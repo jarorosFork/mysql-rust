@@ -68,7 +68,13 @@ impl Table {
         self.rows.push(row);
     }
 
-    fn insert_checked(&mut self, row: Vec<Value>) -> Result<()> {
+    /// Validate that `row` can be inserted — primary-key uniqueness only
+    /// (column count is checked by the caller) — without mutating
+    /// anything. Split out from the old fused check-and-insert so
+    /// `InMemoryStorage::insert_row` can validate, then durably log,
+    /// *then* apply — see its doc comment for why that order matters
+    /// (PERFORMANCE_DURABILITY_PLAN.md D3).
+    fn check_insertable(&self, row: &[Value]) -> Result<()> {
         if let Some(idx) = self.primary_key_index {
             if self.index.contains_key(&row[idx]) {
                 return Err(Error::Execution(format!(
@@ -77,7 +83,6 @@ impl Table {
                 )));
             }
         }
-        self.push_trusted(row);
         Ok(())
     }
 }
@@ -126,6 +131,15 @@ pub struct InMemoryStorage {
     /// with (so nothing about table data is affected by this being in-memory
     /// only).
     databases: RwLock<HashSet<String>>,
+    /// Test-only fault injection: when set, the next [`Self::append_log`]
+    /// call fails without touching the real log, so tests can verify the
+    /// log-before-memory ordering invariant (PERFORMANCE_DURABILITY_PLAN.md
+    /// D3) deterministically. A genuine OS-level write failure isn't
+    /// reliably triggerable on an already-open file handle without
+    /// platform-specific machinery this project doesn't otherwise need;
+    /// this compiles to nothing in a non-test build.
+    #[cfg(test)]
+    fail_next_log_write: std::sync::atomic::AtomicBool,
 }
 
 impl InMemoryStorage {
@@ -144,7 +158,17 @@ impl InMemoryStorage {
             log: Mutex::new(Some(log)),
             table_locks: tokio::sync::Mutex::new(HashMap::new()),
             databases: RwLock::new(HashSet::new()),
+            #[cfg(test)]
+            fail_next_log_write: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Test-only: make the next [`Self::append_log`] call fail, once, as
+    /// if the real log write had failed at the OS level.
+    #[cfg(test)]
+    fn fail_next_log_write(&self) {
+        self.fail_next_log_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Acquire `table`'s exclusive write lock, waiting up to
@@ -178,6 +202,15 @@ impl InMemoryStorage {
     }
 
     fn append_log(&self, write: impl FnOnce(&mut Log) -> Result<()>) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_log_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Io(std::io::Error::other(
+                "fault-injected log write failure (test only)",
+            )));
+        }
         let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
         match log.as_mut() {
             Some(l) => write(l),
@@ -201,18 +234,23 @@ impl Storage for InMemoryStorage {
             }
         }
 
-        {
-            let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
-            if tables.contains_key(name) {
-                return Err(Error::Execution(format!("Table '{name}' already exists")));
-            }
-            tables.insert(
-                name.to_string(),
-                Table::new(columns.clone(), primary_key.clone()),
-            );
+        // Log-before-memory (PERFORMANCE_DURABILITY_PLAN.md D3): both the
+        // existence check and the memory apply stay under one held write
+        // lock, unlike `insert_row` below. Unlike an INSERT, CREATE TABLE
+        // has no connection-level per-table lock to lean on instead (see
+        // `InMemoryStorage::lock_table` / `server::connection::execute_
+        // statement`) — there's no table yet to lock by name — so this is
+        // the one place a log append still happens inside the `tables`
+        // critical section. Accepted: schema changes are rare relative to
+        // row inserts, so this doesn't cost meaningful throughput the way
+        // doing the same for every INSERT would.
+        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+        if tables.contains_key(name) {
+            return Err(Error::Execution(format!("Table '{name}' already exists")));
         }
-
-        self.append_log(|log| log.append_create_table(name, &columns, primary_key.as_deref()))
+        self.append_log(|log| log.append_create_table(name, &columns, primary_key.as_deref()))?;
+        tables.insert(name.to_string(), Table::new(columns, primary_key));
+        Ok(())
     }
 
     fn tables(&self) -> Result<Vec<String>> {
@@ -232,10 +270,21 @@ impl Storage for InMemoryStorage {
     }
 
     fn insert_row(&self, table: &str, row: Vec<Value>) -> Result<()> {
+        // Log-before-memory (PERFORMANCE_DURABILITY_PLAN.md D3): validate
+        // under a read lock, append durably, *then* apply — not the other
+        // way around. If the log append fails, nothing here has mutated
+        // any state a reader could observe, so the row simply never
+        // happened: no phantom row, no undo needed. Safe to validate under
+        // only a read lock (rather than extending the write lock across
+        // the log I/O the way `create_table` above has to) because the
+        // caller already holds this table's exclusive lock for the whole
+        // statement (`InMemoryStorage::lock_table`), so no concurrent
+        // writer to this same table can appear between the check and the
+        // apply below.
         {
-            let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+            let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
             let t = tables
-                .get_mut(table)
+                .get(table)
                 .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
             if row.len() != t.columns.len() {
                 return Err(Error::Execution(format!(
@@ -244,10 +293,20 @@ impl Storage for InMemoryStorage {
                     row.len()
                 )));
             }
-            t.insert_checked(row.clone())?;
+            t.check_insertable(&row)?;
         }
 
-        self.append_log(|log| log.append_insert_row(table, &row))
+        self.append_log(|log| log.append_insert_row(table, &row))?;
+
+        // Infallible: everything that could make it fail was already
+        // checked above under the same guarantee that nothing could have
+        // changed in between (see the comment above).
+        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+        let t = tables
+            .get_mut(table)
+            .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
+        t.push_trusted(row);
+        Ok(())
     }
 
     fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>> {
@@ -482,6 +541,72 @@ mod tests {
             std::process::id(),
             *counter
         ))
+    }
+
+    #[test]
+    fn failed_log_append_on_insert_leaves_no_trace_in_memory() {
+        let path = temp_path("fault-injection-insert");
+        std::fs::remove_file(&path).ok();
+        let storage = InMemoryStorage::open(&path).unwrap();
+        storage
+            .create_table(
+                "t",
+                vec![col("id", ColumnType::Int)],
+                Some("id".to_string()),
+            )
+            .unwrap();
+        storage.insert_row("t", vec![Value::Int(1)]).unwrap();
+
+        storage.fail_next_log_write();
+        let result = storage.insert_row("t", vec![Value::Int(2)]);
+        assert!(
+            result.is_err(),
+            "a failed log append must surface as an error, not succeed silently"
+        );
+
+        assert_eq!(
+            storage.scan("t").unwrap(),
+            vec![vec![Value::Int(1)]],
+            "the row from the failed insert must never become visible -- \
+             log-then-apply, not apply-then-log"
+        );
+        assert!(
+            storage
+                .lookup_by_primary_key("t", &Value::Int(2))
+                .unwrap()
+                .is_none(),
+            "a failed insert must not be reachable via the primary-key index either"
+        );
+        // The fault only fires once -- a retry with the same value must
+        // succeed cleanly, proving the failed attempt left no phantom PK
+        // entry that would incorrectly reject it as a duplicate.
+        storage.insert_row("t", vec![Value::Int(2)]).unwrap();
+        assert_eq!(storage.scan("t").unwrap().len(), 2);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn failed_log_append_on_create_table_leaves_it_absent() {
+        let path = temp_path("fault-injection-create");
+        std::fs::remove_file(&path).ok();
+        let storage = InMemoryStorage::open(&path).unwrap();
+
+        storage.fail_next_log_write();
+        let result = storage.create_table("t", vec![col("id", ColumnType::Int)], None);
+        assert!(result.is_err());
+        assert!(
+            storage.tables().unwrap().is_empty(),
+            "a table whose CREATE TABLE failed to log must not exist in memory either"
+        );
+
+        // The fault only fires once -- retrying must succeed cleanly.
+        storage
+            .create_table("t", vec![col("id", ColumnType::Int)], None)
+            .unwrap();
+        assert_eq!(storage.tables().unwrap(), vec!["t".to_string()]);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

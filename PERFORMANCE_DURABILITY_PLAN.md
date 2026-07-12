@@ -604,12 +604,51 @@ green.
       _without_panicking` and `reopening_a_file_with_mid_file_corruption
       _errors_instead_of_panicking`. 406 tests total (was 399); fmt +
       clippy `-D warnings` clean throughout.
-- [ ] **True WAL ordering (D3)**: encode → append → apply-to-memory;
-      log-append failure applies nothing; the memory apply after a
-      successful append is infallible. Removes the extra `row.clone()`.
-      _Acceptance: fault-injection test (a `Log` wrapper that errors on
-      demand) shows a failed INSERT leaves the table unchanged and other
-      connections never observe the row._
+- [x] **True WAL ordering (D3)** — ✅ done 2026-07-12. `InMemoryStorage::
+      insert_row` reordered from validate-and-apply-then-log to
+      validate → log (durable) → apply; `create_table` the same. If the
+      log append fails, nothing has mutated any state a reader could
+      observe, so the failed row/table simply never happened — no phantom
+      state, no undo needed. `Table::insert_checked` (fused check-and-
+      mutate) split into `check_insertable` (read-only) and the existing
+      `push_trusted` (now infallible, called only after a successful log
+      append) so the two phases can straddle the log I/O. Also removes the
+      `row.clone()`/`columns.clone()` the old ordering needed (the log call
+      used to need its own copy because the *original* had already been
+      moved into the memory apply first) — the plan's stated bonus, landed
+      as a natural side effect of the reorder, not a separate change.
+      `insert_row` validates under only a **read** lock and applies under
+      a **separate** write lock afterward (not one lock held across the
+      log I/O) — safe because the caller already holds this table's
+      exclusive lock for the whole statement (`InMemoryStorage::
+      lock_table`, acquired in `server::connection::execute_statement`
+      before the executor ever runs), so no concurrent writer to the same
+      table can appear between the two. `create_table` has no equivalent
+      per-name lock to lean on (there's no table yet to lock by name until
+      it exists), so it keeps its existence-check, log-append, and memory-
+      apply under one held write lock — a deliberate, documented asymmetry,
+      accepted because schema changes are rare relative to row inserts.
+      **Deviated from the plan's suggested acceptance** ("a `Log` wrapper
+      that errors on demand"): a genuine OS-level write failure turned out
+      not to be reliably triggerable on an *already-open* file handle
+      without new platform-specific machinery (permission changes after
+      `open()` don't affect an already-open fd on Unix; forcing an fd
+      closed out from under a safe `File` isn't possible in safe std) —
+      rather than add a dependency (`libc`/`rustix`) for one test, added a
+      minimal `#[cfg(test)]`-only fault-injection seam
+      (`InMemoryStorage::fail_next_log_write`, an `AtomicBool` field +
+      setter) that makes the next `append_log` call fail without touching
+      the real log file. Compiles to nothing in a non-test build — zero
+      production cost or API surface, private to the crate (not `pub`, so
+      no external test can reach it either). Proof: two new tests —
+      `failed_log_append_on_insert_leaves_no_trace_in_memory` (also
+      confirms a retry with the same value succeeds cleanly, proving no
+      phantom PK entry survives a failed attempt) and `failed_log_append_
+      on_create_table_leaves_it_absent`. 329 lib tests (408 total, was
+      406); fmt + clippy `-D warnings` clean; `tests/transactions.rs` and
+      `tests/concurrency.rs` (8 + 5 tests) still green unchanged, since
+      `Transaction::commit` routes through this same, now-fixed
+      `insert_row` for each buffered row.
 - [ ] **Atomic commit records (D2)**: new `TAG_TX` batch record; used by
       `Transaction::commit` and multi-row INSERT; replay applies
       all-or-nothing.
