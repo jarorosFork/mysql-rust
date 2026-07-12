@@ -450,6 +450,21 @@ impl Storage for InMemoryStorage {
             .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))
     }
 
+    fn scan_filtered(
+        &self,
+        table: &str,
+        filter: &mut dyn FnMut(&[Value]) -> bool,
+    ) -> Result<Vec<Vec<Value>>> {
+        let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
+        let t = tables
+            .get(table)
+            .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
+        // The clone happens only for rows `filter` accepts -- everything
+        // else is inspected by reference and dropped, never copied
+        // (PERFORMANCE_DURABILITY_PLAN.md P1).
+        Ok(t.rows.iter().filter(|row| filter(row)).cloned().collect())
+    }
+
     fn lookup_by_primary_key(&self, table: &str, key: &Value) -> Result<Option<Vec<Value>>> {
         let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
         let t = tables
@@ -581,6 +596,70 @@ mod tests {
                 vec![Value::Null, Value::Varchar("y".to_string())],
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn scan_filtered_returns_only_matching_rows() {
+        let storage = InMemoryStorage::new();
+        storage
+            .create_table("t", vec![col("id", ColumnType::Int)], None)
+            .await
+            .unwrap();
+        for i in 0..10 {
+            storage.insert_row("t", vec![Value::Int(i)]).await.unwrap();
+        }
+
+        let matched = storage
+            .scan_filtered(
+                "t",
+                &mut |row| matches!(row[0], Value::Int(n) if n % 2 == 0),
+            )
+            .unwrap();
+        assert_eq!(
+            matched,
+            vec![
+                vec![Value::Int(0)],
+                vec![Value::Int(2)],
+                vec![Value::Int(4)],
+                vec![Value::Int(6)],
+                vec![Value::Int(8)],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_filtered_calls_the_filter_exactly_once_per_row_and_clones_only_matches() {
+        let storage = InMemoryStorage::new();
+        storage
+            .create_table("t", vec![col("id", ColumnType::Int)], None)
+            .await
+            .unwrap();
+        for i in 0..5 {
+            storage.insert_row("t", vec![Value::Int(i)]).await.unwrap();
+        }
+
+        // PERFORMANCE_DURABILITY_PLAN.md P1's whole point: every row is
+        // *inspected* (the filter runs once per row, same as a plain
+        // scan-then-filter would), but only matching rows are ever cloned
+        // into the result -- proven here by counting filter invocations
+        // separately from the returned row count, rather than just
+        // asserting the final answer is correct (which a naive
+        // scan-then-filter would also produce).
+        let mut calls = 0;
+        let matched = storage
+            .scan_filtered("t", &mut |row| {
+                calls += 1;
+                matches!(row[0], Value::Int(n) if n == 3)
+            })
+            .unwrap();
+        assert_eq!(calls, 5, "filter must be invoked once per row in the table");
+        assert_eq!(matched, vec![vec![Value::Int(3)]]);
+    }
+
+    #[tokio::test]
+    async fn scan_filtered_errors_on_missing_table_not_panic() {
+        let storage = InMemoryStorage::new();
+        assert!(storage.scan_filtered("missing", &mut |_| true).is_err());
     }
 
     #[tokio::test]

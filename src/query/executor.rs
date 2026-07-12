@@ -604,7 +604,9 @@ impl<'a> Executor<'a> {
     /// Scan `table` and apply an optional `WHERE` filter, returning full
     /// (pre-projection) matching rows. The no-`JOIN` `SELECT` path (see
     /// `resolve_from`). Uses the indexed primary-key lookup for
-    /// `col = value` on the primary key; a full scan otherwise.
+    /// `col = value` on the primary key; `Storage::scan_filtered`
+    /// (PERFORMANCE_DURABILITY_PLAN.md P1) otherwise, which clones only the
+    /// rows that actually match instead of the whole table.
     fn scan_and_filter(
         &self,
         table: &str,
@@ -629,12 +631,10 @@ impl<'a> Executor<'a> {
                         .into_iter()
                         .collect())
                 } else {
-                    Ok(self
-                        .storage
-                        .scan(table)?
-                        .into_iter()
-                        .filter(|row| compare_values(&row[col_idx], cond.op, &expected))
-                        .collect())
+                    let op = cond.op;
+                    self.storage.scan_filtered(table, &mut |row| {
+                        compare_values(&row[col_idx], op, &expected)
+                    })
                 }
             }
         }

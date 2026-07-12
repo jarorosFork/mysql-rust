@@ -83,7 +83,9 @@ async fn point_select_by_pk() -> Stats {
 }
 
 async fn full_scan_where_select() -> Stats {
-    const ROWS: usize = 20_000;
+    // PERFORMANCE_DURABILITY_PLAN.md P1's acceptance is stated at this
+    // scale specifically ("full-scan WHERE benchmark at 100k rows").
+    const ROWS: usize = 100_000;
     const CATEGORIES: usize = 100; // ~1% selectivity per value
     const ITERS: usize = 200;
 

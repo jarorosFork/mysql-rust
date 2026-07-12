@@ -76,6 +76,22 @@ pub trait Storage: Send + Sync {
     /// Return every row in `table`, in insertion order.
     fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>>;
 
+    /// Return every row in `table` for which `filter` returns `true`,
+    /// without cloning the rows that don't match
+    /// (PERFORMANCE_DURABILITY_PLAN.md P1) — unlike `scan()` followed by an
+    /// in-memory `.filter()`, which clones the *whole* table (every
+    /// `Varchar`'s heap `String` included) before throwing most of it away.
+    /// No default: a fallback of "call `scan` then filter" would compile
+    /// but silently defeat the entire point for a future implementor who
+    /// forgets to override it, so both current implementors
+    /// ([`InMemoryStorage`] and [`Transaction`]'s pending-row overlay) are
+    /// required to provide the real thing.
+    fn scan_filtered(
+        &self,
+        table: &str,
+        filter: &mut dyn FnMut(&[Value]) -> bool,
+    ) -> Result<Vec<Vec<Value>>>;
+
     /// Look up a row by its primary-key value in O(1) rather than scanning.
     /// Returns `Ok(None)` if the table has no matching row (or no primary
     /// key at all — callers should check `table_schema` first).

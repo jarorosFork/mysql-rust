@@ -172,6 +172,27 @@ impl Storage for Transaction {
         Ok(rows)
     }
 
+    fn scan_filtered(
+        &self,
+        table: &str,
+        filter: &mut dyn FnMut(&[Value]) -> bool,
+    ) -> Result<Vec<Vec<Value>>> {
+        // Same overlay as `scan` above, just filtered on both sides
+        // (PERFORMANCE_DURABILITY_PLAN.md P1): the real storage's matching
+        // rows, plus this transaction's own pending rows that also match —
+        // a non-matching pending row is never cloned either.
+        let mut rows = self.storage.scan_filtered(table, filter)?;
+        if let Some(pending) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table)
+        {
+            rows.extend(pending.iter().filter(|row| filter(row)).cloned());
+        }
+        Ok(rows)
+    }
+
     fn lookup_by_primary_key(&self, table: &str, key: &Value) -> Result<Option<Vec<Value>>> {
         if let Some(row) = self.storage.lookup_by_primary_key(table, key)? {
             return Ok(Some(row));
@@ -257,6 +278,57 @@ mod tests {
             tx.scan("t").unwrap().len(),
             1,
             "the transaction should see its own uncommitted row"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_filtered_overlays_matching_pending_rows_onto_matching_committed_ones() {
+        let storage = setup().await;
+        storage
+            .insert_row(
+                "t",
+                vec![Value::Int(1), Value::Varchar("alice".to_string())],
+            )
+            .await
+            .unwrap();
+        storage
+            .insert_row("t", vec![Value::Int(2), Value::Varchar("bob".to_string())])
+            .await
+            .unwrap();
+
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        // Pending (uncommitted): one row that matches the filter below, one
+        // that doesn't -- only the matching one should come back.
+        tx.insert_row(
+            "t",
+            vec![Value::Int(3), Value::Varchar("carol".to_string())],
+        )
+        .await
+        .unwrap();
+        tx.insert_row("t", vec![Value::Int(4), Value::Varchar("dave".to_string())])
+            .await
+            .unwrap();
+
+        let odd_ids: Vec<Vec<Value>> = tx
+            .scan_filtered(
+                "t",
+                &mut |row| matches!(row[0], Value::Int(n) if n % 2 == 1),
+            )
+            .unwrap();
+        let mut ids: Vec<i64> = odd_ids
+            .iter()
+            .map(|row| match row[0] {
+                Value::Int(n) => n,
+                _ => panic!("expected Int"),
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "must include the matching committed row (1) and the matching \
+             pending row (3), and exclude both non-matching rows (2, 4)"
         );
     }
 
