@@ -1,15 +1,16 @@
 //! A minimal write-ahead log for on-disk persistence.
 //!
-//! Every mutation (`CREATE TABLE`, row insert) is appended as one
-//! length-prefixed, checksummed entry; reopening a data file replays every
-//! entry in order to rebuild the in-memory state. This is deliberately
-//! simple — no checkpointing/compaction yet — but it satisfies "data
-//! written before shutdown is present after restart" (ROADMAP.md Phase 5)
-//! without the complexity of a production WAL, which the roadmap
-//! explicitly allows ("write-ahead or file-backed"). See
-//! PERFORMANCE_DURABILITY_PLAN.md for what's still missing (`fsync`
-//! durability, atomic multi-record commits) and what this module already
-//! closed (checksums, torn-tail recovery).
+//! Every mutation (`CREATE TABLE`, row insert, or an atomic batch of either)
+//! is appended as one length-prefixed, checksummed, durably-flushed (per
+//! [`SyncPolicy`]) entry; reopening a data file replays every entry in
+//! order to rebuild the in-memory state. This is deliberately simple — no
+//! checkpointing/compaction yet — but it satisfies "data written before
+//! shutdown is present after restart" (ROADMAP.md Phase 5) without the
+//! complexity of a production WAL, which the roadmap explicitly allows
+//! ("write-ahead or file-backed"). See PERFORMANCE_DURABILITY_PLAN.md for
+//! what's still missing (checkpointing/compaction, group commit) and what
+//! this module already closed (checksums, torn-tail recovery, `fsync`
+//! durability, atomic multi-record commits).
 //!
 //! ## Record framing and crash recovery
 //!
@@ -41,6 +42,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+use crate::config::SyncPolicy;
 use crate::storage::value::{ColumnSchema, ColumnType, Value};
 use crate::{Error, Result};
 
@@ -390,9 +392,34 @@ fn read_record(bytes: &[u8], pos: usize, file_len: usize) -> RecordRead<'_> {
     }
 }
 
+/// Force `path`'s parent directory entry to durable storage
+/// (PERFORMANCE_DURABILITY_PLAN.md D7) — a no-op with no directory handle
+/// to open on platforms without this concept (Windows doesn't need it: an
+/// `NTFS` directory entry update isn't cached the same way).
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// An open, append-only log file.
 pub struct Log {
     file: File,
+    sync_policy: SyncPolicy,
+    /// Test-only: counts real `sync_data()` calls, so a test can prove the
+    /// policy is actually wired through without depending on genuinely
+    /// observing power-loss durability (which isn't testable at all) or on
+    /// flaky timing comparisons.
+    #[cfg(test)]
+    sync_calls: usize,
 }
 
 impl Log {
@@ -400,9 +427,16 @@ impl Log {
     /// entry in order, feeding each to `apply`. A torn trailing record —
     /// what a crash produces — is discarded and truncated away on disk;
     /// checksum-failed corruption with valid data still following it is
-    /// refused (see the module doc comment).
-    pub fn open(path: &Path, mut apply: impl FnMut(Entry)) -> Result<Self> {
+    /// refused (see the module doc comment). `sync_policy` governs how
+    /// aggressively subsequent [`Self::append`] calls are forced durable
+    /// (PERFORMANCE_DURABILITY_PLAN.md D1).
+    pub fn open(
+        path: &Path,
+        sync_policy: SyncPolicy,
+        mut apply: impl FnMut(Entry),
+    ) -> Result<Self> {
         let existing = std::fs::read(path);
+        let is_new_file = matches!(&existing, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
         match existing {
             Ok(bytes) => {
                 let mut pos = 0;
@@ -435,7 +469,30 @@ impl Log {
         }
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Log { file })
+        if is_new_file {
+            // PERFORMANCE_DURABILITY_PLAN.md D7: the file's *content* being
+            // durable (once D1's sync_data lands below) doesn't help if the
+            // directory entry pointing at it never made it to disk — on
+            // power loss shortly after first creating it, the file itself
+            // can vanish even though its blocks were synced. Only needed
+            // once, for a freshly-created file: on every later restart the
+            // directory entry already exists (and was already synced when
+            // it was first created).
+            sync_parent_dir(path)?;
+        }
+        Ok(Log {
+            file,
+            sync_policy,
+            #[cfg(test)]
+            sync_calls: 0,
+        })
+    }
+
+    /// Test-only: how many times [`Self::append`] has actually called
+    /// `sync_data()` so far.
+    #[cfg(test)]
+    fn sync_call_count(&self) -> usize {
+        self.sync_calls
     }
 
     fn append(&mut self, entry_bytes: &[u8]) -> Result<()> {
@@ -446,7 +503,18 @@ impl Log {
         write_u32(&mut framed, crc);
         framed.extend_from_slice(entry_bytes);
         self.file.write_all(&framed)?;
-        self.file.flush()?;
+        if self.sync_policy == SyncPolicy::Always {
+            // `fdatasync`, not `fsync`: this log's own length change is
+            // exactly the metadata that needs to hit disk for the new
+            // bytes to be recoverable; other metadata (e.g. mtime) doesn't,
+            // and skipping it is what makes fdatasync the right choice
+            // over a full fsync here.
+            self.file.sync_data()?;
+            #[cfg(test)]
+            {
+                self.sync_calls += 1;
+            }
+        }
         Ok(())
     }
 
@@ -491,7 +559,7 @@ mod tests {
         let path = temp_path("round-trip");
         let mut replayed = Vec::new();
         {
-            let mut log = Log::open(&path, |_| {}).unwrap();
+            let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
             log.append_create_table(
                 "t",
                 &[
@@ -517,7 +585,7 @@ mod tests {
                 .unwrap();
         }
 
-        let _log = Log::open(&path, |entry| replayed.push(entry)).unwrap();
+        let _log = Log::open(&path, SyncPolicy::Never, |entry| replayed.push(entry)).unwrap();
 
         assert_eq!(replayed.len(), 3);
         match &replayed[0] {
@@ -552,7 +620,7 @@ mod tests {
         let path = temp_path("round-trip-decimal-date");
         let mut replayed = Vec::new();
         {
-            let mut log = Log::open(&path, |_| {}).unwrap();
+            let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
             log.append_create_table(
                 "t",
                 &[
@@ -584,7 +652,7 @@ mod tests {
                 .unwrap();
         }
 
-        let _log = Log::open(&path, |entry| replayed.push(entry)).unwrap();
+        let _log = Log::open(&path, SyncPolicy::Never, |entry| replayed.push(entry)).unwrap();
 
         match &replayed[0] {
             Entry::CreateTable { columns, .. } => {
@@ -621,7 +689,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let mut seen = 0;
-        let _log = Log::open(&path, |_| seen += 1).unwrap();
+        let _log = Log::open(&path, SyncPolicy::Never, |_| seen += 1).unwrap();
         assert_eq!(seen, 0);
         assert!(path.exists());
 
@@ -631,7 +699,7 @@ mod tests {
     #[test]
     fn recovers_from_a_torn_trailing_record_by_truncating_it_away() {
         let path = temp_path("torn-tail");
-        let mut log = Log::open(&path, |_| {}).unwrap();
+        let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
         log.append_insert_row("t", &[Value::Int(1)]).unwrap();
         let good_len = std::fs::metadata(&path).unwrap().len();
         log.append_insert_row("t", &[Value::Int(2)]).unwrap();
@@ -642,7 +710,7 @@ mod tests {
         for truncate_at in good_len..full_len {
             std::fs::write(&path, &full_bytes[..truncate_at as usize]).unwrap();
             let mut replayed = Vec::new();
-            Log::open(&path, |e| replayed.push(e)).unwrap_or_else(|e| {
+            Log::open(&path, SyncPolicy::Never, |e| replayed.push(e)).unwrap_or_else(|e| {
                 panic!(
                     "truncating the trailing record at byte {truncate_at} of {full_len} \
                      should recover, not error: {e}"
@@ -669,7 +737,8 @@ mod tests {
         std::fs::write(&path, [5, 0, 0, 0, 1, 2, 3]).unwrap();
 
         let mut seen = 0;
-        Log::open(&path, |_| seen += 1).expect("a torn header should recover, not error");
+        Log::open(&path, SyncPolicy::Never, |_| seen += 1)
+            .expect("a torn header should recover, not error");
         assert_eq!(seen, 0);
         assert_eq!(
             std::fs::read(&path).unwrap().len(),
@@ -683,7 +752,7 @@ mod tests {
     #[test]
     fn mid_file_checksum_mismatch_with_valid_data_after_it_is_refused() {
         let path = temp_path("mid-file-corrupt");
-        let mut log = Log::open(&path, |_| {}).unwrap();
+        let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
         log.append_insert_row("t", &[Value::Int(1)]).unwrap(); // record A
         let before_record_b = std::fs::metadata(&path).unwrap().len();
         log.append_insert_row("t", &[Value::Int(2)]).unwrap(); // record B -- corrupted below
@@ -699,7 +768,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         assert!(
-            Log::open(&path, |_| {}).is_err(),
+            Log::open(&path, SyncPolicy::Never, |_| {}).is_err(),
             "checksum-failed corruption with valid data still following it must be refused"
         );
 
@@ -724,5 +793,41 @@ mod tests {
         let mut corrupted = *b"mysql-rust";
         corrupted[3] ^= 0x01;
         assert_ne!(original, crc32(&corrupted));
+    }
+
+    #[test]
+    fn always_policy_calls_sync_data_once_per_append() {
+        let path = temp_path("sync-always");
+        let mut log = Log::open(&path, SyncPolicy::Always, |_| {}).unwrap();
+        assert_eq!(log.sync_call_count(), 0);
+
+        log.append_insert_row("t", &[Value::Int(1)]).unwrap();
+        assert_eq!(log.sync_call_count(), 1);
+
+        log.append_insert_row("t", &[Value::Int(2)]).unwrap();
+        log.append_insert_row("t", &[Value::Int(3)]).unwrap();
+        assert_eq!(
+            log.sync_call_count(),
+            3,
+            "Always must sync durably on every single append, not batch them"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn never_policy_never_calls_sync_data() {
+        let path = temp_path("sync-never");
+        let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
+
+        log.append_insert_row("t", &[Value::Int(1)]).unwrap();
+        log.append_insert_row("t", &[Value::Int(2)]).unwrap();
+        assert_eq!(
+            log.sync_call_count(),
+            0,
+            "Never must not pay any sync_data cost"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }

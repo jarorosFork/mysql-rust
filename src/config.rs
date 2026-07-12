@@ -53,6 +53,37 @@ impl TlsConfig {
     }
 }
 
+/// How aggressively the on-disk log is forced to durable storage
+/// (PERFORMANCE_DURABILITY_PLAN.md D1). Named after — and matching the
+/// intent of — InnoDB's `innodb_flush_log_at_trx_commit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncPolicy {
+    /// `fdatasync` the log after every append. An acknowledged write
+    /// survives anything short of media failure — the only meaningful
+    /// definition of "durable" — at the cost of a real (if small) latency
+    /// hit per write. The default: this server would rather be honest
+    /// about that cost than tell a client "OK" for data that might not
+    /// exist after a power loss.
+    #[default]
+    Always,
+    /// Never explicitly sync; rely on the OS to write the page cache back
+    /// in its own time. Fastest, but an acknowledged write can be lost on
+    /// power loss or a kernel panic (a process crash alone is still safe —
+    /// the page cache survives that regardless of this setting). This was
+    /// this server's only behavior before `sync_policy` existed.
+    Never,
+}
+
+impl SyncPolicy {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "always" => Some(SyncPolicy::Always),
+            "never" => Some(SyncPolicy::Never),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime configuration for the server.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -68,6 +99,9 @@ pub struct Config {
     /// Where table data is persisted. `None` (the default) keeps everything
     /// in memory only — nothing survives a restart.
     pub data_dir: Option<PathBuf>,
+    /// How aggressively the on-disk log is forced to durable storage. Only
+    /// meaningful when `data_dir` is set. Defaults to [`SyncPolicy::Always`].
+    pub sync_policy: SyncPolicy,
     /// Largest client packet payload (in bytes) the server will accept. A
     /// packet declaring more than this is rejected before its payload is
     /// buffered, bounding how much memory one client can force the server to
@@ -96,6 +130,7 @@ impl Default for Config {
             max_connections: 0,
             users: Vec::new(),
             data_dir: None,
+            sync_policy: SyncPolicy::default(),
             max_allowed_packet: 64 * 1024 * 1024,
             log_level: LogLevel::Info,
             tls: None,
@@ -160,6 +195,8 @@ impl Config {
     ///
     /// - `MYSQLRUST_LISTEN_ADDR` — `host:port` to bind (default `127.0.0.1:3306`).
     /// - `MYSQLRUST_DATA_DIR` — directory for the on-disk log (default: in-memory).
+    /// - `MYSQLRUST_SYNC_POLICY` — `always` (default) or `never`; see
+    ///   [`SyncPolicy`]. Only meaningful when `MYSQLRUST_DATA_DIR` is set.
     /// - `MYSQLRUST_USER` — a single account's username; if set, that account
     ///   is created.
     /// - `MYSQLRUST_PASSWORD` — the account's password (unset or empty means a
@@ -197,6 +234,14 @@ impl Config {
             if !dir.is_empty() {
                 config.data_dir = Some(PathBuf::from(dir));
             }
+        }
+
+        if let Some(policy) = get("MYSQLRUST_SYNC_POLICY").filter(|p| !p.is_empty()) {
+            config.sync_policy = SyncPolicy::from_name(&policy).ok_or_else(|| {
+                Error::Config(format!(
+                    "MYSQLRUST_SYNC_POLICY '{policy}' is not recognized; use 'always' or 'never'"
+                ))
+            })?;
         }
 
         if let Some(level) = get("MYSQLRUST_LOG_LEVEL").filter(|l| !l.is_empty()) {
@@ -329,6 +374,26 @@ mod tests {
             ("MYSQLRUST_AUTH_PLUGIN", "bogus_plugin"),
         ]))
         .expect_err("should reject");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn sync_policy_defaults_to_always() {
+        let config = Config::from_env_with(env(&[])).expect("parse");
+        assert_eq!(config.sync_policy, SyncPolicy::Always);
+    }
+
+    #[test]
+    fn sync_policy_never_is_parsed_case_insensitively() {
+        let config =
+            Config::from_env_with(env(&[("MYSQLRUST_SYNC_POLICY", "Never")])).expect("parse");
+        assert_eq!(config.sync_policy, SyncPolicy::Never);
+    }
+
+    #[test]
+    fn unknown_sync_policy_is_a_config_error() {
+        let err = Config::from_env_with(env(&[("MYSQLRUST_SYNC_POLICY", "sometimes")]))
+            .expect_err("should reject");
         assert!(matches!(err, Error::Config(_)));
     }
 }

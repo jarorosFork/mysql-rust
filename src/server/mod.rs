@@ -95,7 +95,7 @@ impl Server {
         );
 
         let storage = Arc::new(match &self.config.data_dir {
-            Some(dir) => InMemoryStorage::open_in_dir(dir)?,
+            Some(dir) => InMemoryStorage::open_in_dir(dir, self.config.sync_policy)?,
             None => InMemoryStorage::new(),
         });
         let connection_limit = (self.config.max_connections > 0)

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, OptsBuilder};
 
-use mysql_rust::config::{Config, UserCredential};
+use mysql_rust::config::{Config, SyncPolicy, UserCredential};
 use mysql_rust::observability::LogLevel;
 use mysql_rust::server::Server;
 
@@ -42,8 +42,9 @@ async fn run_all() -> Vec<Stats> {
         point_select_by_pk().await,
         full_scan_where_select().await,
         fetch_1000_rows().await,
-        single_row_insert(false).await,
-        single_row_insert(true).await,
+        single_row_insert(InsertMode::Volatile).await,
+        single_row_insert(InsertMode::PersistentAlways).await,
+        single_row_insert(InsertMode::PersistentNever).await,
         concurrent_commits().await,
         join_group_by_report().await,
     ]
@@ -57,7 +58,7 @@ async fn point_select_by_pk() -> Stats {
     const ROWS: usize = 20_000;
     const ITERS: usize = 2_000;
 
-    let addr = start_server(None).await;
+    let addr = start_server(None, SyncPolicy::Never).await;
     let mut conn = connect(addr).await;
     conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
         .await
@@ -82,7 +83,7 @@ async fn full_scan_where_select() -> Stats {
     const CATEGORIES: usize = 100; // ~1% selectivity per value
     const ITERS: usize = 200;
 
-    let addr = start_server(None).await;
+    let addr = start_server(None, SyncPolicy::Never).await;
     let mut conn = connect(addr).await;
     conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, category VARCHAR, name VARCHAR)")
         .await
@@ -115,7 +116,7 @@ async fn fetch_1000_rows() -> Stats {
     const ROWS: usize = 1_000;
     const ITERS: usize = 200;
 
-    let addr = start_server(None).await;
+    let addr = start_server(None, SyncPolicy::Never).await;
     let mut conn = connect(addr).await;
     conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
         .await
@@ -132,11 +133,39 @@ async fn fetch_1000_rows() -> Stats {
     stats(&format!("fetch {ROWS}-row result set"), samples)
 }
 
-async fn single_row_insert(persistent: bool) -> Stats {
+/// PERFORMANCE_DURABILITY_PLAN.md D1's acceptance calls for recording the
+/// INSERT-latency cost per `SyncPolicy` rather than guessing it — these
+/// three variants are that measurement.
+enum InsertMode {
+    Volatile,
+    /// The default: `fdatasync` after every insert.
+    PersistentAlways,
+    /// Persisted to disk, but never explicitly synced — the old (pre-D1)
+    /// behavior, kept as an explicit opt-in via `MYSQLRUST_SYNC_POLICY=never`.
+    PersistentNever,
+}
+
+async fn single_row_insert(mode: InsertMode) -> Stats {
     const ITERS: usize = 2_000;
 
-    let dir = persistent.then(|| temp_data_dir("single-insert"));
-    let addr = start_server(dir.as_ref().map(TempDir::path)).await;
+    let (dir, sync_policy, label): (Option<TempDir>, SyncPolicy, &str) = match mode {
+        InsertMode::Volatile => (
+            None,
+            SyncPolicy::Never,
+            "single-row autocommit INSERT, volatile (in-memory)",
+        ),
+        InsertMode::PersistentAlways => (
+            Some(temp_data_dir("single-insert-always")),
+            SyncPolicy::Always,
+            "single-row autocommit INSERT, persistent (sync=always)",
+        ),
+        InsertMode::PersistentNever => (
+            Some(temp_data_dir("single-insert-never")),
+            SyncPolicy::Never,
+            "single-row autocommit INSERT, persistent (sync=never)",
+        ),
+    };
+    let addr = start_server(dir.as_ref().map(TempDir::path), sync_policy).await;
     let mut conn = connect(addr).await;
     conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
         .await
@@ -150,11 +179,6 @@ async fn single_row_insert(persistent: bool) -> Stats {
             .expect("insert");
         samples.push(start.elapsed());
     }
-    let label = if persistent {
-        "single-row autocommit INSERT, persistent"
-    } else {
-        "single-row autocommit INSERT, volatile (in-memory)"
-    };
     stats(label, samples)
 }
 
@@ -163,7 +187,10 @@ async fn concurrent_commits() -> Stats {
     const BURSTS: usize = 5;
 
     let dir = temp_data_dir("concurrent-commits");
-    let addr = start_server(Some(dir.path())).await;
+    // Always: the realistic default a real deployment runs under, and the
+    // scenario PD-2's group-commit work is scored against (watch this row
+    // specifically once that lands).
+    let addr = start_server(Some(dir.path()), SyncPolicy::Always).await;
     {
         let mut conn = connect(addr).await;
         conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
@@ -202,7 +229,7 @@ async fn join_group_by_report() -> Stats {
     const ORDERS: usize = 2_500;
     const ITERS: usize = 100;
 
-    let addr = start_server(None).await;
+    let addr = start_server(None, SyncPolicy::Never).await;
     let mut conn = connect(addr).await;
     conn.query_drop("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR)")
         .await
@@ -301,14 +328,16 @@ fn temp_data_dir(name: &str) -> TempDir {
 /// Boot a real `Server` on an ephemeral loopback port, in a background
 /// task, with one configured account and (optionally) on-disk persistence.
 /// The caller owns and keeps alive whatever `TempDir` backs `data_dir` (see
-/// [`TempDir::path`]) for as long as the server needs it.
-async fn start_server(data_dir: Option<&Path>) -> std::net::SocketAddr {
+/// [`TempDir::path`]) for as long as the server needs it. `sync_policy` is
+/// irrelevant when `data_dir` is `None` (nothing is ever written to disk).
+async fn start_server(data_dir: Option<&Path>, sync_policy: SyncPolicy) -> std::net::SocketAddr {
     let config = Config {
         users: vec![UserCredential::with_caching_sha2_password(
             USERNAME, PASSWORD,
         )],
         log_level: LogLevel::Error,
         data_dir: data_dir.map(Path::to_path_buf),
+        sync_policy,
         ..Config::default()
     };
 

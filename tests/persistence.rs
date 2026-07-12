@@ -259,8 +259,11 @@ fn reopening_a_file_with_a_torn_trailing_record_recovers_without_panicking() {
     // looks like.
     std::fs::write(dir.join("data.log"), [255, 255, 255, 255, 1, 2]).unwrap();
 
-    let storage = mysql_rust::storage::InMemoryStorage::open_in_dir(&dir)
-        .expect("a torn trailing record should recover, not error or panic");
+    let storage = mysql_rust::storage::InMemoryStorage::open_in_dir(
+        &dir,
+        mysql_rust::config::SyncPolicy::Never,
+    )
+    .expect("a torn trailing record should recover, not error or panic");
     assert!(storage.tables().unwrap().is_empty());
 
     std::fs::remove_dir_all(&dir).ok();
@@ -280,7 +283,9 @@ fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("data.log");
 
-    let storage = mysql_rust::storage::InMemoryStorage::open(&path).unwrap();
+    let storage =
+        mysql_rust::storage::InMemoryStorage::open(&path, mysql_rust::config::SyncPolicy::Never)
+            .unwrap();
     storage
         .create_table(
             "t",
@@ -305,7 +310,10 @@ fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking() {
     bytes[corrupt_at] ^= 0xFF;
     std::fs::write(&path, &bytes).unwrap();
 
-    let result = mysql_rust::storage::InMemoryStorage::open_in_dir(&dir);
+    let result = mysql_rust::storage::InMemoryStorage::open_in_dir(
+        &dir,
+        mysql_rust::config::SyncPolicy::Never,
+    );
     assert!(
         result.is_err(),
         "expected mid-file corruption (with valid data still following it) to be rejected, not panic"

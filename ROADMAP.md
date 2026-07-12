@@ -439,23 +439,30 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       slower than a point SELECT returning a similar row count. 2 new
       non-ignored tests pass today as regression guards. 399 tests total
       (was 397). fmt + clippy `-D warnings` clean.)_
-- [ ] PD-1 — Durability core: CRC framing, torn-tail recovery, WAL
+- [x] PD-1 — Durability core: CRC framing, torn-tail recovery, WAL
       ordering, atomic commit records, fsync policy + directory fsync.
-      _(In progress: CRC-checked record framing + torn-tail recovery
-      (D4/D5), true WAL ordering (D3), and atomic commit records (D2) all
-      done 2026-07-12 — see PERFORMANCE_DURABILITY_PLAN.md's D2-D5 entries
-      for the full design (why the checksum has to cover the length field,
-      not just the payload, for recovery to be safe; why a batch record
-      makes atomicity fall out of the torn-tail work for free; why
+      _(✅ Done 2026-07-12, all five findings (D1-D5) plus D7. See
+      PERFORMANCE_DURABILITY_PLAN.md's D1-D5 entries for the full design
+      of each (why the checksum has to cover the length field, not just
+      the payload, for torn-tail recovery to be safe; why a batch record
+      makes commit atomicity fall out of that recovery work for free; why
       `insert_row`/`insert_rows` validate under a read lock and apply
       under a separate write lock while `create_table` holds one write
-      lock across both) and proof: **`tests/crash.rs`'s entire 5-test
-      suite now passes with zero `#[ignore]`d assertions** — every
-      durability bug the harness was built in PD-0 to catch (17/1000 and
-      361/500 rows surviving a killed statement; a torn tail refusing to
-      start) is fixed, closing the loop PD-0 opened. 416 tests total. Only
-      fsync policy + directory fsync (D1/D7) remain before this phase's
-      acceptance check.)_
+      lock across both; why `fdatasync` over `fsync`; why `EverySecond`
+      was deliberately deferred to PD-2's dedicated-writer-thread
+      architecture rather than half-built now) and the real, measured
+      trade-offs each introduced (PERFORMANCE_DURABILITY_PLAN.md's
+      "Baseline" section: `sync=always` costs ~100x the per-INSERT latency
+      of `sync=never` on this machine; 200 concurrent commits went from
+      46.9ms to 829ms once every one of them paid its own fsync —
+      precisely the number PD-2's group commit is scored against).
+      Proof: **`tests/crash.rs`'s entire 5-test suite passes with zero
+      `#[ignore]`d assertions** — every durability bug the harness was
+      built in PD-0 to catch (17/1000 and 361/500 rows surviving a killed
+      statement; a torn tail refusing to start) is fixed, closing the loop
+      PD-0 opened. 421 tests total (was 397 before PD-0); e2e app (41/41)
+      and the benchmark suite (`cargo bench`) both green. fmt + clippy
+      `-D warnings` clean throughout.)_
 - [ ] PD-2 — Write-path architecture: dedicated log-writer thread with
       group commit.
 - [ ] PD-3 — Query-path performance: `TCP_NODELAY`, single-buffer

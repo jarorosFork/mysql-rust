@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::config::SyncPolicy;
 use crate::storage::log::{Entry, Log};
 use crate::storage::value::{ColumnSchema, TableSchema, Value};
 use crate::storage::Storage;
@@ -168,10 +169,12 @@ impl InMemoryStorage {
     }
 
     /// Open (creating if necessary) a store backed by a log file at `path`.
-    /// Any existing data is replayed into memory immediately.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Any existing data is replayed into memory immediately. `sync_policy`
+    /// governs how aggressively subsequent writes are forced durable (see
+    /// `Log::open`, PERFORMANCE_DURABILITY_PLAN.md D1).
+    pub fn open(path: &Path, sync_policy: SyncPolicy) -> Result<Self> {
         let mut tables: HashMap<String, Table> = HashMap::new();
-        let log = Log::open(path, |entry| apply_entry(&mut tables, entry))?;
+        let log = Log::open(path, sync_policy, |entry| apply_entry(&mut tables, entry))?;
         Ok(InMemoryStorage {
             tables: RwLock::new(tables),
             log: Mutex::new(Some(log)),
@@ -215,9 +218,9 @@ impl InMemoryStorage {
 
     /// Open (creating the directory and a fixed-name data file within it if
     /// necessary) a persistent store rooted at `dir`.
-    pub fn open_in_dir(dir: &Path) -> Result<Self> {
+    pub fn open_in_dir(dir: &Path, sync_policy: SyncPolicy) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        Self::open(&dir.join("data.log"))
+        Self::open(&dir.join("data.log"), sync_policy)
     }
 
     fn append_log(&self, write: impl FnOnce(&mut Log) -> Result<()>) -> Result<()> {
@@ -619,7 +622,7 @@ mod tests {
     fn failed_log_append_on_insert_leaves_no_trace_in_memory() {
         let path = temp_path("fault-injection-insert");
         std::fs::remove_file(&path).ok();
-        let storage = InMemoryStorage::open(&path).unwrap();
+        let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
         storage
             .create_table(
                 "t",
@@ -662,7 +665,7 @@ mod tests {
     fn failed_log_append_on_create_table_leaves_it_absent() {
         let path = temp_path("fault-injection-create");
         std::fs::remove_file(&path).ok();
-        let storage = InMemoryStorage::open(&path).unwrap();
+        let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
 
         storage.fail_next_log_write();
         let result = storage.create_table("t", vec![col("id", ColumnType::Int)], None);
@@ -742,7 +745,7 @@ mod tests {
     fn failed_log_append_on_insert_rows_leaves_no_trace_of_the_whole_batch() {
         let path = temp_path("fault-injection-insert-rows");
         std::fs::remove_file(&path).ok();
-        let storage = InMemoryStorage::open(&path).unwrap();
+        let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
         storage
             .create_table(
                 "t",
@@ -784,7 +787,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
             storage
                 .create_table(
                     "t",
@@ -803,7 +806,7 @@ mod tests {
                 .unwrap();
         } // `storage` (and its log file handle) dropped here — simulates a restart.
 
-        let reopened = InMemoryStorage::open(&path).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
         assert_eq!(reopened.tables().unwrap(), vec!["t".to_string()]);
         assert_eq!(
             reopened.scan("t").unwrap(),
@@ -827,7 +830,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
             storage
                 .create_table(
                     "orders",
@@ -859,7 +862,7 @@ mod tests {
                 .unwrap();
         } // dropped here — simulates a restart.
 
-        let reopened = InMemoryStorage::open(&path).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
         assert_eq!(
             reopened.scan("orders").unwrap(),
             vec![vec![
@@ -877,7 +880,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
             storage
                 .create_table(
                     "t",
@@ -888,7 +891,7 @@ mod tests {
             storage.insert_row("t", vec![Value::Int(1)]).unwrap();
         }
 
-        let reopened = InMemoryStorage::open(&path).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
         assert!(reopened.insert_row("t", vec![Value::Int(1)]).is_err());
 
         std::fs::remove_file(&path).ok();
@@ -946,7 +949,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
             storage
                 .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
                 .unwrap();
@@ -957,7 +960,7 @@ mod tests {
         // Reopening must replay the rows and pick the counter up from the
         // largest value actually present, not restart it from 1 — otherwise
         // a fresh auto-assigned insert would collide with an existing row.
-        let reopened = InMemoryStorage::open(&path).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
         assert_eq!(reopened.next_auto_increment("t").unwrap(), 3);
 
         std::fs::remove_file(&path).ok();

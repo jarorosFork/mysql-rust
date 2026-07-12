@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, OptsBuilder};
 
+use mysql_rust::config::SyncPolicy;
 use mysql_rust::storage::{ColumnSchema, ColumnType, InMemoryStorage, Storage, Value};
 
 const USERNAME: &str = "alice";
@@ -289,7 +290,7 @@ fn varchar_col(name: &str) -> ColumnSchema {
 #[test]
 fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
     let path = temp_data_dir("torn-tail").join("data.log");
-    let storage = InMemoryStorage::open(&path).expect("open");
+    let storage = InMemoryStorage::open(&path, SyncPolicy::Never).expect("open");
     storage
         .create_table(
             "t",
@@ -312,7 +313,7 @@ fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
 
     for truncate_at in before_last_record..after_last_record {
         std::fs::write(&path, &full_bytes[..truncate_at as usize]).expect("write truncated log");
-        let reopened = InMemoryStorage::open(&path).unwrap_or_else(|e| {
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap_or_else(|e| {
             panic!(
                 "truncating the final record at byte {truncate_at} of {after_last_record} \
                  should recover (discarding just that record), not error: {e}"
@@ -337,7 +338,7 @@ fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
 #[test]
 fn mid_file_corruption_with_valid_data_after_it_is_still_refused() {
     let path = temp_data_dir("mid-file-corrupt").join("data.log");
-    let storage = InMemoryStorage::open(&path).expect("open");
+    let storage = InMemoryStorage::open(&path, SyncPolicy::Never).expect("open");
     storage
         .create_table("t", vec![int_pk_col("id")], Some("id".to_string()))
         .expect("create table");
@@ -358,7 +359,7 @@ fn mid_file_corruption_with_valid_data_after_it_is_still_refused() {
     std::fs::write(&path, &bytes).expect("write corrupted log");
 
     assert!(
-        InMemoryStorage::open(&path).is_err(),
+        InMemoryStorage::open(&path, SyncPolicy::Never).is_err(),
         "mid-file corruption with valid data still following it must never be silently accepted"
     );
 }
