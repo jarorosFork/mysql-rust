@@ -60,6 +60,17 @@ impl ColumnType {
 pub struct ColumnSchema {
     pub name: String,
     pub column_type: ColumnType,
+    /// Whether `NULL` is a legal value for this column. A primary-key column
+    /// is always non-nullable, regardless of how it's declared (matching SQL:
+    /// `PRIMARY KEY` implies `NOT NULL`) — see `Executor::execute_create_table`.
+    pub nullable: bool,
+    /// Whether this column auto-assigns the next sequential integer value on
+    /// insert when its value is `NULL` (explicitly, or because it was omitted
+    /// from an explicit column list). At most one per table, and it must be
+    /// the primary key — this engine's single index is the primary key, and
+    /// `AUTO_INCREMENT` needs to be on an indexed column to mean anything
+    /// (see `Executor::execute_create_table`, `Storage::next_auto_increment`).
+    pub auto_increment: bool,
 }
 
 /// A table's full schema.

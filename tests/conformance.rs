@@ -274,6 +274,67 @@ async fn real_driver_create_schema_synonym() {
     drop(server);
 }
 
+/// The literal DDL DBeaver's visual table editor generated (captured
+/// verbatim from a live debug-log session, see `parser::tests::
+/// dbeaver_generated_create_table_parses` for the same text) — run through
+/// the real driver, followed by the INSERT a GUI's data editor issues, which
+/// omits the AUTO_INCREMENT column and expects the server to assign it.
+#[tokio::test]
+async fn real_driver_dbeaver_create_table_and_auto_increment_insert() {
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    conn.query_drop(
+        "CREATE TABLE testfd.NewTable (\n\
+         \tId INT auto_increment NOT NULL,\n\
+         \tName varchar(100) NULL,\n\
+         \tCONSTRAINT NewTable_PK PRIMARY KEY (Id)\n\
+         )\n\
+         DEFAULT CHARSET=utf8mb4\n\
+         COLLATE=utf8mb4_general_ci",
+    )
+    .await
+    .expect("the exact DBeaver-generated CREATE TABLE must succeed");
+
+    // A GUI data editor's generated INSERT omits the auto-increment column.
+    conn.query_drop("INSERT INTO NewTable (Name) VALUES ('Ada')")
+        .await
+        .expect("INSERT omitting the AUTO_INCREMENT column");
+    conn.query_drop("INSERT INTO NewTable (Name) VALUES ('Grace')")
+        .await
+        .expect("second INSERT");
+
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT Id, Name FROM NewTable")
+        .await
+        .expect("SELECT");
+    assert_eq!(rows, vec![(1, "Ada".to_string()), (2, "Grace".to_string())]);
+
+    // An explicit high value, then another omitted-Id insert: the sequence
+    // must jump past it rather than colliding with a duplicate-key error.
+    conn.query_drop("INSERT INTO NewTable (Id, Name) VALUES (100, 'Linus')")
+        .await
+        .expect("explicit Id value");
+    conn.query_drop("INSERT INTO NewTable (Name) VALUES ('Margaret')")
+        .await
+        .expect("auto-assigned Id must not collide with the explicit one");
+    let last: Option<i32> = conn
+        .query_first("SELECT Id FROM NewTable WHERE Name = 'Margaret'")
+        .await
+        .expect("SELECT");
+    assert_eq!(last, Some(101));
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
 #[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`

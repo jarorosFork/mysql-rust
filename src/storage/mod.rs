@@ -44,6 +44,13 @@ pub trait Storage {
     /// key at all — callers should check `table_schema` first).
     fn lookup_by_primary_key(&self, table: &str, key: &Value) -> Result<Option<Vec<Value>>>;
 
+    /// Reserve and return the next value for `table`'s `AUTO_INCREMENT`
+    /// column. Errors if the table doesn't exist or has no such column.
+    /// **Not transactional** — matching real MySQL/InnoDB, a reserved value
+    /// is never reused even if the insert that requested it is rolled back
+    /// (see `Transaction`'s implementation), so a sequence can show gaps.
+    fn next_auto_increment(&self, table: &str) -> Result<i64>;
+
     /// Register a database name. Errors if it already exists, unless
     /// `if_not_exists` is set (in which case that's a silent no-op, matching
     /// `CREATE DATABASE IF NOT EXISTS`). This is a lightweight namespace

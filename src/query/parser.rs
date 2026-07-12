@@ -78,8 +78,16 @@ pub struct ColumnDef {
     /// Recorded as-written; validated against `storage::ColumnType` by the
     /// executor at `CREATE TABLE` time.
     pub type_name: String,
-    /// Whether this column was declared `PRIMARY KEY`.
+    /// Whether this column was declared `PRIMARY KEY` (inline, or via a
+    /// table-level `PRIMARY KEY (...)` constraint naming it).
     pub is_primary_key: bool,
+    /// Whether `NULL` is a legal value (default `true`; `false` after
+    /// explicit `NOT NULL`). A primary-key column is always non-nullable
+    /// regardless of this flag (see `Executor::execute_create_table`).
+    pub nullable: bool,
+    /// Whether this column is `AUTO_INCREMENT`. Only meaningful (and only
+    /// accepted) on the primary-key column — see `Executor::execute_create_table`.
+    pub auto_increment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +171,9 @@ enum Token {
     Gt,
     Le,
     Ge,
+    /// `.` — separates a schema/table qualifier from what follows (e.g.
+    /// `information_schema.TABLES`, `mydb.mytable`).
+    Dot,
     /// `?` — a prepared-statement parameter placeholder.
     Placeholder,
 }
@@ -241,6 +252,7 @@ fn token_text(token: &Token) -> String {
         Token::Gt => ">".to_string(),
         Token::Le => "<=".to_string(),
         Token::Ge => ">=".to_string(),
+        Token::Dot => ".".to_string(),
         Token::Placeholder => "?".to_string(),
     }
 }
@@ -333,6 +345,10 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
             }
             ';' => {
                 tokens.push(Token::Semicolon);
+                i += 1;
+            }
+            '.' => {
+                tokens.push(Token::Dot);
                 i += 1;
             }
             '*' => {
@@ -535,6 +551,22 @@ fn is_database_ident(token: &Token) -> bool {
     matches!(token, Token::Ident(s) if s.eq_ignore_ascii_case("DATABASE") || s.eq_ignore_ascii_case("SCHEMA"))
 }
 
+/// Apply a table-level `PRIMARY KEY (col_list)` constraint onto the matching
+/// column in `columns`. This engine's storage supports only a single-column
+/// primary key (see `storage::Table`), so a multi-column list is rejected
+/// with a clear error rather than silently keeping just one column.
+fn apply_primary_key_constraint(columns: &mut [ColumnDef], pk_columns: &[String]) -> Result<()> {
+    let [name] = pk_columns else {
+        return Err(Error::Unsupported("composite primary keys"));
+    };
+    let col = columns
+        .iter_mut()
+        .find(|c| &c.name == name)
+        .ok_or_else(|| Error::Parse(format!("PRIMARY KEY references unknown column '{name}'")))?;
+    col.is_primary_key = true;
+    Ok(())
+}
+
 // ---------- Parser ----------
 
 struct Parser<'a> {
@@ -604,6 +636,213 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A parenthesized, comma-separated column-name list, as used by table
+    /// constraints: `(col1, col2, ...)`. A column may carry an index
+    /// prefix-length, e.g. `KEY (name(20))` — consumed, not stored (this
+    /// server has no concept of prefix indexes).
+    fn parse_parenthesized_column_list(&mut self) -> Result<Vec<String>> {
+        self.expect_punct(&Token::LParen)?;
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.expect_ident()?);
+            if let Some(Token::LParen) = self.peek() {
+                self.pos += 1;
+                match self.advance() {
+                    Some(Token::Integer(_)) => {}
+                    other => {
+                        return Err(Error::Parse(format!(
+                            "expected an integer prefix length, found {}",
+                            describe(other)
+                        )))
+                    }
+                }
+                self.expect_punct(&Token::RParen)?;
+            }
+            match self.advance() {
+                Some(Token::Comma) => continue,
+                Some(Token::RParen) => break,
+                other => {
+                    return Err(Error::Parse(format!(
+                        "expected ',' or ')', found {}",
+                        describe(other)
+                    )))
+                }
+            }
+        }
+        Ok(cols)
+    }
+
+    /// An optional bare identifier naming an index/constraint — consumed and
+    /// discarded (we don't track names beyond what's needed to parse past them).
+    fn eat_optional_name(&mut self) {
+        if matches!(self.peek(), Some(Token::Ident(_))) {
+            self.pos += 1;
+        }
+    }
+
+    /// Whether the parser is positioned at a table-level constraint —
+    /// `[CONSTRAINT name] {PRIMARY KEY | UNIQUE [KEY|INDEX] | KEY | INDEX |
+    /// FOREIGN KEY} ...` — rather than the start of another column
+    /// definition, inside a `CREATE TABLE`'s column list.
+    fn peek_is_table_constraint_start(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(Token::Keyword(Keyword::Primary)) | Some(Token::Keyword(Keyword::Key))
+        ) || self.peek_is_ident_ci("CONSTRAINT")
+            || self.peek_is_ident_ci("UNIQUE")
+            || self.peek_is_ident_ci("INDEX")
+            || self.peek_is_ident_ci("FOREIGN")
+    }
+
+    /// Parse one table-level constraint clause and apply its effect (if any)
+    /// onto `columns`. Only `PRIMARY KEY (...)` has an effect (marking the
+    /// named column primary); `UNIQUE`/plain `KEY`/`INDEX`/`FOREIGN KEY` are
+    /// parsed fully (so they don't break parsing) but not enforced — this
+    /// engine has one index (the primary key) and no referential-integrity
+    /// checking.
+    fn parse_table_constraint(&mut self, columns: &mut [ColumnDef]) -> Result<()> {
+        if self.peek_is_ident_ci("CONSTRAINT") {
+            self.pos += 1;
+            self.eat_optional_name(); // the constraint's own name
+        }
+
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Primary))) {
+            self.pos += 1;
+            self.expect_keyword(Keyword::Key)?;
+            let pk_columns = self.parse_parenthesized_column_list()?;
+            apply_primary_key_constraint(columns, &pk_columns)?;
+        } else if self.peek_is_ident_ci("UNIQUE") {
+            self.pos += 1;
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::Key)))
+                || self.peek_is_ident_ci("INDEX")
+            {
+                self.pos += 1;
+            }
+            self.eat_optional_name();
+            self.parse_parenthesized_column_list()?;
+        } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Key)))
+            || self.peek_is_ident_ci("INDEX")
+        {
+            self.pos += 1;
+            self.eat_optional_name();
+            self.parse_parenthesized_column_list()?;
+        } else if self.peek_is_ident_ci("FOREIGN") {
+            self.pos += 1;
+            self.expect_keyword(Keyword::Key)?;
+            self.eat_optional_name();
+            self.parse_parenthesized_column_list()?; // local columns
+            self.expect_ident_ci("REFERENCES")?;
+            self.expect_qualified_ident()?; // referenced table
+            self.parse_parenthesized_column_list()?; // referenced columns
+                                                     // Optional trailing `ON DELETE ...` / `ON UPDATE ...` clauses —
+                                                     // consume up to the next top-level `,`/`)`.
+            while !matches!(self.peek(), Some(Token::Comma) | Some(Token::RParen) | None) {
+                self.pos += 1;
+            }
+        } else {
+            return Err(Error::Parse(format!(
+                "expected a table constraint (PRIMARY KEY/UNIQUE/KEY/FOREIGN KEY), found {}",
+                describe(self.peek())
+            )));
+        }
+        Ok(())
+    }
+
+    /// One column definition inside `CREATE TABLE (...)`: name, type
+    /// (with optional size/precision), then any number of attributes in any
+    /// order (`NOT NULL`/`NULL`, `AUTO_INCREMENT`, `PRIMARY KEY`, `UNIQUE
+    /// [KEY]`, `DEFAULT <expr>`, `COMMENT '...'`) — matching real DDL, which
+    /// doesn't fix an attribute order.
+    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+        let name = self.expect_ident()?;
+        let type_name = self.expect_ident()?;
+
+        // Optional size/precision, e.g. VARCHAR(255) or DECIMAL(10,2);
+        // consumed, not stored (this server's types have no size parameter).
+        if let Some(Token::LParen) = self.peek() {
+            self.pos += 1;
+            loop {
+                match self.advance() {
+                    Some(Token::Integer(_)) => {}
+                    other => {
+                        return Err(Error::Parse(format!(
+                            "expected an integer in type size, found {}",
+                            describe(other)
+                        )))
+                    }
+                }
+                match self.advance() {
+                    Some(Token::Comma) => continue,
+                    Some(Token::RParen) => break,
+                    other => {
+                        return Err(Error::Parse(format!(
+                            "expected ',' or ')', found {}",
+                            describe(other)
+                        )))
+                    }
+                }
+            }
+        }
+        // UNSIGNED/ZEROFILL immediately follow a numeric type, before any
+        // other attribute; consumed, not enforced (one INT range here).
+        while self.peek_is_ident_ci("UNSIGNED") || self.peek_is_ident_ci("ZEROFILL") {
+            self.pos += 1;
+        }
+
+        let mut is_primary_key = false;
+        let mut nullable = true;
+        let mut auto_increment = false;
+        loop {
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::Null))) {
+                self.pos += 1;
+                nullable = true;
+            } else if self.peek_is_ident_ci("NOT")
+                && matches!(self.peek_at(1), Some(Token::Keyword(Keyword::Null)))
+            {
+                self.pos += 2;
+                nullable = false;
+            } else if self.peek_is_ident_ci("AUTO_INCREMENT") {
+                self.pos += 1;
+                auto_increment = true;
+            } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Primary))) {
+                self.pos += 1;
+                self.expect_keyword(Keyword::Key)?;
+                is_primary_key = true;
+            } else if self.peek_is_ident_ci("UNIQUE") {
+                self.pos += 1;
+                if matches!(self.peek(), Some(Token::Keyword(Keyword::Key))) {
+                    self.pos += 1;
+                }
+                // Not enforced beyond the primary key; parsed so it doesn't
+                // break the rest of the column definition.
+            } else if self.peek_is_ident_ci("DEFAULT") {
+                self.pos += 1;
+                self.parse_expr()?; // not modelled: no default-value substitution
+            } else if self.peek_is_ident_ci("COMMENT") {
+                self.pos += 1;
+                match self.advance() {
+                    Some(Token::Str(_)) => {}
+                    other => {
+                        return Err(Error::Parse(format!(
+                            "expected a string after COMMENT, found {}",
+                            describe(other)
+                        )))
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(ColumnDef {
+            name,
+            type_name,
+            is_primary_key,
+            nullable,
+            auto_increment,
+        })
+    }
+
     /// Consume an optional `IF NOT EXISTS`, reporting whether it was present.
     fn eat_if_not_exists(&mut self) -> Result<bool> {
         if !self.peek_is_ident_ci("IF") {
@@ -644,6 +883,22 @@ impl<'a> Parser<'a> {
                 describe(other)
             ))),
         }
+    }
+
+    /// An identifier optionally schema-qualified with one or more `.`
+    /// segments (`db.table`, or even `catalog.db.table`, as e.g.
+    /// `information_schema.TABLES` or a JDBC-generated `mydb.NewTable`).
+    /// Returns only the final segment — the object name — discarding any
+    /// qualifier: this server is schemaless (`USE`/database names are a
+    /// compatibility no-op; see `Statement::Use`), so there is nothing
+    /// meaningful to route the qualifier to.
+    fn expect_qualified_ident(&mut self) -> Result<String> {
+        let mut name = self.expect_ident()?;
+        while matches!(self.peek(), Some(Token::Dot)) {
+            self.pos += 1;
+            name = self.expect_ident()?;
+        }
+        Ok(name)
     }
 
     fn expect_punct(&mut self, expected: &Token) -> Result<()> {
@@ -839,44 +1094,30 @@ impl<'a> Parser<'a> {
         Ok(statement)
     }
 
+    /// `CREATE TABLE [db.]name (col_def | table_constraint, ...) [options]`.
+    /// The table name may be schema-qualified (see [`expect_qualified_ident`]);
+    /// each comma-separated item is either a column definition (see
+    /// [`parse_column_def`]) or a table-level constraint (see
+    /// [`parse_table_constraint`]), disambiguated by its leading token; any
+    /// trailing table options (`ENGINE=...`, `DEFAULT CHARSET=...`, ...) are
+    /// parsed only to be discarded, same as `CREATE DATABASE`'s tail.
+    ///
+    /// [`expect_qualified_ident`]: Parser::expect_qualified_ident
+    /// [`parse_column_def`]: Parser::parse_column_def
+    /// [`parse_table_constraint`]: Parser::parse_table_constraint
     fn parse_create_table(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
         self.expect_keyword(Keyword::Table)?;
-        let table = self.expect_ident()?;
+        let table = self.expect_qualified_ident()?;
         self.expect_punct(&Token::LParen)?;
 
-        let mut columns = Vec::new();
+        let mut columns: Vec<ColumnDef> = Vec::new();
         loop {
-            let name = self.expect_ident()?;
-            let type_name = self.expect_ident()?;
-            // Optional size, e.g. VARCHAR(255); consumed, not stored.
-            if let Some(Token::LParen) = self.peek() {
-                self.pos += 1;
-                match self.advance() {
-                    Some(Token::Integer(_)) => {}
-                    other => {
-                        return Err(Error::Parse(format!(
-                            "expected an integer in type size, found {}",
-                            describe(other)
-                        )))
-                    }
-                }
-                self.expect_punct(&Token::RParen)?;
-            }
-
-            let is_primary_key = if let Some(Token::Keyword(Keyword::Primary)) = self.peek() {
-                self.pos += 1;
-                self.expect_keyword(Keyword::Key)?;
-                true
+            if self.peek_is_table_constraint_start() {
+                self.parse_table_constraint(&mut columns)?;
             } else {
-                false
-            };
-
-            columns.push(ColumnDef {
-                name,
-                type_name,
-                is_primary_key,
-            });
+                columns.push(self.parse_column_def()?);
+            }
 
             match self.advance() {
                 Some(Token::Comma) => continue,
@@ -890,6 +1131,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.consume_to_statement_end();
         self.eat_semicolon_and_ensure_end()?;
         Ok(Statement::CreateTable { table, columns })
     }
@@ -897,7 +1139,7 @@ impl<'a> Parser<'a> {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Insert)?;
         self.expect_keyword(Keyword::Into)?;
-        let table = self.expect_ident()?;
+        let table = self.expect_qualified_ident()?;
 
         let columns = if let Some(Token::LParen) = self.peek() {
             self.pos += 1;
@@ -976,7 +1218,15 @@ impl<'a> Parser<'a> {
 
         let (from, selection) = if let Some(Token::Keyword(Keyword::From)) = self.peek() {
             self.pos += 1;
-            let table = self.expect_ident()?;
+            let table = self.expect_qualified_ident()?;
+            // An optional table alias (`FROM t alias` / `FROM t AS alias`) is
+            // parsed and discarded: this server doesn't support qualifying a
+            // column reference by table/alias (`alias.col`), only by name, so
+            // there's nowhere for it to be used yet — but accepting it means a
+            // query that includes one (common in generated SQL, e.g. from
+            // `information_schema` introspection) parses instead of failing
+            // at this token.
+            self.parse_optional_alias()?;
             let selection = if let Some(Token::Keyword(Keyword::Where)) = self.peek() {
                 self.pos += 1;
                 Some(self.parse_condition()?)
@@ -1298,11 +1548,15 @@ mod tests {
                         name: "id".to_string(),
                         type_name: "INT".to_string(),
                         is_primary_key: false,
+                        nullable: true,
+                        auto_increment: false,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         type_name: "VARCHAR".to_string(),
                         is_primary_key: false,
+                        nullable: true,
+                        auto_increment: false,
                     },
                 ],
             }
@@ -1347,7 +1601,144 @@ mod tests {
         ));
     }
 
+    /// The literal DDL DBeaver's visual table editor generated (captured
+    /// verbatim from a live debug-log session): a schema-qualified name,
+    /// `AUTO_INCREMENT NOT NULL`, `NULL`, a table-level named `CONSTRAINT
+    /// ... PRIMARY KEY (...)`, and trailing `DEFAULT CHARSET=...
+    /// COLLATE=...` — every one of which the original grammar rejected.
+    #[test]
+    fn dbeaver_generated_create_table_parses() {
+        let sql = "CREATE TABLE testfd.NewTable (\n\
+                    \tId INT auto_increment NOT NULL,\n\
+                    \tName varchar(100) NULL,\n\
+                    \tCONSTRAINT NewTable_PK PRIMARY KEY (Id)\n\
+                    )\n\
+                    DEFAULT CHARSET=utf8mb4\n\
+                    COLLATE=utf8mb4_general_ci";
+        let stmt = parse(sql).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        match stmt {
+            Statement::CreateTable { table, columns } => {
+                // The schema qualifier is dropped; only the table name is kept.
+                assert_eq!(table, "NewTable");
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].name, "Id");
+                assert!(
+                    columns[0].is_primary_key,
+                    "set by the table-level CONSTRAINT"
+                );
+                assert!(!columns[0].nullable, "NOT NULL, and implied by PRIMARY KEY");
+                assert!(columns[0].auto_increment);
+                assert_eq!(columns[1].name, "Name");
+                assert!(!columns[1].is_primary_key);
+                assert!(columns[1].nullable);
+                assert!(!columns[1].auto_increment);
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_name_can_be_schema_qualified() {
+        let stmt = parse("CREATE TABLE mydb.t (a INT)").unwrap();
+        match stmt {
+            Statement::CreateTable { table, .. } => assert_eq!(table, "t"),
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_null_and_null_column_attributes() {
+        let stmt = parse("CREATE TABLE t (a INT NOT NULL, b INT NULL, c INT)").unwrap();
+        match stmt {
+            Statement::CreateTable { columns, .. } => {
+                assert!(!columns[0].nullable);
+                assert!(columns[1].nullable);
+                assert!(columns[2].nullable, "nullable by default");
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_increment_column_attribute() {
+        let stmt = parse("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY)").unwrap();
+        match stmt {
+            Statement::CreateTable { columns, .. } => {
+                assert!(columns[0].auto_increment);
+                assert!(columns[0].is_primary_key);
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_level_primary_key_constraint_marks_the_column() {
+        let stmt = parse("CREATE TABLE t (id INT, name VARCHAR, PRIMARY KEY (id))").unwrap();
+        match stmt {
+            Statement::CreateTable { columns, .. } => {
+                assert!(columns[0].is_primary_key);
+                assert!(!columns[1].is_primary_key);
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_level_composite_primary_key_is_unsupported() {
+        assert!(matches!(
+            parse("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn table_level_primary_key_unknown_column_is_a_parse_error() {
+        assert!(matches!(
+            parse("CREATE TABLE t (a INT, PRIMARY KEY (bogus))"),
+            Err(Error::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn unique_key_index_and_foreign_key_constraints_are_parsed_and_discarded() {
+        assert!(parse("CREATE TABLE t (a INT, UNIQUE (a))").is_ok());
+        assert!(parse("CREATE TABLE t (a INT, UNIQUE KEY uq_a (a))").is_ok());
+        assert!(parse("CREATE TABLE t (a INT, KEY idx_a (a))").is_ok());
+        assert!(parse("CREATE TABLE t (a INT, INDEX idx_a (a))").is_ok());
+        assert!(parse(
+            "CREATE TABLE t (a INT, b INT, \
+             CONSTRAINT fk_b FOREIGN KEY (b) REFERENCES other(id) ON DELETE CASCADE)"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn column_default_comment_and_unique_attributes_are_parsed_and_discarded() {
+        assert!(parse("CREATE TABLE t (a INT DEFAULT 0, b VARCHAR DEFAULT NULL)").is_ok());
+        assert!(parse("CREATE TABLE t (a INT COMMENT 'a column')").is_ok());
+        assert!(parse("CREATE TABLE t (a INT UNIQUE, b INT UNIQUE KEY)").is_ok());
+        assert!(parse("CREATE TABLE t (a INT UNSIGNED, b BIGINT ZEROFILL)").is_ok());
+    }
+
+    #[test]
+    fn create_table_trailing_options_are_discarded() {
+        assert!(parse(
+            "CREATE TABLE t (a INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+             COLLATE=utf8mb4_general_ci COMMENT='a table'"
+        )
+        .is_ok());
+    }
+
     // ---- INSERT ----
+
+    #[test]
+    fn insert_into_qualified_table_name() {
+        let stmt = parse("INSERT INTO mydb.t VALUES (1)").unwrap();
+        match stmt {
+            Statement::Insert { table, .. } => assert_eq!(table, "t"),
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
 
     #[test]
     fn insert_with_explicit_columns_multi_row() {
@@ -1551,6 +1942,27 @@ mod tests {
     }
 
     // ---- SELECT ----
+
+    #[test]
+    fn select_from_qualified_table_name() {
+        let stmt = parse("SELECT * FROM information_schema.TABLES").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::Select {
+                projection: vec![SelectItem::Wildcard],
+                from: Some("TABLES".to_string()),
+                selection: None,
+            }
+        );
+    }
+
+    #[test]
+    fn select_from_table_with_bare_and_as_alias() {
+        assert!(parse("SELECT * FROM t alias").is_ok());
+        assert!(parse("SELECT * FROM t AS alias").is_ok());
+        // The alias is parsed and discarded, but WHERE afterward still works.
+        assert!(parse("SELECT * FROM t alias WHERE a = 1").is_ok());
+    }
 
     #[test]
     fn select_wildcard_from_table() {

@@ -27,6 +27,12 @@ struct Table {
     /// Primary-key value -> row index. Empty (and unused) if `primary_key`
     /// is `None`.
     index: HashMap<Value, usize>,
+    /// `(column index, next value)` for this table's `AUTO_INCREMENT`
+    /// column, if it has one. Bumped by every inserted row (live or
+    /// replayed — see `push_trusted`) to stay ahead of the largest value
+    /// actually present, so restart-then-insert and explicit-value-then-
+    /// auto-assign both continue correctly, matching real MySQL.
+    auto_increment: Option<(usize, i64)>,
 }
 
 impl Table {
@@ -34,12 +40,17 @@ impl Table {
         let primary_key_index = primary_key
             .as_ref()
             .and_then(|pk| columns.iter().position(|c| &c.name == pk));
+        let auto_increment = columns
+            .iter()
+            .position(|c| c.auto_increment)
+            .map(|idx| (idx, 1i64));
         Table {
             columns,
             primary_key,
             primary_key_index,
             rows: Vec::new(),
             index: HashMap::new(),
+            auto_increment,
         }
     }
 
@@ -48,6 +59,11 @@ impl Table {
     fn push_trusted(&mut self, row: Vec<Value>) {
         if let Some(idx) = self.primary_key_index {
             self.index.insert(row[idx].clone(), self.rows.len());
+        }
+        if let Some((ai_idx, next)) = &mut self.auto_increment {
+            if let Value::Int(v) = row[*ai_idx] {
+                *next = (*next).max(v + 1);
+            }
         }
         self.rows.push(row);
     }
@@ -250,6 +266,19 @@ impl Storage for InMemoryStorage {
         Ok(t.index.get(key).map(|&idx| t.rows[idx].clone()))
     }
 
+    fn next_auto_increment(&self, table: &str) -> Result<i64> {
+        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+        let t = tables
+            .get_mut(table)
+            .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
+        let (_, next) = t.auto_increment.as_mut().ok_or_else(|| {
+            Error::Execution(format!("Table '{table}' has no AUTO_INCREMENT column"))
+        })?;
+        let value = *next;
+        *next += 1;
+        Ok(value)
+    }
+
     fn create_database(&self, name: &str, if_not_exists: bool) -> Result<()> {
         let mut databases = self.databases.write().unwrap_or_else(|e| e.into_inner());
         if databases.contains(name) {
@@ -291,6 +320,8 @@ mod tests {
         ColumnSchema {
             name: name.to_string(),
             column_type: ty,
+            nullable: true,
+            auto_increment: false,
         }
     }
 
@@ -515,6 +546,75 @@ mod tests {
 
         let reopened = InMemoryStorage::open(&path).unwrap();
         assert!(reopened.insert_row("t", vec![Value::Int(1)]).is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn auto_increment_col(name: &str) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            column_type: ColumnType::Int,
+            nullable: false,
+            auto_increment: true,
+        }
+    }
+
+    #[test]
+    fn next_auto_increment_returns_sequential_values() {
+        let storage = InMemoryStorage::new();
+        storage
+            .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
+            .unwrap();
+        assert_eq!(storage.next_auto_increment("t").unwrap(), 1);
+        assert_eq!(storage.next_auto_increment("t").unwrap(), 2);
+        assert_eq!(storage.next_auto_increment("t").unwrap(), 3);
+    }
+
+    #[test]
+    fn next_auto_increment_errors_on_missing_table_or_no_such_column() {
+        let storage = InMemoryStorage::new();
+        assert!(storage.next_auto_increment("missing").is_err());
+
+        storage
+            .create_table("t", vec![col("a", ColumnType::Int)], None)
+            .unwrap();
+        assert!(
+            storage.next_auto_increment("t").is_err(),
+            "table has no AUTO_INCREMENT column"
+        );
+    }
+
+    #[test]
+    fn inserting_an_explicit_value_advances_the_auto_increment_counter() {
+        let storage = InMemoryStorage::new();
+        storage
+            .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
+            .unwrap();
+        storage.insert_row("t", vec![Value::Int(41)]).unwrap();
+        // The counter must jump past the manually-inserted value, not
+        // collide with it.
+        assert_eq!(storage.next_auto_increment("t").unwrap(), 42);
+    }
+
+    #[test]
+    fn auto_increment_sequence_continues_correctly_after_reopening() {
+        let path = temp_path("persist-auto-increment");
+        std::fs::remove_file(&path).ok();
+
+        {
+            let storage = InMemoryStorage::open(&path).unwrap();
+            storage
+                .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
+                .unwrap();
+            storage.insert_row("t", vec![Value::Int(1)]).unwrap();
+            storage.insert_row("t", vec![Value::Int(2)]).unwrap();
+        }
+
+        // Reopening must replay the rows and pick the counter up from the
+        // largest value actually present, not restart it from 1 — otherwise
+        // a fresh auto-assigned insert would collide with an existing row.
+        let reopened = InMemoryStorage::open(&path).unwrap();
+        assert_eq!(reopened.next_auto_increment("t").unwrap(), 3);
 
         std::fs::remove_file(&path).ok();
     }

@@ -181,6 +181,12 @@ impl Storage for Transaction {
             .and_then(|rows| rows.iter().find(|r| &r[pk_idx] == key).cloned()))
     }
 
+    // Real MySQL/InnoDB never rolls back a reserved AUTO_INCREMENT value
+    // either — go straight to the real storage, same as create_table.
+    fn next_auto_increment(&self, table: &str) -> Result<i64> {
+        self.storage.next_auto_increment(table)
+    }
+
     // Database-name registration isn't part of the buffered-write model at
     // all (unlike table rows) — same as `create_table`, it goes straight to
     // the real storage, "auto-committing" immediately.
@@ -211,10 +217,14 @@ mod tests {
                     ColumnSchema {
                         name: "id".to_string(),
                         column_type: ColumnType::Int,
+                        nullable: false,
+                        auto_increment: false,
                     },
                     ColumnSchema {
                         name: "name".to_string(),
                         column_type: ColumnType::Varchar,
+                        nullable: true,
+                        auto_increment: false,
                     },
                 ],
                 Some("id".to_string()),

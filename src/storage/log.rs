@@ -26,6 +26,9 @@ const VALUE_VARCHAR: u8 = 2;
 const COLUMN_TYPE_INT: u8 = 0;
 const COLUMN_TYPE_VARCHAR: u8 = 1;
 
+const COLUMN_FLAG_NULLABLE: u8 = 0b01;
+const COLUMN_FLAG_AUTO_INCREMENT: u8 = 0b10;
+
 /// One replayed operation from the log.
 pub enum Entry {
     CreateTable {
@@ -83,6 +86,14 @@ fn encode_create_table(
             ColumnType::Int => COLUMN_TYPE_INT,
             ColumnType::Varchar => COLUMN_TYPE_VARCHAR,
         });
+        let mut flags = 0u8;
+        if col.nullable {
+            flags |= COLUMN_FLAG_NULLABLE;
+        }
+        if col.auto_increment {
+            flags |= COLUMN_FLAG_AUTO_INCREMENT;
+        }
+        buf.push(flags);
     }
     buf
 }
@@ -176,7 +187,13 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
                     COLUMN_TYPE_VARCHAR => ColumnType::Varchar,
                     other => return Err(corrupt(&format!("unknown column type tag {other}"))),
                 };
-                columns.push(ColumnSchema { name, column_type });
+                let flags = read_byte(bytes, &mut pos)?;
+                columns.push(ColumnSchema {
+                    name,
+                    column_type,
+                    nullable: flags & COLUMN_FLAG_NULLABLE != 0,
+                    auto_increment: flags & COLUMN_FLAG_AUTO_INCREMENT != 0,
+                });
             }
             Ok(Entry::CreateTable {
                 table,
@@ -281,10 +298,14 @@ mod tests {
                     ColumnSchema {
                         name: "a".to_string(),
                         column_type: ColumnType::Int,
+                        nullable: false,
+                        auto_increment: false,
                     },
                     ColumnSchema {
                         name: "b".to_string(),
                         column_type: ColumnType::Varchar,
+                        nullable: true,
+                        auto_increment: false,
                     },
                 ],
                 Some("a"),

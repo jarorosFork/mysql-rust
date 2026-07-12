@@ -119,10 +119,14 @@ impl<'a> Executor<'a> {
         let text_col = |name: &str| ColumnSchema {
             name: name.to_string(),
             column_type: ColumnType::Varchar,
+            nullable: true,
+            auto_increment: false,
         };
         let int_col = |name: &str| ColumnSchema {
             name: name.to_string(),
             column_type: ColumnType::Int,
+            nullable: true,
+            auto_increment: false,
         };
         match show {
             ShowStatement::Databases => {
@@ -212,6 +216,7 @@ impl<'a> Executor<'a> {
 
     fn execute_create_table(&self, table: &str, columns: Vec<ColumnDef>) -> Result<QueryResult> {
         let mut primary_key = None;
+        let mut auto_increment_column = None;
         let mut schema_columns = Vec::with_capacity(columns.len());
         for col in columns {
             let column_type = ColumnType::from_name(&col.type_name).ok_or_else(|| {
@@ -228,10 +233,33 @@ impl<'a> Executor<'a> {
                 }
                 primary_key = Some(col.name.clone());
             }
+            if col.auto_increment {
+                if auto_increment_column.is_some() {
+                    return Err(Error::Unsupported(
+                        "more than one AUTO_INCREMENT column per table",
+                    ));
+                }
+                auto_increment_column = Some(col.name.clone());
+            }
             schema_columns.push(ColumnSchema {
                 name: col.name,
                 column_type,
+                // PRIMARY KEY implies NOT NULL, regardless of how the column
+                // was actually declared — matches standard SQL.
+                nullable: !col.is_primary_key && col.nullable,
+                auto_increment: col.auto_increment,
             });
+        }
+
+        // This engine has exactly one index — the primary key — so an
+        // AUTO_INCREMENT column (which real MySQL requires to be indexed)
+        // must be it.
+        if let Some(name) = &auto_increment_column {
+            if primary_key.as_deref() != Some(name.as_str()) {
+                return Err(Error::Unsupported(
+                    "AUTO_INCREMENT on a column that isn't the PRIMARY KEY",
+                ));
+            }
         }
 
         self.storage
@@ -264,11 +292,16 @@ impl<'a> Executor<'a> {
 
             let mut values = Vec::with_capacity(ordered_exprs.len());
             for (expr, col) in ordered_exprs.iter().zip(schema.columns.iter()) {
-                let value = coerce(expr, col.column_type, &col.name)?;
-                if value == Value::Null && schema.primary_key.as_deref() == Some(col.name.as_str())
-                {
+                let mut value = coerce(expr, col.column_type, &col.name)?;
+                // A NULL AUTO_INCREMENT value (explicit, or via reorder_exprs
+                // defaulting an omitted column) gets the next sequence value
+                // instead of being subject to the NOT NULL check below.
+                if value == Value::Null && col.auto_increment {
+                    value = Value::Int(self.storage.next_auto_increment(table)?);
+                }
+                if value == Value::Null && !col.nullable {
                     return Err(Error::Execution(format!(
-                        "Column '{}' cannot be NULL (primary key)",
+                        "Column '{}' cannot be NULL",
                         col.name
                     )));
                 }
@@ -342,6 +375,8 @@ impl<'a> Executor<'a> {
             columns.push(ColumnSchema {
                 name: alias.unwrap_or(default_name),
                 column_type,
+                nullable: true,
+                auto_increment: false,
             });
             values.push(value);
         }
@@ -569,13 +604,17 @@ fn reorder_exprs(
 
     table_columns
         .iter()
-        .map(|col| {
-            named.remove(col.name.as_str()).ok_or_else(|| {
-                Error::Execution(format!(
-                    "Column '{}' has no default value and was not given a value",
-                    col.name
-                ))
-            })
+        .map(|col| match named.remove(col.name.as_str()) {
+            Some(expr) => Ok(expr),
+            // An omitted AUTO_INCREMENT column defaults to NULL, which
+            // execute_insert then substitutes with the next sequence value —
+            // matching real MySQL, where naming an explicit column list
+            // without the auto-increment column is the normal way to insert.
+            None if col.auto_increment => Ok(Expr::Null),
+            None => Err(Error::Execution(format!(
+                "Column '{}' has no default value and was not given a value",
+                col.name
+            ))),
         })
         .collect()
 }
@@ -934,6 +973,102 @@ mod tests {
         assert!(matches!(
             run(&storage, "INSERT INTO t VALUES (NULL)"),
             Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn insert_null_into_explicit_not_null_column_is_rejected() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT NOT NULL)").expect("create");
+        assert!(matches!(
+            run(&storage, "INSERT INTO t VALUES (NULL)"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn insert_null_into_a_nullable_column_is_allowed() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT NULL)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (NULL)").expect("insert");
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn auto_increment_assigns_sequential_ids_when_omitted() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)",
+        )
+        .expect("create");
+        run(&storage, "INSERT INTO t (name) VALUES ('alice')").expect("insert 1");
+        run(&storage, "INSERT INTO t (name) VALUES ('bob')").expect("insert 2");
+        let result = run(&storage, "SELECT id, name FROM t").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![int(1), vc("alice")], vec![int(2), vc("bob")],]
+        );
+    }
+
+    #[test]
+    fn auto_increment_assigns_when_value_is_explicitly_null() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)",
+        )
+        .expect("create");
+        run(&storage, "INSERT INTO t VALUES (NULL, 'alice')").expect("insert");
+        let result = run(&storage, "SELECT id FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![int(1)]]);
+    }
+
+    #[test]
+    fn auto_increment_continues_after_an_explicit_higher_value() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY)",
+        )
+        .expect("create");
+        run(&storage, "INSERT INTO t VALUES (100)").expect("explicit value");
+        run(&storage, "INSERT INTO t VALUES (NULL)").expect("auto-assigned");
+        let result = run(&storage, "SELECT id FROM t").expect("select");
+        let mut ids: Vec<i64> = result
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Int(n) => n,
+                ref other => panic!("expected an int, got {other:?}"),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![100, 101]);
+    }
+
+    #[test]
+    fn auto_increment_on_a_non_primary_key_column_is_unsupported() {
+        let storage = InMemoryStorage::new();
+        assert!(matches!(
+            run(
+                &storage,
+                "CREATE TABLE t (id INT PRIMARY KEY, seq INT AUTO_INCREMENT)"
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn more_than_one_auto_increment_column_is_unsupported() {
+        let storage = InMemoryStorage::new();
+        assert!(matches!(
+            run(
+                &storage,
+                "CREATE TABLE t (a INT AUTO_INCREMENT PRIMARY KEY, b INT AUTO_INCREMENT)"
+            ),
+            Err(Error::Unsupported(_))
         ));
     }
 
