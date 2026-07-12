@@ -1,13 +1,41 @@
 //! A minimal write-ahead log for on-disk persistence.
 //!
 //! Every mutation (`CREATE TABLE`, row insert) is appended as one
-//! length-prefixed entry; reopening a data file replays every entry in
-//! order to rebuild the in-memory state. This is deliberately simple —
-//! no checkpointing/compaction, no fsync durability guarantees beyond what
-//! `File::write_all` gives — but it satisfies "data written before shutdown
-//! is present after restart" (ROADMAP.md Phase 5) without the complexity of
-//! a production WAL, which the roadmap explicitly allows ("write-ahead or
-//! file-backed").
+//! length-prefixed, checksummed entry; reopening a data file replays every
+//! entry in order to rebuild the in-memory state. This is deliberately
+//! simple — no checkpointing/compaction yet — but it satisfies "data
+//! written before shutdown is present after restart" (ROADMAP.md Phase 5)
+//! without the complexity of a production WAL, which the roadmap
+//! explicitly allows ("write-ahead or file-backed"). See
+//! PERFORMANCE_DURABILITY_PLAN.md for what's still missing (`fsync`
+//! durability, atomic multi-record commits) and what this module already
+//! closed (checksums, torn-tail recovery).
+//!
+//! ## Record framing and crash recovery
+//!
+//! Each record on disk is `[len: u32 LE][crc: u32 LE][payload: len bytes]`,
+//! where `crc` is a CRC-32 over `len`'s own four bytes *and* the payload
+//! together — covering the length field itself, not just the payload, is
+//! what makes the recovery below safe (see [`read_record`]).
+//!
+//! [`Log::open`] replays records front to back. A crash can only ever cut
+//! off the *end* of a file (the OS writes bytes in order), so any problem
+//! reading a record breaks into exactly two cases:
+//!
+//! - **Nothing decodable follows**: either there aren't enough bytes left
+//!   for a full header, the header's claimed length runs past the end of
+//!   the file, or the checksum fails and this is the last record the file
+//!   has. All three are exactly what an interrupted write looks like, so
+//!   this is a **torn tail** — recovery discards it and the file is
+//!   truncated on disk to the last good record, so a subsequent append
+//!   lands right after the good data instead of after orphaned garbage
+//!   (which would otherwise turn a torn tail from *this* crash into
+//!   apparent mid-file corruption after the *next* one).
+//! - **The checksum fails but more (structured-looking) data follows it**:
+//!   this cannot be explained by a crash — a torn write never leaves valid
+//!   bytes *after* the damage — so it's treated as unrecoverable
+//!   corruption and [`Log::open`] refuses outright rather than silently
+//!   discarding a suffix of data that might still be intact.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -132,6 +160,39 @@ fn corrupt(context: &str) -> Error {
     Error::Execution(format!("corrupt data file: {context}"))
 }
 
+/// CRC-32 (the IEEE 802.3/zlib/gzip/PNG variant: reflected input and
+/// output, polynomial `0xEDB88320`, initial value and final XOR both
+/// `0xFFFFFFFF`). Hand-rolled rather than a dependency — matching
+/// `auth::sha1`/`auth::sha256`, this is small, well-known, and fully
+/// verifiable against a published test vector (see the module's tests):
+/// CRC-32(`"123456789"`) = `0xCBF43926` is the standard "check value"
+/// essentially every CRC-32 implementation is tested against.
+fn crc32(data: &[u8]) -> u32 {
+    const POLY: u32 = 0xEDB88320;
+    let mut crc = 0xFFFFFFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if crc & 1 == 1 {
+                crc = (crc >> 1) ^ POLY;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// The checksum stored in a record's header: covers `len`'s own four bytes
+/// *and* the payload together, not just the payload — see the module doc
+/// comment for why that's what makes torn-tail recovery safe.
+fn record_crc(len: u32, payload: &[u8]) -> u32 {
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(payload);
+    crc32(&buf)
+}
+
 fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
     let end = pos
         .checked_add(4)
@@ -242,6 +303,53 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
     }
 }
 
+/// The outcome of trying to read one record starting at a given position —
+/// see the module doc comment for the reasoning behind each case.
+enum RecordRead<'a> {
+    /// A complete, checksum-verified record.
+    Ok { payload: &'a [u8], next_pos: usize },
+    /// Nothing decodable follows: an incomplete header, a header whose
+    /// claimed length runs past the end of the file, or a checksum
+    /// mismatch on what is (per `next_valid_after` below) the last record
+    /// in the file. Every one of these is what an interrupted write looks
+    /// like — recoverable by discarding from here on.
+    TornTail,
+    /// A checksum mismatch with more (structured-looking) data still
+    /// following — not explainable by a crash, since a torn write can only
+    /// ever damage the tail. Not recoverable.
+    Corrupt,
+}
+
+/// Try to read one record at `pos`. `file_len` is `bytes.len()`, passed
+/// separately so this needs only the current record's own bytes rather
+/// than the whole file — a checksum mismatch is only a torn tail if this
+/// record's claimed end is the physical end of the file.
+fn read_record(bytes: &[u8], pos: usize, file_len: usize) -> RecordRead<'_> {
+    let Some(header) = bytes.get(pos..pos.saturating_add(8)) else {
+        return RecordRead::TornTail;
+    };
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let payload_start = pos + 8;
+    let Some(payload_end) = payload_start.checked_add(len as usize) else {
+        return RecordRead::TornTail;
+    };
+    let Some(payload) = bytes.get(payload_start..payload_end) else {
+        return RecordRead::TornTail;
+    };
+    if record_crc(len, payload) != crc {
+        return if payload_end == file_len {
+            RecordRead::TornTail
+        } else {
+            RecordRead::Corrupt
+        };
+    }
+    RecordRead::Ok {
+        payload,
+        next_pos: payload_end,
+    }
+}
+
 /// An open, append-only log file.
 pub struct Log {
     file: File,
@@ -249,22 +357,37 @@ pub struct Log {
 
 impl Log {
     /// Open (creating if necessary) the log at `path` and replay every
-    /// entry in order, feeding each to `apply`.
+    /// entry in order, feeding each to `apply`. A torn trailing record —
+    /// what a crash produces — is discarded and truncated away on disk;
+    /// checksum-failed corruption with valid data still following it is
+    /// refused (see the module doc comment).
     pub fn open(path: &Path, mut apply: impl FnMut(Entry)) -> Result<Self> {
         let existing = std::fs::read(path);
         match existing {
             Ok(bytes) => {
                 let mut pos = 0;
                 while pos < bytes.len() {
-                    let len = read_u32(&bytes, &mut pos)? as usize;
-                    let end = pos
-                        .checked_add(len)
-                        .ok_or_else(|| corrupt("entry length overflow"))?;
-                    let entry_bytes = bytes
-                        .get(pos..end)
-                        .ok_or_else(|| corrupt("truncated entry"))?;
-                    apply(decode_entry(entry_bytes)?);
-                    pos = end;
+                    match read_record(&bytes, pos, bytes.len()) {
+                        RecordRead::Ok { payload, next_pos } => {
+                            apply(decode_entry(payload)?);
+                            pos = next_pos;
+                        }
+                        RecordRead::TornTail => break,
+                        RecordRead::Corrupt => {
+                            return Err(corrupt(
+                                "checksum mismatch with valid data still following it",
+                            ));
+                        }
+                    }
+                }
+                if pos < bytes.len() {
+                    // A torn tail was discarded above: truncate it away on
+                    // disk too, so the next append lands right after the
+                    // last good record rather than after orphaned garbage
+                    // (which would make this crash's torn tail look like
+                    // mid-file corruption after the *next* one).
+                    let file = OpenOptions::new().write(true).open(path)?;
+                    file.set_len(pos as u64)?;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -276,8 +399,11 @@ impl Log {
     }
 
     fn append(&mut self, entry_bytes: &[u8]) -> Result<()> {
-        let mut framed = Vec::with_capacity(4 + entry_bytes.len());
-        write_u32(&mut framed, entry_bytes.len() as u32);
+        let len = entry_bytes.len() as u32;
+        let crc = record_crc(len, entry_bytes);
+        let mut framed = Vec::with_capacity(8 + entry_bytes.len());
+        write_u32(&mut framed, len);
+        write_u32(&mut framed, crc);
         framed.extend_from_slice(entry_bytes);
         self.file.write_all(&framed)?;
         self.file.flush()?;
@@ -457,13 +583,100 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_entry_not_panicking() {
-        let path = temp_path("truncated");
-        std::fs::write(&path, [5, 0, 0, 0, 1, 2, 3]).unwrap(); // claims 5 bytes, has 3
+    fn recovers_from_a_torn_trailing_record_by_truncating_it_away() {
+        let path = temp_path("torn-tail");
+        let mut log = Log::open(&path, |_| {}).unwrap();
+        log.append_insert_row("t", &[Value::Int(1)]).unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+        log.append_insert_row("t", &[Value::Int(2)]).unwrap();
+        let full_len = std::fs::metadata(&path).unwrap().len();
+        drop(log);
+        let full_bytes = std::fs::read(&path).unwrap();
 
-        let result = Log::open(&path, |_| {});
-        assert!(result.is_err());
+        for truncate_at in good_len..full_len {
+            std::fs::write(&path, &full_bytes[..truncate_at as usize]).unwrap();
+            let mut replayed = Vec::new();
+            Log::open(&path, |e| replayed.push(e)).unwrap_or_else(|e| {
+                panic!(
+                    "truncating the trailing record at byte {truncate_at} of {full_len} \
+                     should recover, not error: {e}"
+                )
+            });
+            assert_eq!(
+                replayed.len(),
+                1,
+                "only the fully-written first record should replay (truncated at {truncate_at})"
+            );
+            // The garbage tail should be truncated away on disk too, so a
+            // later append doesn't leave a gap of orphaned bytes before it.
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+        }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_file_too_short_for_even_one_record_header_recovers_as_empty() {
+        let path = temp_path("truncated-header");
+        // Not even a full 8-byte [len][crc] header -- exactly what a crash
+        // right after the very first write ever looks like.
+        std::fs::write(&path, [5, 0, 0, 0, 1, 2, 3]).unwrap();
+
+        let mut seen = 0;
+        Log::open(&path, |_| seen += 1).expect("a torn header should recover, not error");
+        assert_eq!(seen, 0);
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            0,
+            "the garbage should be truncated away"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mid_file_checksum_mismatch_with_valid_data_after_it_is_refused() {
+        let path = temp_path("mid-file-corrupt");
+        let mut log = Log::open(&path, |_| {}).unwrap();
+        log.append_insert_row("t", &[Value::Int(1)]).unwrap(); // record A
+        let before_record_b = std::fs::metadata(&path).unwrap().len();
+        log.append_insert_row("t", &[Value::Int(2)]).unwrap(); // record B -- corrupted below
+        log.append_insert_row("t", &[Value::Int(3)]).unwrap(); // record C -- stays valid, still follows
+        drop(log);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Flip a byte right after record B's 8-byte header (its payload's
+        // first byte). Record C's bytes are still intact and present after
+        // it -- exactly what makes this mid-file damage, not a torn tail.
+        let record_b_payload_start = before_record_b as usize + 8;
+        bytes[record_b_payload_start] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            Log::open(&path, |_| {}).is_err(),
+            "checksum-failed corruption with valid data still following it must be refused"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        // The canonical CRC-32 (IEEE 802.3) test vector, used to validate
+        // essentially every implementation of this algorithm.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn crc32_of_empty_input_is_zero() {
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn crc32_detects_a_single_flipped_bit() {
+        let original = crc32(b"mysql-rust");
+        let mut corrupted = *b"mysql-rust";
+        corrupted[3] ^= 0x01;
+        assert_ne!(original, crc32(&corrupted));
     }
 }

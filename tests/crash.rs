@@ -281,14 +281,13 @@ fn varchar_col(name: &str) -> ColumnSchema {
 
 /// A torn final log record — the *normal* artifact of any crash, since the
 /// last `write()` in flight when a process dies is exactly as likely to be
-/// incomplete as complete — currently makes `InMemoryStorage::open` refuse
-/// to start at all (PERFORMANCE_DURABILITY_PLAN.md D4). It should instead
-/// recover by discarding just the incomplete tail record, matching
-/// Postgres/InnoDB/SQLite/RocksDB recovery behavior. Sweeps every possible
-/// truncation point within the final record so the fix has to be correct
-/// at each byte boundary, not just "mostly".
+/// incomplete as complete — `InMemoryStorage::open` recovers by discarding
+/// just the incomplete tail record (PERFORMANCE_DURABILITY_PLAN.md D4/D5),
+/// matching Postgres/InnoDB/SQLite/RocksDB recovery behavior, rather than
+/// refusing to start at all. Sweeps every possible truncation point within
+/// the final record so the fix has to be correct at each byte boundary,
+/// not just "mostly".
 #[test]
-#[ignore = "PERFORMANCE_DURABILITY_PLAN.md D4 (needs D5's checksums to detect a torn record): un-ignore once truncate-and-recover lands"]
 fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
     let path = temp_data_dir("torn-tail").join("data.log");
     let storage = InMemoryStorage::open(&path).expect("open");
@@ -349,15 +348,14 @@ fn mid_file_corruption_with_valid_data_after_it_is_still_refused() {
     drop(storage);
 
     let mut bytes = std::fs::read(&path).expect("read log");
-    // Every record is framed as `[u32 outer length][entry bytes...]`, and
-    // an entry's very first byte is a tag identifying which kind it is
-    // (`decode_entry`) -- corrupting exactly that byte to a value no tag
-    // uses is guaranteed to fail decoding regardless of the rest of the
-    // format, without hardcoding the tag constants themselves. Row 2's
-    // record follows row 1's untouched record, so this is unambiguously
-    // "damage in the middle", not "torn at the end".
-    let row2_tag_offset = before_row2 as usize + 4;
-    bytes[row2_tag_offset] = 0xFF;
+    // Every record is framed as `[u32 len][u32 crc][entry bytes...]`
+    // (storage::log) -- flipping any payload byte breaks its checksum
+    // regardless of the rest of the format, without hardcoding the tag
+    // constants themselves. Row 2's record follows row 1's untouched
+    // record, so this is unambiguously "damage in the middle", not "torn
+    // at the end".
+    let row2_payload_offset = before_row2 as usize + 8;
+    bytes[row2_payload_offset] ^= 0xFF;
     std::fs::write(&path, &bytes).expect("write corrupted log");
 
     assert!(

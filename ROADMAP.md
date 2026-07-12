@@ -441,6 +441,12 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       (was 397). fmt + clippy `-D warnings` clean.)_
 - [ ] PD-1 — Durability core: CRC framing, torn-tail recovery, WAL
       ordering, atomic commit records, fsync policy + directory fsync.
+      _(In progress: CRC-checked record framing + torn-tail recovery done
+      2026-07-12 — see PERFORMANCE_DURABILITY_PLAN.md's D4/D5 entry for the
+      full design (why the checksum has to cover the length field, not
+      just the payload, for recovery to be safe) and proof (406 tests,
+      PD-0's own torn-tail assertion un-ignored and green). WAL ordering,
+      atomic commit records, and fsync policy remain.)_
 - [ ] PD-2 — Write-path architecture: dedicated log-writer thread with
       group commit.
 - [ ] PD-3 — Query-path performance: `TCP_NODELAY`, single-buffer

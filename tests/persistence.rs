@@ -239,24 +239,76 @@ fn no_data_dir_means_nothing_persists() {
     }
 }
 
+/// A crash can only ever truncate the *end* of the data file — an
+/// incomplete trailing record is exactly what that looks like, and
+/// PERFORMANCE_DURABILITY_PLAN.md D4 makes it recoverable: the incomplete
+/// record is discarded rather than the whole server refusing to start.
+/// (Superseded the file's previous version of this test, which — before
+/// D4/D5's torn-tail recovery landed — expected this same byte pattern to
+/// be rejected outright; see `reopening_a_file_with_mid_file_corruption_
+/// errors_instead_of_panicking` below for the case that's still refused.)
 #[test]
-fn reopening_a_corrupt_data_file_errors_instead_of_panicking() {
-    let dir = temp_dir("corrupt");
+fn reopening_a_file_with_a_torn_trailing_record_recovers_without_panicking() {
+    use mysql_rust::storage::Storage;
+
+    let dir = temp_dir("torn-tail");
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("data.log"), [255, 255, 255, 255, 1, 2]).unwrap(); // bogus length prefix
+    // A record header claiming far more payload than the file actually
+    // has — exactly what a crash mid-write of the very first record ever
+    // looks like.
+    std::fs::write(dir.join("data.log"), [255, 255, 255, 255, 1, 2]).unwrap();
 
-    // The listener setup in spawn_server always succeeds; the corrupt file
-    // only surfaces when the server tries to open storage for a connection,
-    // which happens inside a background thread (see Connection::new in
-    // src/server/connection.rs — it now returns a Result for exactly this
-    // reason). We can't observe that failure through the socket (the
-    // connection is simply never driven), so assert directly against the
-    // storage layer instead, which is what actually fails.
+    let storage = mysql_rust::storage::InMemoryStorage::open_in_dir(&dir)
+        .expect("a torn trailing record should recover, not error or panic");
+    assert!(storage.tables().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The complement of the torn-tail case: corruption that is *not* confined
+/// to the final record — here, the first of two insert records is
+/// damaged while the second, fully-valid one still follows it — can never
+/// be explained by a crash (which only ever damages the tail), so it must
+/// still be refused, not silently truncated away.
+#[test]
+fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking() {
+    use mysql_rust::storage::{ColumnSchema, ColumnType, Storage, Value};
+
+    let dir = temp_dir("mid-file-corrupt");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("data.log");
+
+    let storage = mysql_rust::storage::InMemoryStorage::open(&path).unwrap();
+    storage
+        .create_table(
+            "t",
+            vec![ColumnSchema {
+                name: "id".to_string(),
+                column_type: ColumnType::Int,
+                nullable: false,
+                auto_increment: false,
+            }],
+            Some("id".to_string()),
+        )
+        .unwrap();
+    let before_inserts = std::fs::metadata(&path).unwrap().len(); // end of the CREATE TABLE record
+    storage.insert_row("t", vec![Value::Int(1)]).unwrap(); // record: gets corrupted below
+    storage.insert_row("t", vec![Value::Int(2)]).unwrap(); // record: stays valid, still follows
+    drop(storage);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    // Corrupt the first payload byte of the row-1 record (right after its
+    // 8-byte header). The row-2 record is still fully intact after it.
+    let corrupt_at = before_inserts as usize + 8;
+    bytes[corrupt_at] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
     let result = mysql_rust::storage::InMemoryStorage::open_in_dir(&dir);
     assert!(
         result.is_err(),
-        "expected a corrupt data file to be rejected, not panic"
+        "expected mid-file corruption (with valid data still following it) to be rejected, not panic"
     );
 
     std::fs::remove_dir_all(&dir).ok();

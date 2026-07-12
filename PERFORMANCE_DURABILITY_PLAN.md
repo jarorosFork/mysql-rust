@@ -546,16 +546,64 @@ Order matters: framing/CRC first (it's the format break), then recovery,
 then ordering/atomicity, then fsync policy — each step keeps all tests
 green.
 
-- [ ] **CRC-checked record framing (D5)**: `[len][crc32][payload]`, format
-      version bump, hand-rolled table-driven CRC32 with known-vector tests
-      (or justify `crc32fast` in Cargo.toml per the dependency rule).
-      _Acceptance: round-trip tests; a flipped payload bit is detected at
-      replay._
-- [ ] **Torn-tail recovery (D4)**: `Log::open` truncates an invalid tail
-      record (warn with offset), refuses only on mid-file corruption;
-      split the existing corrupt-file tests accordingly.
-      _Acceptance: PD-0 torn-tail injector assertions un-ignored and green
-      at every truncation offset._
+- [x] **CRC-checked record framing (D5)** + **Torn-tail recovery (D4)** —
+      ✅ done 2026-07-12, implemented together (deliberately, not a scope
+      slip): a torn tail can only be told apart from mid-file corruption
+      *using* a checksum, so doing D4 without D5 first isn't meaningfully
+      possible — `tests/crash.rs`'s own `#[ignore]` reason already said as
+      much ("needs D5's checksums to detect a torn record").
+      New framing: `[len: u32][crc: u32][payload: len bytes]`, where `crc`
+      covers **`len`'s own bytes together with the payload**, not the
+      payload alone. That one design choice is what makes recovery safe:
+      if only the payload were checksummed, a corrupted length field could
+      make mid-file damage look exactly like a torn tail (the claimed
+      payload would run past the true end of file, or land on a plausible
+      but wrong boundary), silently discarding real subsequent records.
+      With the length field itself inside the checksummed region, that
+      failure mode reliably surfaces as a checksum mismatch instead.
+      Hand-rolled CRC-32 (IEEE 802.3/zlib/gzip/PNG variant) — no
+      dependency, matching `auth::sha1`/`auth::sha256`'s precedent — a
+      plain bit-by-bit implementation (not table-driven: record sizes here
+      never approach where that would matter, and the simpler form is
+      easier to verify by inspection), tested against the standard
+      `"123456789"` → `0xCBF43926` check value plus empty-input and
+      bit-flip-detection cases. No format-version byte: matches this
+      project's established precedent (every prior on-disk format change —
+      DECIMAL/DATE, per-column flags — was a clean break, no migration
+      path, "no back-compat concern for this project's data").
+      `Log::open`'s replay loop (`read_record`) now returns one of three
+      outcomes per record: a verified payload, `TornTail` (an incomplete
+      header, a length running past EOF, or a checksum failure on what's
+      positioned as the file's last record — all three are exactly what an
+      interrupted write looks like, since a crash can only ever damage the
+      *end* of a file), or `Corrupt` (checksum failure with more
+      structured-looking data still following — impossible to explain by a
+      crash, so refused). On a `TornTail`, the file is physically
+      truncated to the last good record via `File::set_len` — not just
+      skipped in memory — so a subsequent append lands right after the
+      good data instead of after orphaned garbage (which would otherwise
+      turn a torn tail from *this* crash into apparent mid-file corruption
+      after the *next* one).
+      Proof: `tests/crash.rs`'s `torn_log_tail_recovers_by_discarding_the
+      _incomplete_final_record` — one of PD-0's own `#[ignore]`d
+      assertions — is now **un-ignored and green** at every byte-exact
+      truncation offset within the final record, exactly per its own
+      acceptance criterion; `mid_file_corruption_with_valid_data_after_it
+      _is_still_refused` continues to pass. Two existing tests whose
+      expectations were superseded by the new (better) behavior were
+      updated, not just made to pass: `storage::log`'s
+      `rejects_truncated_entry_not_panicking` split into
+      `recovers_from_a_torn_trailing_record_by_truncating_it_away` (sweeps
+      every truncation offset, also asserts the on-disk file is physically
+      truncated) and `a_file_too_short_for_even_one_record_header_recovers
+      _as_empty`, plus a new `mid_file_checksum_mismatch_with_valid_data
+      _after_it_is_refused`; `tests/persistence.rs`'s
+      `reopening_a_corrupt_data_file_errors_instead_of_panicking` (which
+      asserted the *old*, now-incorrect expectation for a torn header)
+      split into `reopening_a_file_with_a_torn_trailing_record_recovers
+      _without_panicking` and `reopening_a_file_with_mid_file_corruption
+      _errors_instead_of_panicking`. 406 tests total (was 399); fmt +
+      clippy `-D warnings` clean throughout.
 - [ ] **True WAL ordering (D3)**: encode → append → apply-to-memory;
       log-append failure applies nothing; the memory apply after a
       successful append is infallible. Removes the extra `row.clone()`.
