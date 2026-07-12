@@ -39,6 +39,18 @@ impl Packet {
     /// ([`MAX_PAYLOAD`]); larger payloads are the writer's responsibility to
     /// split before calling this.
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Append the encoded packet (header + payload) to `out` rather than
+    /// allocating a fresh `Vec` — lets a caller writing many packets in a
+    /// row (see `protocol::resultset::ResultSet::encode_into`) build one
+    /// buffer and hand it to the socket in a single `write_all`
+    /// (PERFORMANCE_DURABILITY_PLAN.md P2), instead of one syscall per
+    /// packet.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         debug_assert!(
             self.payload.len() <= MAX_PAYLOAD,
             "payload of {} bytes exceeds single-packet maximum; caller must split",
@@ -46,11 +58,9 @@ impl Packet {
         );
 
         let len_bytes = (self.payload.len() as u32).to_le_bytes();
-        let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
         out.extend_from_slice(&len_bytes[..3]);
         out.push(self.sequence_id);
         out.extend_from_slice(&self.payload);
-        out
     }
 
     /// Parse a single complete packet from the front of `bytes`.
@@ -105,6 +115,19 @@ mod tests {
         let bytes = packet.encode();
         let decoded = Packet::decode(&bytes).expect("decode");
         assert_eq!(decoded, packet);
+    }
+
+    /// PERFORMANCE_DURABILITY_PLAN.md P2: `encode_into` is the byte-buffer
+    /// twin of `encode()`, used on the hot path so many packets can share
+    /// one buffer instead of one `Vec` allocation each — must produce
+    /// identical bytes either way, and append rather than overwrite.
+    #[test]
+    fn encode_into_matches_encode_and_appends() {
+        let packet = Packet::new(7, b"hello world".to_vec());
+        let mut buf = vec![0xAA, 0xBB];
+        packet.encode_into(&mut buf);
+        assert_eq!(&buf[..2], &[0xAA, 0xBB]);
+        assert_eq!(&buf[2..], packet.encode().as_slice());
     }
 
     #[test]

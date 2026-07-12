@@ -174,6 +174,78 @@ impl ResultSet {
 
         Ok((packets, seq))
     }
+
+    /// Encode a text-protocol result set straight into `out` — the
+    /// production write path (PERFORMANCE_DURABILITY_PLAN.md P2 step 1):
+    /// unlike [`Self::to_text_packets`], this never materializes a
+    /// `Vec<Packet>`, so a 1,000-row result becomes one buffer the caller
+    /// can hand to the socket in a single `write_all`, not ~1,000 of them.
+    /// `to_text_packets` stays as the packet-level structural test surface
+    /// (and any other caller that genuinely needs individual `Packet`s);
+    /// this is the byte-level equivalent for the hot path. Returns the next
+    /// sequence id after the encoded packets.
+    pub fn encode_text_into(
+        &self,
+        out: &mut Vec<u8>,
+        deprecate_eof: bool,
+        status_flags: u16,
+        start: u8,
+    ) -> Result<u8> {
+        self.encode_into(out, deprecate_eof, status_flags, start, encode_text_row)
+    }
+
+    /// Binary-protocol counterpart of [`Self::encode_text_into`].
+    pub fn encode_binary_into(
+        &self,
+        out: &mut Vec<u8>,
+        deprecate_eof: bool,
+        status_flags: u16,
+        start: u8,
+    ) -> Result<u8> {
+        self.encode_into(out, deprecate_eof, status_flags, start, encode_binary_row)
+    }
+
+    /// Shared framing for [`Self::encode_text_into`]/[`Self::encode_binary_into`]
+    /// — the byte-buffer twin of [`Self::to_packets`] above (kept as a
+    /// separate loop rather than building on `to_packets` so the hot path
+    /// never pays for the `Vec<Packet>` it doesn't need).
+    fn encode_into(
+        &self,
+        out: &mut Vec<u8>,
+        deprecate_eof: bool,
+        status_flags: u16,
+        start_sequence_id: u8,
+        encode_row: fn(&[Cell], u8) -> Result<Packet>,
+    ) -> Result<u8> {
+        let mut seq = start_sequence_id;
+
+        Packet::new(seq, write_lenenc_int(self.columns.len() as u64)).encode_into(out);
+        seq = seq.wrapping_add(1);
+
+        for column in &self.columns {
+            column.to_packet(seq)?.encode_into(out);
+            seq = seq.wrapping_add(1);
+        }
+
+        if !deprecate_eof {
+            eof_packet(status_flags, seq).encode_into(out);
+            seq = seq.wrapping_add(1);
+        }
+
+        for row in &self.rows {
+            encode_row(row, seq)?.encode_into(out);
+            seq = seq.wrapping_add(1);
+        }
+
+        if deprecate_eof {
+            deprecate_eof_terminator(status_flags, seq).encode_into(out)
+        } else {
+            eof_packet(status_flags, seq).encode_into(out)
+        };
+        seq = seq.wrapping_add(1);
+
+        Ok(seq)
+    }
 }
 
 /// The `CLIENT_DEPRECATE_EOF` result-set terminator: an OK packet carrying
@@ -299,6 +371,90 @@ mod tests {
         let terminator = &packets.last().unwrap().payload;
         assert_eq!(terminator[0], 0xfe);
         assert!(terminator.len() < 9);
+    }
+
+    /// PERFORMANCE_DURABILITY_PLAN.md P2 step 1: `encode_text_into`/
+    /// `encode_binary_into` must produce exactly the bytes a client would
+    /// see today, byte for byte — these are a new *encoding path* for the
+    /// same wire format, not a new format. Cross-checked against
+    /// `to_*_packets` (each packet's own `encode()`, concatenated) across
+    /// both classic and `CLIENT_DEPRECATE_EOF` framing, and both protocols,
+    /// so a divergence in either encoder would fail here.
+    fn assert_encode_into_matches_to_packets(
+        result_set: &ResultSet,
+        deprecate_eof: bool,
+        status_flags: u16,
+        start: u8,
+    ) {
+        let (text_packets, text_next_seq) = result_set
+            .to_text_packets(deprecate_eof, status_flags, start)
+            .expect("to_text_packets");
+        let mut expected_text = Vec::new();
+        for p in &text_packets {
+            expected_text.extend(p.encode());
+        }
+        let mut actual_text = Vec::new();
+        let actual_text_next_seq = result_set
+            .encode_text_into(&mut actual_text, deprecate_eof, status_flags, start)
+            .expect("encode_text_into");
+        assert_eq!(actual_text, expected_text);
+        assert_eq!(actual_text_next_seq, text_next_seq);
+
+        let (binary_packets, binary_next_seq) = result_set
+            .to_binary_packets(deprecate_eof, status_flags, start)
+            .expect("to_binary_packets");
+        let mut expected_binary = Vec::new();
+        for p in &binary_packets {
+            expected_binary.extend(p.encode());
+        }
+        let mut actual_binary = Vec::new();
+        let actual_binary_next_seq = result_set
+            .encode_binary_into(&mut actual_binary, deprecate_eof, status_flags, start)
+            .expect("encode_binary_into");
+        assert_eq!(actual_binary, expected_binary);
+        assert_eq!(actual_binary_next_seq, binary_next_seq);
+    }
+
+    #[test]
+    fn encode_into_matches_to_packets_classic_framing() {
+        assert_encode_into_matches_to_packets(&sample(), false, AUTOCOMMIT, 5);
+    }
+
+    #[test]
+    fn encode_into_matches_to_packets_deprecate_eof_framing() {
+        assert_encode_into_matches_to_packets(&sample(), true, AUTOCOMMIT, 0);
+    }
+
+    #[test]
+    fn encode_into_matches_to_packets_multi_row_multi_column_with_nulls() {
+        let result_set = ResultSet {
+            columns: vec![
+                ColumnDefinition::new("id", ColumnType::LongLong),
+                ColumnDefinition::new("name", ColumnType::VarString),
+            ],
+            rows: vec![
+                vec![Cell::Int(1), Cell::Text("ada".to_string())],
+                vec![Cell::Int(2), Cell::Null],
+                vec![Cell::Null, Cell::Text("carol".to_string())],
+            ],
+        };
+        assert_encode_into_matches_to_packets(&result_set, false, AUTOCOMMIT, 3);
+        assert_encode_into_matches_to_packets(&result_set, true, AUTOCOMMIT, 3);
+    }
+
+    #[test]
+    fn encode_into_appends_rather_than_overwriting_a_nonempty_buffer() {
+        let mut out = vec![0xAA, 0xBB];
+        let next_seq = sample()
+            .encode_text_into(&mut out, true, AUTOCOMMIT, 0)
+            .expect("encode");
+        assert_eq!(
+            &out[..2],
+            &[0xAA, 0xBB],
+            "must append, not clear, the buffer"
+        );
+        assert!(out.len() > 2);
+        assert_eq!(next_seq, 4);
     }
 
     #[test]

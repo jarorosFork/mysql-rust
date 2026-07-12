@@ -63,6 +63,13 @@ pub struct Connection {
     /// Persisted across reads so any bytes the client pipelines ahead of a
     /// response are not lost.
     read_buf: Vec<u8>,
+    /// Reused across every response so a multi-packet result set is one
+    /// `write_all` + one `flush` instead of one pair per packet
+    /// (PERFORMANCE_DURABILITY_PLAN.md P2): `write_packet` and `send_result`
+    /// both encode into this buffer (clearing it first — `Vec::clear` keeps
+    /// the allocation, so a connection that has sent one large result set
+    /// doesn't pay to reallocate for the next one).
+    out_buf: Vec<u8>,
     /// The scramble sent to the client for the auth exchange currently in
     /// progress (replaced if an auth-switch happens).
     scramble: [u8; SCRAMBLE_LEN],
@@ -112,6 +119,7 @@ impl Connection {
             connection_id,
             sequence_id: 0,
             read_buf: Vec::new(),
+            out_buf: Vec::new(),
             scramble: [0u8; SCRAMBLE_LEN],
             default_auth_plugin: config.default_auth_plugin,
             authenticator: Authenticator::new(&config.users),
@@ -411,14 +419,23 @@ impl Connection {
                         .collect(),
                 };
                 let deprecate_eof = self.client_capabilities & CLIENT_DEPRECATE_EOF != 0;
-                let (packets, next_seq) = if binary {
-                    result_set.to_binary_packets(deprecate_eof, status_flags, self.sequence_id)?
+                self.out_buf.clear();
+                let next_seq = if binary {
+                    result_set.encode_binary_into(
+                        &mut self.out_buf,
+                        deprecate_eof,
+                        status_flags,
+                        self.sequence_id,
+                    )?
                 } else {
-                    result_set.to_text_packets(deprecate_eof, status_flags, self.sequence_id)?
+                    result_set.encode_text_into(
+                        &mut self.out_buf,
+                        deprecate_eof,
+                        status_flags,
+                        self.sequence_id,
+                    )?
                 };
-                for packet in &packets {
-                    self.write_packet(packet).await?;
-                }
+                self.flush_out_buf().await?;
                 self.sequence_id = next_seq;
             }
             Err(e) => {
@@ -656,7 +673,16 @@ impl Connection {
     }
 
     async fn write_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.stream.write_all(&packet.encode()).await?;
+        self.out_buf.clear();
+        packet.encode_into(&mut self.out_buf);
+        self.flush_out_buf().await
+    }
+
+    /// Write `self.out_buf`'s current contents (however many packets the
+    /// caller encoded into it) to the socket in one `write_all` + one
+    /// `flush`, then leave the buffer as-is for the next caller to `clear`.
+    async fn flush_out_buf(&mut self) -> Result<()> {
+        self.stream.write_all(&self.out_buf).await?;
         // Flush so the bytes actually leave — a TLS stream buffers plaintext
         // until flushed (a no-op cost for plain TCP).
         self.stream.flush().await?;

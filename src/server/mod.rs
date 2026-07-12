@@ -109,6 +109,18 @@ impl Server {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, peer)) => {
+                            // MySQL itself sets this on every session
+                            // (PERFORMANCE_DURABILITY_PLAN.md P5): without
+                            // it, Nagle's algorithm can hold a small write
+                            // (this protocol sends plenty, e.g. an OK
+                            // packet right after a result set) until the
+                            // peer's delayed ACK fires, a ~40ms stall for
+                            // no reason on a loopback-latency link.
+                            // Best-effort -- a failure here doesn't affect
+                            // correctness, only (rarely) latency, so it's
+                            // not worth rejecting an otherwise-good socket
+                            // over.
+                            let _ = stream.set_nodelay(true);
                             let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                             self.spawn_connection(&mut tasks, stream, peer, connection_id, &storage, &connection_limit);
                         }
