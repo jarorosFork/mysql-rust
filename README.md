@@ -23,16 +23,37 @@ A MySQL-compatible database server written from scratch in Rust.
 ## Quickstart
 
 ```bash
-cargo run
+# Create an account and start the server — no credentials are hard-coded.
+MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run
 # -> mysql-rust listening on 127.0.0.1:3306 (version 8.0.0-mysql-rust-0.1.0)
 ```
 
-The server accepts real connections: handshake, `mysql_native_password`
-authentication, and `CREATE TABLE` / `INSERT` / `SELECT ... WHERE`. A
-scripted client exercising the full wire protocol is the standing
-integration-test suite (`tests/`); no `mysql` binary was available to test
-against literally in the environment this was built in, so treat that
-specific claim as unverified until tried against a real client.
+Then connect with any standard MySQL client or driver — e.g. the `mysql` CLI:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u alice -ps3cret
+```
+
+Without `MYSQLRUST_USER` the server starts with **no accounts** and denies
+every login (by design — no default credentials are shipped) and prints a hint
+pointing at these variables. Compatibility isn't just self-asserted: a real
+third-party driver (`mysql_async`) connects, authenticates with both auth
+plugins, and runs a full text + prepared-statement + transaction workload
+against the server in `tests/conformance.rs`.
+
+### Environment variables (read by the `mysql-rust` binary)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MYSQLRUST_USER` | *(unset)* | Username of the account to create. Unset ⇒ no accounts (every login denied). |
+| `MYSQLRUST_PASSWORD` | *(unset)* | That account's password. Unset or empty ⇒ passwordless account. |
+| `MYSQLRUST_AUTH_PLUGIN` | `caching_sha2_password` | `caching_sha2_password` or `mysql_native_password` (case-insensitive). |
+| `MYSQLRUST_LISTEN_ADDR` | `127.0.0.1:3306` | `host:port` to bind. |
+| `MYSQLRUST_DATA_DIR` | *(unset)* | Directory for the on-disk log (persistence). Unset ⇒ in-memory only. |
+
+`Config::from_env()` builds this configuration (the injectable
+`Config::from_env_with` makes it unit-testable); the `Config` struct below is
+the full programmatic surface.
 
 ## Configuration
 

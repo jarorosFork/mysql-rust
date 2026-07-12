@@ -20,6 +20,9 @@ pub enum Error {
     Execution(String),
     /// A feature that has not been implemented yet was requested.
     Unsupported(&'static str),
+    /// The server configuration (e.g. from the environment) was invalid.
+    /// Raised at startup, before any client is served.
+    Config(String),
 }
 
 impl fmt::Display for Error {
@@ -31,6 +34,7 @@ impl fmt::Display for Error {
             Error::Parse(m) => write!(f, "parse error: {m}"),
             Error::Execution(m) => write!(f, "execution error: {m}"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Error::Config(m) => write!(f, "configuration error: {m}"),
         }
     }
 }

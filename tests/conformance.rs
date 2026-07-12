@@ -122,6 +122,30 @@ async fn real_driver_native_password_end_to_end() {
 }
 
 #[tokio::test]
+async fn real_driver_connects_with_env_configured_account() {
+    // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`
+    // produces — built through the same `from_env` code path, but with an
+    // injected lookup so the global process environment isn't touched.
+    let vars: std::collections::HashMap<&str, &str> = [
+        ("MYSQLRUST_USER", "alice"),
+        ("MYSQLRUST_PASSWORD", "s3cret"),
+    ]
+    .into_iter()
+    .collect();
+    let mut config =
+        Config::from_env_with(|k| vars.get(k).map(|s| s.to_string())).expect("env config parses");
+    config.log_level = LogLevel::Error;
+
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+    let one: Vec<u8> = conn.query("SELECT 1").await.expect("SELECT 1");
+    assert_eq!(one, vec![1]);
+    conn.disconnect().await.expect("clean disconnect");
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn real_driver_rejects_bad_password() {
     let config = Config {
         users: vec![UserCredential::with_caching_sha2_password(

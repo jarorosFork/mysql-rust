@@ -146,6 +146,9 @@ impl ErrPacket {
             Error::Auth(msg) => ErrPacket::new(1045, b"28000", msg.clone()),
             Error::Protocol(msg) => ErrPacket::new(1047, b"08S01", msg.clone()), // ER_UNKNOWN_COM_ERROR
             Error::Io(e) => ErrPacket::new(1105, b"HY000", format!("I/O error: {e}")),
+            // Config errors surface at startup, never mid-session, but the
+            // mapping keeps this match exhaustive.
+            Error::Config(msg) => ErrPacket::new(1105, b"HY000", msg.clone()),
         }
     }
 

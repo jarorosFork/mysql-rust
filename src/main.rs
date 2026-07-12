@@ -11,8 +11,23 @@ use mysql_rust::server::Server;
 
 #[tokio::main]
 async fn main() {
-    // In the future: load from CLI args / env / a config file.
-    let config = Config::default();
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("fatal: {err}");
+            process::exit(1);
+        }
+    };
+
+    // Without at least one account the server denies every login, which is a
+    // confusing first-run experience — point the way to the env vars.
+    if config.users.is_empty() {
+        eprintln!(
+            "warning: no accounts configured, so every login will be denied.\n\
+             Set MYSQLRUST_USER (and MYSQLRUST_PASSWORD) to create one, e.g.:\n  \
+             MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run"
+        );
+    }
 
     if let Err(err) = run(config).await {
         eprintln!("fatal: {err}");
