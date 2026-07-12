@@ -8,11 +8,13 @@
 //! `SIGKILL`ed exactly like a real crash: no destructor runs, no buffered
 //! writes flush, nothing gets a chance to clean up.
 //!
-//! Several assertions below are `#[ignore]`d with a reason naming the
-//! PERFORMANCE_DURABILITY_PLAN.md task that fixes them. That is this
-//! harness's whole point per the plan's PD-0 acceptance criterion: each
-//! D-task's own acceptance is un-ignoring (not rewriting) its assertion.
-//! Run the ignored set with `cargo test --test crash -- --ignored`.
+//! Assertions that PERFORMANCE_DURABILITY_PLAN.md's durability work
+//! (D2-D5) hadn't landed yet were `#[ignore]`d with a reason naming the
+//! task that would fix them — that was this harness's whole point per the
+//! plan's PD-0 acceptance criterion: each D-task's own acceptance was
+//! un-ignoring (not rewriting) its assertion. As of D2 (2026-07-12,
+//! atomic commit records — the last of D2-D5), every test in this file
+//! passes unignored.
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -159,15 +161,14 @@ async fn process_crash_after_acknowledged_write_still_persists_it() {
 }
 
 /// A multi-row `INSERT` is one statement with one client-visible outcome:
-/// either the client got an OK for all N rows, or it got nothing. Today
-/// `execute_insert` calls `Storage::insert_row` once per row, each an
-/// independent apply-then-log step (PERFORMANCE_DURABILITY_PLAN.md D2/D3),
-/// so a kill partway through can leave a **partial** row count on disk —
-/// data no acknowledged statement ever produced. Sweeps several kill
-/// delays (0..=21ms) across fresh data dirs to land the kill at different
-/// points in the row loop without needing byte-exact control over it.
+/// either the client got an OK for all N rows, or it got nothing.
+/// `execute_insert` batches every row into one `Storage::insert_rows` call,
+/// logged as a single atomic record (PERFORMANCE_DURABILITY_PLAN.md D2), so
+/// a kill partway through can never leave a **partial** row count on disk.
+/// Sweeps several kill delays (0..=21ms) across fresh data dirs to land the
+/// kill at different points in the row loop without needing byte-exact
+/// control over it.
 #[tokio::test]
-#[ignore = "PERFORMANCE_DURABILITY_PLAN.md D2: multi-row INSERT is not yet an atomic log record; un-ignore once it is"]
 async fn crash_mid_multi_row_insert_never_leaves_a_partial_statement() {
     const ROW_COUNT: usize = 1000;
     let mut insert_sql = String::from("INSERT INTO t VALUES ");
@@ -211,12 +212,10 @@ async fn crash_mid_multi_row_insert_never_leaves_a_partial_statement() {
 }
 
 /// Same shape as the multi-row-INSERT test, but for `BEGIN`/`COMMIT`:
-/// `Transaction::commit` (storage/transaction.rs) applies its buffered rows
-/// one at a time too, so a crash mid-commit can permanently resurrect a
-/// prefix of the transaction — the exact atomicity violation
-/// PERFORMANCE_DURABILITY_PLAN.md D2 exists to close.
+/// `Transaction::commit` (storage/transaction.rs) now applies its buffered
+/// rows as one atomic batch too (PERFORMANCE_DURABILITY_PLAN.md D2), so a
+/// crash mid-commit can never resurrect a prefix of the transaction.
 #[tokio::test]
-#[ignore = "PERFORMANCE_DURABILITY_PLAN.md D2: COMMIT is not yet an atomic log record; un-ignore once it is"]
 async fn crash_mid_transaction_commit_never_leaves_a_partial_transaction() {
     const ROW_COUNT: usize = 500;
 

@@ -36,6 +36,24 @@ pub trait Storage {
     /// has columns, in column order, and already be type-checked.
     fn insert_row(&self, table: &str, row: Vec<Value>) -> Result<()>;
 
+    /// Insert several `(table, row)` pairs as one atomic unit where the
+    /// underlying engine supports it — a durable engine logs them as a
+    /// single record, so a crash partway through can never leave a partial
+    /// result on disk (see [`InMemoryStorage`]'s override and
+    /// PERFORMANCE_DURABILITY_PLAN.md D2). Used for a multi-row `INSERT`
+    /// statement and for `COMMIT`.
+    ///
+    /// The default just inserts one at a time, which is exactly right for
+    /// [`Transaction`]: its buffered pending rows aren't durable until
+    /// `commit()` — which itself calls this same method on the *real*
+    /// storage, where the override's atomicity actually applies.
+    fn insert_rows(&self, rows: Vec<(String, Vec<Value>)>) -> Result<()> {
+        for (table, row) in rows {
+            self.insert_row(&table, row)?;
+        }
+        Ok(())
+    }
+
     /// Return every row in `table`, in insertion order.
     fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>>;
 

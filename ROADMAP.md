@@ -442,16 +442,20 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
 - [ ] PD-1 — Durability core: CRC framing, torn-tail recovery, WAL
       ordering, atomic commit records, fsync policy + directory fsync.
       _(In progress: CRC-checked record framing + torn-tail recovery
-      (D4/D5) and true WAL ordering (D3) done 2026-07-12 — see
-      PERFORMANCE_DURABILITY_PLAN.md's D3/D4/D5 entries for the full design
-      (why the checksum has to cover the length field, not just the
-      payload, for recovery to be safe; why `insert_row` validates under a
-      read lock and applies under a separate write lock while
-      `create_table` holds one write lock across both) and proof (408
-      tests, PD-0's own torn-tail assertion un-ignored and green, two new
-      fault-injection tests proving a failed log append leaves no trace in
-      memory). Atomic commit records (D2) and fsync policy (D1/D7)
-      remain.)_
+      (D4/D5), true WAL ordering (D3), and atomic commit records (D2) all
+      done 2026-07-12 — see PERFORMANCE_DURABILITY_PLAN.md's D2-D5 entries
+      for the full design (why the checksum has to cover the length field,
+      not just the payload, for recovery to be safe; why a batch record
+      makes atomicity fall out of the torn-tail work for free; why
+      `insert_row`/`insert_rows` validate under a read lock and apply
+      under a separate write lock while `create_table` holds one write
+      lock across both) and proof: **`tests/crash.rs`'s entire 5-test
+      suite now passes with zero `#[ignore]`d assertions** — every
+      durability bug the harness was built in PD-0 to catch (17/1000 and
+      361/500 rows surviving a killed statement; a torn tail refusing to
+      start) is fixed, closing the loop PD-0 opened. 416 tests total. Only
+      fsync policy + directory fsync (D1/D7) remain before this phase's
+      acceptance check.)_
 - [ ] PD-2 — Write-path architecture: dedicated log-writer thread with
       group commit.
 - [ ] PD-3 — Query-path performance: `TCP_NODELAY`, single-buffer

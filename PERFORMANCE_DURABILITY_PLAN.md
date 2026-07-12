@@ -649,11 +649,47 @@ green.
       `tests/concurrency.rs` (8 + 5 tests) still green unchanged, since
       `Transaction::commit` routes through this same, now-fixed
       `insert_row` for each buffered row.
-- [ ] **Atomic commit records (D2)**: new `TAG_TX` batch record; used by
-      `Transaction::commit` and multi-row INSERT; replay applies
-      all-or-nothing.
-      _Acceptance: PD-0 partial-transaction assertions un-ignored and
-      green under randomized mid-commit SIGKILL._
+- [x] **Atomic commit records (D2)** — ✅ done 2026-07-12. New
+      `TAG_TRANSACTION` record type (`Entry::Transaction { rows: Vec<
+      (String, Vec<Value>)> }`) carrying a whole batch of `(table, row)`
+      inserts. Atomicity falls out of D4/D5 for free: a batch is exactly
+      *one* on-disk record, and `Log::open`'s replay already only ever
+      applies a record whose checksum verified fully intact — there's no
+      separate "partial batch" state to design for, since the record-level
+      guarantee D4/D5 already built *is* the batch-level guarantee here.
+      New `Storage::insert_rows(&self, rows: Vec<(String, Vec<Value>)>)`
+      trait method (default impl: insert one at a time — exactly right for
+      `Transaction`, whose buffered rows aren't durable until `commit()`
+      calls this same method on the *real* storage); `InMemoryStorage`
+      overrides it to validate the whole batch (including a duplicate
+      primary key *within* the batch itself, e.g. `INSERT INTO t VALUES
+      (1,'a'),(1,'b')` — not just against already-committed data, which the
+      existing per-row check alone can't see) under a read lock, log it as
+      one record, then apply every row. `Transaction::commit` now collects
+      all its pending rows (across however many tables were touched) into
+      one call to `insert_rows` instead of looping `insert_row`.
+      `Executor::execute_insert` now coerces *every* row of a multi-row
+      `INSERT` first, collecting them into a batch, before calling
+      `insert_rows` once — this fixes a sharper bug than the crash case
+      alone: previously, row 1 of `INSERT INTO t VALUES (1),(2),('bad')`
+      was already applied by the time row 3's type error was discovered,
+      so even an ordinary (no crash needed) multi-row INSERT with a bad
+      value partway through used to leave a partial result. A statement is
+      now genuinely all-or-nothing regardless of *why* it fails.
+      Proof — this is the one where the crash harness closes the loop it
+      opened in PD-0: `tests/crash.rs`'s
+      `crash_mid_multi_row_insert_never_leaves_a_partial_statement` and
+      `crash_mid_transaction_commit_never_leaves_a_partial_transaction` —
+      the harness's last two `#[ignore]`d assertions — are now **both
+      un-ignored and green**, closing out every assertion PD-0 set out to
+      eventually prove; the whole file (5 tests, 0 ignored) passes clean.
+      5 new unit/integration tests beyond that: duplicate-key-within-batch
+      and duplicate-against-committed-data rejection (nothing applies
+      either way), a fault-injection test extended to the batch path, a
+      cross-table `Transaction::commit` test, and two executor-level tests
+      proving the ordinary (non-crash) multi-row-INSERT atomicity fix.
+      416 tests total (was 408); fmt + clippy `-D warnings` clean; e2e app
+      (41/41) and the benchmark suite still build and run clean.
 - [ ] **fsync with policy (D1)** + **directory fsync (D7)**:
       `Config::sync_policy` (`always` default / `every_second` / `never`,
       env `MYSQLRUST_SYNC_POLICY`), `sync_data` per policy in the append

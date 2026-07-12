@@ -46,6 +46,14 @@ use crate::{Error, Result};
 
 const TAG_CREATE_TABLE: u8 = 1;
 const TAG_INSERT_ROW: u8 = 2;
+/// A batch of row inserts spanning one or more tables, applied all
+/// together or not at all on replay (PERFORMANCE_DURABILITY_PLAN.md D2) —
+/// used for a multi-row `INSERT` statement and for `COMMIT`. This falls out
+/// of the existing per-record framing for free: a batch is exactly *one*
+/// on-disk record, and `Log::open`'s torn-tail/corruption handling already
+/// only ever applies a record whose checksum verified intact, so there's no
+/// separate "partial batch" state to handle here.
+const TAG_TRANSACTION: u8 = 3;
 
 const VALUE_NULL: u8 = 0;
 const VALUE_INT: u8 = 1;
@@ -71,6 +79,11 @@ pub enum Entry {
     InsertRow {
         table: String,
         row: Vec<Value>,
+    },
+    /// A batch of `(table, row)` inserts recorded as a single record — see
+    /// [`TAG_TRANSACTION`].
+    Transaction {
+        rows: Vec<(String, Vec<Value>)>,
     },
 }
 
@@ -152,6 +165,19 @@ fn encode_insert_row(table: &str, row: &[Value]) -> Vec<u8> {
     write_u32(&mut buf, row.len() as u32);
     for value in row {
         write_value(&mut buf, value);
+    }
+    buf
+}
+
+fn encode_transaction(rows: &[(String, Vec<Value>)]) -> Vec<u8> {
+    let mut buf = vec![TAG_TRANSACTION];
+    write_u32(&mut buf, rows.len() as u32);
+    for (table, row) in rows {
+        write_string(&mut buf, table);
+        write_u32(&mut buf, row.len() as u32);
+        for value in row {
+            write_value(&mut buf, value);
+        }
     }
     buf
 }
@@ -299,6 +325,20 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
             }
             Ok(Entry::InsertRow { table, row })
         }
+        TAG_TRANSACTION => {
+            let row_count = read_u32(bytes, &mut pos)? as usize;
+            let mut rows = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                let table = read_string(bytes, &mut pos)?;
+                let value_count = read_u32(bytes, &mut pos)? as usize;
+                let mut row = Vec::with_capacity(value_count);
+                for _ in 0..value_count {
+                    row.push(read_value(bytes, &mut pos)?);
+                }
+                rows.push((table, row));
+            }
+            Ok(Entry::Transaction { rows })
+        }
         other => Err(corrupt(&format!("unknown entry tag {other}"))),
     }
 }
@@ -421,6 +461,12 @@ impl Log {
 
     pub fn append_insert_row(&mut self, table: &str, row: &[Value]) -> Result<()> {
         self.append(&encode_insert_row(table, row))
+    }
+
+    /// Append a batch of `(table, row)` inserts as one atomic record (see
+    /// [`TAG_TRANSACTION`]).
+    pub fn append_transaction(&mut self, rows: &[(String, Vec<Value>)]) -> Result<()> {
+        self.append(&encode_transaction(rows))
     }
 }
 

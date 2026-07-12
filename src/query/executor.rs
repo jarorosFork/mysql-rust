@@ -282,7 +282,16 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult> {
         let schema = self.storage.table_schema(table)?;
 
-        let mut affected = 0u64;
+        // Coerce every row's values *before* touching storage at all, then
+        // insert the whole statement as one atomic batch
+        // (PERFORMANCE_DURABILITY_PLAN.md D2, via `Storage::insert_rows`).
+        // This also fixes a subtler pre-existing gap than D2's headline
+        // crash case: previously, row 1 could already be applied by the
+        // time row 3 failed to coerce, so even a plain (no crash involved)
+        // multi-row INSERT with a bad value partway through used to leave
+        // a partial result. A single statement is now genuinely all-or-
+        // nothing.
+        let mut batch = Vec::with_capacity(rows.len());
         for row in rows {
             let ordered_exprs = match &columns {
                 Some(cols) => reorder_exprs(&schema.columns, cols, row)?,
@@ -303,6 +312,10 @@ impl<'a> Executor<'a> {
                 // A NULL AUTO_INCREMENT value (explicit, or via reorder_exprs
                 // defaulting an omitted column) gets the next sequence value
                 // instead of being subject to the NOT NULL check below.
+                // Reserving it here (rather than deferring to the batch
+                // insert) matches real MySQL/InnoDB: AUTO_INCREMENT isn't
+                // transactional, so a value is never reused even if this
+                // statement as a whole later fails.
                 if value == Value::Null && col.auto_increment {
                     value = Value::Int(self.storage.next_auto_increment(table)?);
                 }
@@ -315,9 +328,11 @@ impl<'a> Executor<'a> {
                 values.push(value);
             }
 
-            self.storage.insert_row(table, values)?;
-            affected += 1;
+            batch.push((table.to_string(), values));
         }
+
+        let affected = batch.len() as u64;
+        self.storage.insert_rows(batch)?;
 
         Ok(QueryResult {
             rows_affected: affected,
@@ -2675,6 +2690,51 @@ mod tests {
             run(&storage, "INSERT INTO t VALUES (1, 'bob')"),
             Err(Error::Execution(_))
         ));
+    }
+
+    #[test]
+    fn multi_row_insert_rejects_a_duplicate_key_within_the_same_statement() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)",
+        )
+        .expect("create");
+        assert!(matches!(
+            run(
+                &storage,
+                "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (1, 'carol')"
+            ),
+            Err(Error::Execution(_))
+        ));
+        // Not just the colliding row: the whole statement, including rows
+        // 1 and 2 which were individually fine, must not have applied
+        // (PERFORMANCE_DURABILITY_PLAN.md D2 -- one statement, one
+        // client-visible outcome).
+        assert!(run(&storage, "SELECT * FROM t")
+            .expect("select")
+            .rows
+            .is_empty());
+    }
+
+    #[test]
+    fn multi_row_insert_is_all_or_nothing_when_a_later_row_fails_to_coerce() {
+        // Not a crash scenario -- a plain type error partway through a
+        // multi-row INSERT. Before PERFORMANCE_DURABILITY_PLAN.md D2, rows
+        // before the bad one were already applied by the time this was
+        // discovered; now the whole batch is validated before anything is
+        // applied, so a statement that fails even for a completely
+        // ordinary reason still leaves nothing behind.
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+        assert!(matches!(
+            run(&storage, "INSERT INTO t VALUES (1), (2), ('not-a-number')"),
+            Err(Error::Execution(_))
+        ));
+        assert!(run(&storage, "SELECT * FROM t")
+            .expect("select")
+            .rows
+            .is_empty());
     }
 
     #[test]

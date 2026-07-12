@@ -85,6 +85,14 @@ impl Table {
         }
         Ok(())
     }
+
+    /// The primary-key value `row` would be inserted under, if this table
+    /// has one — used to additionally detect a duplicate key *within* one
+    /// batch (see `InMemoryStorage::insert_rows`), which `check_insertable`
+    /// alone can't: it only ever sees already-committed state.
+    fn primary_key_value<'a>(&self, row: &'a [Value]) -> Option<&'a Value> {
+        self.primary_key_index.map(|idx| &row[idx])
+    }
 }
 
 fn apply_entry(tables: &mut HashMap<String, Table>, entry: Entry) {
@@ -101,6 +109,17 @@ fn apply_entry(tables: &mut HashMap<String, Table>, entry: Entry) {
             // same log, replayed just above.
             if let Some(t) = tables.get_mut(&table) {
                 t.push_trusted(row);
+            }
+        }
+        Entry::Transaction { rows } => {
+            // The record itself is all-or-nothing (see `storage::log`'s
+            // module doc comment) -- by the time `apply_entry` sees it,
+            // every row in it is known-intact, so applying them in a
+            // simple loop is exactly as atomic as the record was.
+            for (table, row) in rows {
+                if let Some(t) = tables.get_mut(&table) {
+                    t.push_trusted(row);
+                }
             }
         }
     }
@@ -306,6 +325,59 @@ impl Storage for InMemoryStorage {
             .get_mut(table)
             .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
         t.push_trusted(row);
+        Ok(())
+    }
+
+    fn insert_rows(&self, rows: Vec<(String, Vec<Value>)>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        // Same log-before-memory shape as `insert_row` above, just for a
+        // whole batch: validate everything (including duplicate keys
+        // *within* this batch, which `check_insertable` alone can't see
+        // since it only ever looks at already-committed state) under a
+        // read lock, append the whole batch as one durable record, then
+        // apply every row — infallible, for the same reason `insert_row`'s
+        // apply is.
+        {
+            let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
+            let mut seen_in_batch: HashMap<&str, HashSet<&Value>> = HashMap::new();
+            for (table, row) in &rows {
+                let t = tables
+                    .get(table.as_str())
+                    .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
+                if row.len() != t.columns.len() {
+                    return Err(Error::Execution(format!(
+                        "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
+                        t.columns.len(),
+                        row.len()
+                    )));
+                }
+                t.check_insertable(row)?;
+                if let Some(key) = t.primary_key_value(row) {
+                    if !seen_in_batch.entry(table.as_str()).or_default().insert(key) {
+                        return Err(Error::Execution(format!(
+                            "Duplicate entry '{}' for key 'PRIMARY'",
+                            key.to_display_string().unwrap_or_default()
+                        )));
+                    }
+                }
+            }
+        }
+
+        self.append_log(|log| log.append_transaction(&rows))?;
+
+        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+        for (table, row) in rows {
+            // Trusted for the same reason `insert_row`'s apply is; a
+            // missing table here would mean one vanished between the
+            // check above and here, which can't happen under the same
+            // per-table-lock guarantee `insert_row` relies on.
+            if let Some(t) = tables.get_mut(&table) {
+                t.push_trusted(row);
+            }
+        }
         Ok(())
     }
 
@@ -605,6 +677,103 @@ mod tests {
             .create_table("t", vec![col("id", ColumnType::Int)], None)
             .unwrap();
         assert_eq!(storage.tables().unwrap(), vec!["t".to_string()]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn insert_rows_rejects_a_duplicate_key_within_the_batch_and_applies_none_of_it() {
+        let storage = InMemoryStorage::new();
+        storage
+            .create_table(
+                "t",
+                vec![col("id", ColumnType::Int), col("name", ColumnType::Varchar)],
+                Some("id".to_string()),
+            )
+            .unwrap();
+
+        let result = storage.insert_rows(vec![
+            (
+                "t".to_string(),
+                vec![Value::Int(1), Value::Varchar("alice".to_string())],
+            ),
+            (
+                "t".to_string(),
+                vec![Value::Int(2), Value::Varchar("bob".to_string())],
+            ),
+            (
+                "t".to_string(),
+                vec![Value::Int(1), Value::Varchar("carol".to_string())],
+            ),
+        ]);
+        assert!(result.is_err());
+        assert!(
+            storage.scan("t").unwrap().is_empty(),
+            "rows 1 and 2 (individually fine) must not survive a batch rejected for row 3's \
+             duplicate key -- one batch, one outcome"
+        );
+    }
+
+    #[test]
+    fn insert_rows_rejects_a_row_that_collides_with_already_committed_data() {
+        let storage = InMemoryStorage::new();
+        storage
+            .create_table(
+                "t",
+                vec![col("id", ColumnType::Int)],
+                Some("id".to_string()),
+            )
+            .unwrap();
+        storage.insert_row("t", vec![Value::Int(1)]).unwrap();
+
+        let result = storage.insert_rows(vec![
+            ("t".to_string(), vec![Value::Int(2)]),
+            ("t".to_string(), vec![Value::Int(1)]), // collides with the already-committed row
+        ]);
+        assert!(result.is_err());
+        assert_eq!(
+            storage.scan("t").unwrap(),
+            vec![vec![Value::Int(1)]],
+            "the batch's own row 2 must not have applied either"
+        );
+    }
+
+    #[test]
+    fn failed_log_append_on_insert_rows_leaves_no_trace_of_the_whole_batch() {
+        let path = temp_path("fault-injection-insert-rows");
+        std::fs::remove_file(&path).ok();
+        let storage = InMemoryStorage::open(&path).unwrap();
+        storage
+            .create_table(
+                "t",
+                vec![col("id", ColumnType::Int)],
+                Some("id".to_string()),
+            )
+            .unwrap();
+
+        storage.fail_next_log_write();
+        let result = storage.insert_rows(vec![
+            ("t".to_string(), vec![Value::Int(1)]),
+            ("t".to_string(), vec![Value::Int(2)]),
+            ("t".to_string(), vec![Value::Int(3)]),
+        ]);
+        assert!(result.is_err());
+        assert!(
+            storage.scan("t").unwrap().is_empty(),
+            "none of the batch's rows must be visible when the log append for the \
+             whole batch fails"
+        );
+
+        // The fault only fires once -- retrying the same batch must
+        // succeed cleanly, proving nothing was left half-applied.
+        storage
+            .insert_rows(vec![
+                ("t".to_string(), vec![Value::Int(1)]),
+                ("t".to_string(), vec![Value::Int(2)]),
+                ("t".to_string(), vec![Value::Int(3)]),
+            ])
+            .unwrap();
+        assert_eq!(storage.scan("t").unwrap().len(), 3);
 
         std::fs::remove_file(&path).ok();
     }

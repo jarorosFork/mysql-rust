@@ -72,18 +72,19 @@ impl Transaction {
         Ok(())
     }
 
-    /// Apply every buffered row to the real storage and release all locks.
-    /// Held locks guarantee nothing else could have changed these tables
-    /// since they were buffered, so this cannot fail on a conflict it
-    /// didn't already check for at insert time.
+    /// Apply every buffered row to the real storage, as one atomic batch
+    /// (PERFORMANCE_DURABILITY_PLAN.md D2 — see `InMemoryStorage::
+    /// insert_rows`), and release all locks. Held locks guarantee nothing
+    /// else could have changed these tables since they were buffered, so
+    /// this cannot fail on a conflict it didn't already check for at
+    /// insert time.
     pub fn commit(self) -> Result<()> {
         let pending = self.pending.into_inner().unwrap_or_else(|e| e.into_inner());
-        for (table, rows) in pending {
-            for row in rows {
-                self.storage.insert_row(&table, row)?;
-            }
-        }
-        Ok(()) // locks release as `self.locks` drops here.
+        let rows: Vec<(String, Vec<Value>)> = pending
+            .into_iter()
+            .flat_map(|(table, rows)| rows.into_iter().map(move |row| (table.clone(), row)))
+            .collect();
+        self.storage.insert_rows(rows) // locks release as `self.locks` drops here.
     }
 
     /// Discard every buffered row and release all locks. Nothing was ever
@@ -283,6 +284,48 @@ mod tests {
         assert_eq!(
             storage.scan("t").unwrap(),
             vec![vec![Value::Int(1), Value::Varchar("alice".to_string())]]
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_applies_rows_across_multiple_tables_as_one_atomic_batch() {
+        let storage = setup();
+        storage
+            .create_table(
+                "u",
+                vec![ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: ColumnType::Int,
+                    nullable: false,
+                    auto_increment: false,
+                }],
+                Some("id".to_string()),
+            )
+            .unwrap();
+
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.ensure_locked("u").await.unwrap();
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+        tx.insert_row("u", vec![Value::Int(100)]).unwrap();
+        tx.insert_row("u", vec![Value::Int(101)]).unwrap();
+
+        tx.commit().unwrap();
+
+        // PERFORMANCE_DURABILITY_PLAN.md D2: one log record for the whole
+        // transaction, regardless of how many tables it touched -- all of
+        // it lands (or, on a crash, none of it does; see tests/crash.rs).
+        assert_eq!(
+            storage.scan("t").unwrap(),
+            vec![vec![Value::Int(1), Value::Varchar("alice".to_string())]]
+        );
+        assert_eq!(
+            storage.scan("u").unwrap(),
+            vec![vec![Value::Int(100)], vec![Value::Int(101)]]
         );
     }
 
