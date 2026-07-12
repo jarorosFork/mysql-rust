@@ -1,0 +1,60 @@
+name: CI
+
+# Runs the full quality bar on every push and pull request. These are the
+# exact gates PRODUCTION_READINESS.md §6 requires, in the same order a local
+# developer runs them (see CLAUDE.md "Commands"). No external services are
+# needed: the integration and end-to-end conformance tests start the server
+# in-process on an ephemeral port, and the real-driver test (`mysql_async`)
+# is a Rust dev-dependency — so a stock Ubuntu runner with a Rust toolchain
+# is sufficient.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: fmt · clippy · build · test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Gate 6.1 — formatting.
+      - name: Formatting (cargo fmt --check)
+        run: cargo fmt --all -- --check
+
+      # Gate 6.2 — lints, warnings denied.
+      - name: Clippy (--all-targets -D warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets --verbose
+
+      # Gates 6.3 / 6.4 / 6.5 / 6.6 — unit + integration + end-to-end
+      # conformance (real mysql_async driver) + fuzz harness, all via
+      # `cargo test`.
+      - name: Test (unit + integration + conformance + fuzz)
+        run: cargo test --verbose

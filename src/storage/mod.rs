@@ -1,0 +1,46 @@
+//! Storage engine abstraction.
+//!
+//! Concrete engines (in-memory, on-disk, ...) implement the [`Storage`]
+//! trait so the query executor can stay engine-agnostic.
+
+pub mod engine;
+pub mod log;
+pub mod transaction;
+pub mod value;
+
+pub use engine::InMemoryStorage;
+pub use transaction::Transaction;
+pub use value::{ColumnSchema, ColumnType, TableSchema, Value};
+
+use crate::Result;
+
+/// A pluggable storage backend. `&self` (not `&mut self`) so a single
+/// instance can eventually be shared across connections (Phase 6); engines
+/// use interior mutability.
+pub trait Storage {
+    /// Create a table with the given schema and optional primary-key column.
+    fn create_table(
+        &self,
+        name: &str,
+        columns: Vec<ColumnSchema>,
+        primary_key: Option<String>,
+    ) -> Result<()>;
+
+    /// Return the names of all tables.
+    fn tables(&self) -> Result<Vec<String>>;
+
+    /// Return `name`'s full schema.
+    fn table_schema(&self, name: &str) -> Result<TableSchema>;
+
+    /// Append a row. `row` must have exactly as many values as the table
+    /// has columns, in column order, and already be type-checked.
+    fn insert_row(&self, table: &str, row: Vec<Value>) -> Result<()>;
+
+    /// Return every row in `table`, in insertion order.
+    fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>>;
+
+    /// Look up a row by its primary-key value in O(1) rather than scanning.
+    /// Returns `Ok(None)` if the table has no matching row (or no primary
+    /// key at all — callers should check `table_schema` first).
+    fn lookup_by_primary_key(&self, table: &str, key: &Value) -> Result<Option<Vec<Value>>>;
+}

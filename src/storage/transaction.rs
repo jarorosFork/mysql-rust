@@ -1,0 +1,354 @@
+//! A connection-scoped transaction: buffers writes until `commit`, discards
+//! them on `rollback`, and holds each written table's exclusive lock for
+//! the transaction's whole lifetime.
+//!
+//! Isolation level: **read committed**. A transaction always sees its own
+//! writes layered on top of the latest committed state (never a stale
+//! snapshot), and other connections never see this transaction's writes
+//! until `commit` — reads never block (no read locks), only writers
+//! serialize against each other, one table-level lock at a time. This is
+//! the minimum level the roadmap calls for; `REPEATABLE READ`/`SERIALIZABLE`
+//! would need real MVCC (row versioning), which is out of scope here.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::OwnedMutexGuard;
+
+use crate::storage::engine::InMemoryStorage;
+use crate::storage::value::{ColumnSchema, TableSchema, Value};
+use crate::storage::Storage;
+use crate::{Error, Result};
+
+/// An in-progress transaction. Logically owned by exactly one `Connection`,
+/// but its fields still need `std::sync::Mutex` rather than a plain
+/// `RefCell`: an `async fn(&self)` (`ensure_locked`, below) that awaits
+/// while holding `&self` requires `Self: Sync` for the enclosing future to
+/// be `Send` — `RefCell` can never satisfy that, regardless of actual
+/// access patterns. The mutexes themselves are only ever held for a plain
+/// synchronous field update, never across an `.await`.
+pub struct Transaction {
+    storage: Arc<InMemoryStorage>,
+    /// Rows inserted by this transaction but not yet committed, per table.
+    pending: Mutex<HashMap<String, Vec<Vec<Value>>>>,
+    /// Tables this transaction has written to, each holding that table's
+    /// write lock until `commit`/`rollback` (i.e. until `self` is dropped
+    /// or consumed by one of those methods).
+    locks: Mutex<Vec<(String, OwnedMutexGuard<()>)>>,
+    locked_tables: Mutex<HashSet<String>>,
+}
+
+impl Transaction {
+    pub fn new(storage: Arc<InMemoryStorage>) -> Self {
+        Transaction {
+            storage,
+            pending: Mutex::new(HashMap::new()),
+            locks: Mutex::new(Vec::new()),
+            locked_tables: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Acquire `table`'s write lock if this transaction doesn't already
+    /// hold it, blocking (bounded by `InMemoryStorage::lock_table`'s
+    /// timeout) until it's available. Idempotent per table.
+    pub async fn ensure_locked(&self, table: &str) -> Result<()> {
+        if self
+            .locked_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(table)
+        {
+            return Ok(());
+        }
+        let guard = self.storage.lock_table(table).await?;
+        self.locked_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table.to_string());
+        self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((table.to_string(), guard));
+        Ok(())
+    }
+
+    /// Apply every buffered row to the real storage and release all locks.
+    /// Held locks guarantee nothing else could have changed these tables
+    /// since they were buffered, so this cannot fail on a conflict it
+    /// didn't already check for at insert time.
+    pub fn commit(self) -> Result<()> {
+        let pending = self.pending.into_inner().unwrap_or_else(|e| e.into_inner());
+        for (table, rows) in pending {
+            for row in rows {
+                self.storage.insert_row(&table, row)?;
+            }
+        }
+        Ok(()) // locks release as `self.locks` drops here.
+    }
+
+    /// Discard every buffered row and release all locks. Nothing was ever
+    /// applied to the real storage, so there's nothing to undo.
+    pub fn rollback(self) {}
+
+    fn primary_key_index(&self, schema: &TableSchema) -> Option<usize> {
+        let pk = schema.primary_key.as_ref()?;
+        schema.columns.iter().position(|c| &c.name == pk)
+    }
+}
+
+impl Storage for Transaction {
+    fn create_table(
+        &self,
+        name: &str,
+        columns: Vec<ColumnSchema>,
+        primary_key: Option<String>,
+    ) -> Result<()> {
+        // DDL auto-commits immediately, even inside a transaction — matches
+        // real MySQL (CREATE TABLE implicitly commits any open transaction
+        // first); we don't go quite that far, but we don't buffer it either.
+        self.storage.create_table(name, columns, primary_key)
+    }
+
+    fn tables(&self) -> Result<Vec<String>> {
+        self.storage.tables()
+    }
+
+    fn table_schema(&self, name: &str) -> Result<TableSchema> {
+        self.storage.table_schema(name)
+    }
+
+    fn insert_row(&self, table: &str, row: Vec<Value>) -> Result<()> {
+        let schema = self.storage.table_schema(table)?;
+        if row.len() != schema.columns.len() {
+            return Err(Error::Execution(format!(
+                "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
+                schema.columns.len(),
+                row.len()
+            )));
+        }
+
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pk_idx) = self.primary_key_index(&schema) {
+            let key = &row[pk_idx];
+            let committed = self.storage.lookup_by_primary_key(table, key)?.is_some();
+            let already_pending = pending
+                .get(table)
+                .is_some_and(|rows| rows.iter().any(|r| &r[pk_idx] == key));
+            if committed || already_pending {
+                return Err(Error::Execution(format!(
+                    "Duplicate entry '{}' for key 'PRIMARY'",
+                    key.to_display_string().unwrap_or_default()
+                )));
+            }
+        }
+        drop(pending);
+
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(table.to_string())
+            .or_default()
+            .push(row);
+        Ok(())
+    }
+
+    fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>> {
+        let mut rows = self.storage.scan(table)?;
+        if let Some(pending) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table)
+        {
+            rows.extend(pending.iter().cloned());
+        }
+        Ok(rows)
+    }
+
+    fn lookup_by_primary_key(&self, table: &str, key: &Value) -> Result<Option<Vec<Value>>> {
+        if let Some(row) = self.storage.lookup_by_primary_key(table, key)? {
+            return Ok(Some(row));
+        }
+        let schema = self.storage.table_schema(table)?;
+        let Some(pk_idx) = self.primary_key_index(&schema) else {
+            return Ok(None);
+        };
+        Ok(self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table)
+            .and_then(|rows| rows.iter().find(|r| &r[pk_idx] == key).cloned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::value::ColumnType;
+
+    fn setup() -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .create_table(
+                "t",
+                vec![
+                    ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: ColumnType::Int,
+                    },
+                    ColumnSchema {
+                        name: "name".to_string(),
+                        column_type: ColumnType::Varchar,
+                    },
+                ],
+                Some("id".to_string()),
+            )
+            .unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    async fn transaction_sees_its_own_pending_writes() {
+        let storage = setup();
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            tx.scan("t").unwrap().len(),
+            1,
+            "the transaction should see its own uncommitted row"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_readers_do_not_see_pending_writes() {
+        let storage = setup();
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+
+        // Reading straight from storage (as any other connection would) —
+        // read committed: nothing is visible until commit.
+        assert!(storage.scan("t").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_applies_pending_rows_to_storage() {
+        let storage = setup();
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+
+        tx.commit().unwrap();
+
+        assert_eq!(
+            storage.scan("t").unwrap(),
+            vec![vec![Value::Int(1), Value::Varchar("alice".to_string())]]
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_discards_pending_rows() {
+        let storage = setup();
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+
+        tx.rollback();
+
+        assert!(
+            storage.scan("t").unwrap().is_empty(),
+            "rollback must leave storage untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_primary_key_within_the_same_transaction_is_rejected() {
+        let storage = setup();
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+        assert!(tx
+            .insert_row("t", vec![Value::Int(1), Value::Varchar("bob".to_string())])
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_primary_key_against_already_committed_data_is_rejected() {
+        let storage = setup();
+        storage
+            .insert_row(
+                "t",
+                vec![Value::Int(1), Value::Varchar("alice".to_string())],
+            )
+            .unwrap();
+
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        assert!(tx
+            .insert_row("t", vec![Value::Int(1), Value::Varchar("bob".to_string())])
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_locked_is_idempotent_within_one_transaction() {
+        // A non-reentrant lock acquired twice by the same "owner" without a
+        // guard would deadlock — this is exactly what multiple INSERTs into
+        // the same table within one transaction do in practice.
+        let storage = setup();
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.ensure_locked("t").await.unwrap(); // must not hang
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+        tx.insert_row("t", vec![Value::Int(2), Value::Varchar("bob".to_string())])
+            .unwrap();
+        assert_eq!(tx.scan("t").unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lookup_by_primary_key_checks_pending_too() {
+        let storage = setup();
+        let tx = Transaction::new(Arc::clone(&storage));
+        tx.ensure_locked("t").await.unwrap();
+        tx.insert_row(
+            "t",
+            vec![Value::Int(1), Value::Varchar("alice".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            tx.lookup_by_primary_key("t", &Value::Int(1)).unwrap(),
+            Some(vec![Value::Int(1), Value::Varchar("alice".to_string())])
+        );
+        assert_eq!(
+            tx.lookup_by_primary_key("t", &Value::Int(99)).unwrap(),
+            None
+        );
+    }
+}

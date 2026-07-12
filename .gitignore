@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local state (session locks, scheduled-task state, etc.)
+.claude/
+
+# Secrets / local env — never commit key material or credentials.
+# (The TLS test generates its cert at runtime via rcgen; nothing is checked in.)
+.env
+.env.*
+*.pem
+*.key
+*.p12

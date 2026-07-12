@@ -1,0 +1,39 @@
+[package]
+name = "mysql-rust"
+version = "0.1.0"
+edition = "2021"
+description = "A MySQL-compatible database server written in Rust (early-stage skeleton)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+# First real dependency (Phase 6, ROADMAP.md): the single-connection path
+# was proven blocking/std-only through Phases 1-5 as planned. tokio brings
+# real concurrency — one async task per connection instead of one at a time
+# — which the storage layer is now built to support (Storage::* take &self;
+# see src/storage/engine.rs). Feature set is deliberately narrow: rt +
+# rt-multi-thread (a real multi-threaded scheduler, so the concurrency is
+# genuine parallelism, not just interleaving), net (TcpListener/TcpStream),
+# io-util (AsyncRead/AsyncWriteExt), macros (#[tokio::main]/#[tokio::test]),
+# signal (SIGINT/SIGTERM for graceful shutdown), sync (the shutdown
+# broadcast + connection-limit semaphore), time (bounded shutdown drain).
+[dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
+# TLS (Phase 9, ROADMAP.md): `CLIENT_SSL` support. TLS genuinely cannot be
+# hand-rolled (unlike SHA-1), so this is a necessary crypto dependency.
+# `ring` backend (not the aws-lc-rs default) is deliberate — it builds
+# cleanly here without cmake/a full C toolchain. Narrow features: no
+# certificate-verification machinery is pulled in beyond what a server
+# needs (the server presents a cert; it doesn't verify client certs).
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+
+[dev-dependencies]
+# Generates a self-signed certificate at test time so the TLS integration
+# test needs no checked-in key material (which would carry an expiry and be
+# an odd thing to commit). `ring` backend to match the server's.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# End-to-end conformance (Phase 10): a real, standard third-party MySQL
+# driver — not our own scripted client — connecting to the server proves
+# genuine wire compatibility. `mysql_async` is tokio-based (matches our
+# runtime). default-features off drops TLS/compression backends we don't
+# need for the plaintext conformance test and keeps the build lean.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
