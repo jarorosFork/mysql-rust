@@ -329,7 +329,37 @@ rest stays a known, explicit gap rather than an unstated one.
       real `f64` can't even represent `19.99` exactly) + 6 new e2e app
       entries (`cargo run --example e2e`, 26/26 passing). 352 tests total
       (was 329). fmt + clippy `-D warnings` clean.)_
-- [ ] `GROUP BY` + aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`).
+- [x] `GROUP BY` + aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`).
+      _(A query is "aggregate" if it has a `GROUP BY` or any aggregate
+      function call in the projection (`is_aggregate_query`); such queries
+      route through a new `execute_select_aggregate` instead of the plain
+      row-scan path. WHERE filtering is shared with the plain path via a new
+      `scan_and_filter` helper (incl. the primary-key-equality fast path) and
+      runs *before* grouping. Rows are partitioned by their `GROUP BY` values
+      into a `HashMap<Vec<Value>, Vec<Vec<Value>>>` — with no `GROUP BY` at
+      all, this collapses to exactly one group so a bare `COUNT(*)` on an
+      empty table correctly returns `0`, not zero rows. Group keys are sorted
+      deterministically (via the existing `value_ordering`) so results don't
+      depend on `HashMap` iteration order. `ONLY_FULL_GROUP_BY`-style
+      validation rejects any projected column that isn't in `GROUP BY` and
+      isn't wrapped in an aggregate, and rejects `SELECT *` in an aggregate
+      query outright. `ORDER BY` on an aggregate query resolves column names
+      against the *output* schema (so `ORDER BY total` can name a `SUM(...)
+      AS total` alias, which doesn't exist in the source table) rather than
+      the source table schema used by the plain path. Every aggregate is
+      NULL-aware (`COUNT` skips `NULL` for a named column; `SUM`/`AVG`/`MIN`/
+      `MAX` skip `NULL` rows and return `NULL`, not `0`, when every input was
+      `NULL`) and uses checked arithmetic throughout (`checked_add`/
+      `checked_mul`/`checked_pow`) so overflow is a proper `Error::Execution`,
+      never a panic. `AVG` returns exact fixed-point, not a float: its scale
+      is the source column's scale plus 4 (capped at 30), computed via
+      integer scaling and round-half-away-from-zero — matching the same
+      rounding rule `DECIMAL` coercion already uses. Proof: 24 new tests (4
+      parser + 19 executor, incl. empty-table/all-NULL/overflow/validation
+      edge cases + 1 real-driver conformance test covering a grouped report
+      with `WHERE`+`GROUP BY`+`ORDER BY` on an alias together) + 8 new e2e
+      app entries (`cargo run --example e2e`, 34/34 passing). 376 tests total
+      (was 352). fmt + clippy `-D warnings` clean.)_
 - [ ] `JOIN` (`INNER`, `LEFT`) — includes qualified column references
       (`table.column`/`alias.column`), deferred until now since they only
       matter once more than one table is in play.

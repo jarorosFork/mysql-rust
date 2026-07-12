@@ -154,6 +154,43 @@ const ENTRIES: &[Entry] = &[
         name: "WHERE on a decimal column compares numerically, not lexically",
         sql: "SELECT total FROM orders WHERE total > 10.00 ORDER BY total",
     },
+    // ---- Phase 11: GROUP BY + aggregate functions ----
+    Entry {
+        name: "create and seed a sales table for GROUP BY / aggregate queries",
+        sql: "CREATE TABLE sales (id INT PRIMARY KEY, category VARCHAR, amount DECIMAL(10,2))",
+    },
+    Entry {
+        name: "insert sales rows across two categories",
+        sql: "INSERT INTO sales VALUES \
+              (1, 'fruit', 10.00), (2, 'fruit', 5.50), \
+              (3, 'veg', 3.25), (4, 'veg', 7.75), (5, 'veg', 1.00)",
+    },
+    Entry {
+        name: "plain aggregate (no GROUP BY): total row count",
+        sql: "SELECT COUNT(*) FROM sales",
+    },
+    Entry {
+        name: "plain aggregate: grand total (exact fixed-point, not a float)",
+        sql: "SELECT SUM(amount) FROM sales",
+    },
+    Entry {
+        name: "GROUP BY: a totals-by-category report, sorted by the \
+               aggregate's own alias",
+        sql: "SELECT category, COUNT(*) AS n, SUM(amount) AS total \
+              FROM sales GROUP BY category ORDER BY total DESC",
+    },
+    Entry {
+        name: "WHERE filters before GROUP BY (not after)",
+        sql: "SELECT category, COUNT(*) FROM sales WHERE amount > 4.00 GROUP BY category",
+    },
+    Entry {
+        name: "AVG returns exact fixed-point (not a float approximation)",
+        sql: "SELECT AVG(amount) FROM sales",
+    },
+    Entry {
+        name: "MIN and MAX",
+        sql: "SELECT MIN(amount), MAX(amount) FROM sales",
+    },
     Entry {
         name: "drop schema (cleanup)",
         sql: "DROP SCHEMA IF EXISTS shop_alt",

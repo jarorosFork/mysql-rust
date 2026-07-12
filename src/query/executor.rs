@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::query::parser::{
     ColumnDef, CompareOp, Condition, Expr, OrderByItem, SelectItem, ShowStatement, Statement,
 };
-use crate::storage::{format_decimal, ColumnSchema, ColumnType, Storage, Value};
+use crate::storage::{format_decimal, ColumnSchema, ColumnType, Storage, TableSchema, Value};
 use crate::{Error, Result};
 
 /// A single row in a result set: one typed value per column.
@@ -84,10 +84,13 @@ impl<'a> Executor<'a> {
                 projection,
                 from,
                 selection,
+                group_by,
                 order_by,
                 limit,
                 offset,
-            } => self.execute_select(projection, from, selection, &order_by, limit, offset),
+            } => self.execute_select(
+                projection, from, selection, &group_by, &order_by, limit, offset,
+            ),
             // Transaction control is handled by `Connection` before a
             // statement ever reaches an `Executor` (it needs to switch
             // which `Storage` implementation subsequent statements use —
@@ -322,19 +325,30 @@ impl<'a> Executor<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn execute_select(
         &self,
         projection: Vec<SelectItem>,
         from: Option<String>,
         selection: Option<Condition>,
+        group_by: &[String],
         order_by: &[OrderByItem],
         limit: Option<u64>,
         offset: Option<u64>,
     ) -> Result<QueryResult> {
         match from {
             None => self.execute_select_without_table(projection, limit, offset),
-            Some(table) => self
-                .execute_select_from_table(&table, projection, selection, order_by, limit, offset),
+            Some(table) => {
+                if is_aggregate_query(&projection, group_by) {
+                    self.execute_select_aggregate(
+                        &table, projection, selection, group_by, order_by, limit, offset,
+                    )
+                } else {
+                    self.execute_select_from_table(
+                        &table, projection, selection, order_by, limit, offset,
+                    )
+                }
+            }
         }
     }
 
@@ -497,31 +511,7 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult> {
         let schema = self.storage.table_schema(table)?;
         let selected_indices = resolve_projection(&schema.columns, &projection)?;
-
-        let mut matching_rows: Vec<Vec<Value>> = match &selection {
-            None => self.storage.scan(table)?,
-            Some(cond) => {
-                let col_idx = column_index(&schema.columns, &cond.column)?;
-                let column_type = schema.columns[col_idx].column_type;
-                let expected = coerce(&cond.value, column_type, &cond.column)?;
-
-                let is_pk_equality = cond.op == CompareOp::Eq
-                    && schema.primary_key.as_deref() == Some(cond.column.as_str());
-                if is_pk_equality {
-                    // Indexed point lookup instead of a full scan.
-                    self.storage
-                        .lookup_by_primary_key(table, &expected)?
-                        .into_iter()
-                        .collect()
-                } else {
-                    self.storage
-                        .scan(table)?
-                        .into_iter()
-                        .filter(|row| compare_values(&row[col_idx], cond.op, &expected))
-                        .collect()
-                }
-            }
-        };
+        let mut matching_rows = self.scan_and_filter(table, &schema, &selection)?;
 
         // Sort before projecting: ORDER BY may name a column that isn't in
         // the SELECT list, so this needs the full (pre-projection) row.
@@ -573,6 +563,419 @@ impl<'a> Executor<'a> {
             rows,
             rows_affected: 0,
         })
+    }
+
+    /// Scan `table` and apply an optional `WHERE` filter, returning full
+    /// (pre-projection) matching rows. Shared by the plain and aggregate
+    /// `SELECT` paths. Uses the indexed primary-key lookup for `col = value`
+    /// on the primary key; a full scan otherwise.
+    fn scan_and_filter(
+        &self,
+        table: &str,
+        schema: &TableSchema,
+        selection: &Option<Condition>,
+    ) -> Result<Vec<Vec<Value>>> {
+        match selection {
+            None => self.storage.scan(table),
+            Some(cond) => {
+                let col_idx = column_index(&schema.columns, &cond.column)?;
+                let column_type = schema.columns[col_idx].column_type;
+                let expected = coerce(&cond.value, column_type, &cond.column)?;
+
+                let is_pk_equality = cond.op == CompareOp::Eq
+                    && schema.primary_key.as_deref() == Some(cond.column.as_str());
+                if is_pk_equality {
+                    Ok(self
+                        .storage
+                        .lookup_by_primary_key(table, &expected)?
+                        .into_iter()
+                        .collect())
+                } else {
+                    Ok(self
+                        .storage
+                        .scan(table)?
+                        .into_iter()
+                        .filter(|row| compare_values(&row[col_idx], cond.op, &expected))
+                        .collect())
+                }
+            }
+        }
+    }
+
+    /// `SELECT` with `GROUP BY` and/or an aggregate function
+    /// (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) in the projection. Groups the
+    /// `WHERE`-filtered rows by `group_by`'s columns' values — or, if
+    /// `group_by` is empty, treats the whole filtered set as one group, so
+    /// e.g. `SELECT COUNT(*) FROM t` always returns exactly one row, even
+    /// for an empty table (zero *groups* only happens with an explicit,
+    /// non-empty `GROUP BY` and zero matching rows). Every bare column in
+    /// the projection must be one of `group_by`'s columns — standard SQL;
+    /// MySQL's own `ONLY_FULL_GROUP_BY` default enforces the same rule.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_select_aggregate(
+        &self,
+        table: &str,
+        projection: Vec<SelectItem>,
+        selection: Option<Condition>,
+        group_by: &[String],
+        order_by: &[OrderByItem],
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> Result<QueryResult> {
+        let schema = self.storage.table_schema(table)?;
+        let group_by_indices = group_by
+            .iter()
+            .map(|name| column_index(&schema.columns, name))
+            .collect::<Result<Vec<usize>>>()?;
+
+        if projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard))
+        {
+            return Err(Error::Unsupported("'*' in a GROUP BY / aggregate query"));
+        }
+
+        // Resolve each projection item once (not once per group), and build
+        // the output column schema right away — independent of any group's
+        // actual data, so a zero-group result (e.g. GROUP BY on an empty
+        // table) still reports the right columns, just no rows.
+        let mut resolved = Vec::with_capacity(projection.len());
+        let mut output_columns = Vec::with_capacity(projection.len());
+        for item in &projection {
+            let SelectItem::Expr(expr, alias) = item else {
+                unreachable!("wildcard already rejected above");
+            };
+            let (item_plan, default_name, column_type) = match expr {
+                Expr::Column(name) => {
+                    let pos = group_by.iter().position(|g| g == name).ok_or_else(|| {
+                        Error::Execution(format!(
+                            "Column '{name}' must appear in GROUP BY or be used inside an aggregate function"
+                        ))
+                    })?;
+                    let column_type = schema.columns[group_by_indices[pos]].column_type;
+                    (
+                        ResolvedAggregateItem::GroupColumn(pos),
+                        name.clone(),
+                        column_type,
+                    )
+                }
+                Expr::Function(name, args) if is_aggregate_function_name(name) => {
+                    let arg_col = resolve_aggregate_arg(args, &schema)?;
+                    let column_type = aggregate_result_type(name, arg_col.map(|(_, t)| t))?;
+                    let default_name = match arg_col {
+                        None => format!("{name}(*)"),
+                        Some((idx, _)) => format!("{name}({})", schema.columns[idx].name),
+                    };
+                    (
+                        ResolvedAggregateItem::Aggregate(name.clone(), arg_col),
+                        default_name,
+                        column_type,
+                    )
+                }
+                _ => {
+                    return Err(Error::Execution(
+                        "only columns and aggregate functions are allowed in a GROUP BY / aggregate SELECT list"
+                            .to_string(),
+                    ))
+                }
+            };
+            resolved.push(item_plan);
+            output_columns.push(ColumnSchema {
+                name: alias.clone().unwrap_or(default_name),
+                column_type,
+                nullable: true,
+                auto_increment: false,
+            });
+        }
+
+        let matching_rows = self.scan_and_filter(table, &schema, &selection)?;
+
+        let mut groups: HashMap<Vec<Value>, Vec<Vec<Value>>> = HashMap::new();
+        if group_by_indices.is_empty() {
+            groups.insert(Vec::new(), matching_rows);
+        } else {
+            for row in matching_rows {
+                let key: Vec<Value> = group_by_indices.iter().map(|&i| row[i].clone()).collect();
+                groups.entry(key).or_default().push(row);
+            }
+        }
+
+        // Deterministic group order (by key) so results are stable even
+        // before any ORDER BY is applied.
+        let mut keys: Vec<Vec<Value>> = groups.keys().cloned().collect();
+        keys.sort_by(|a, b| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(av, bv)| value_ordering(av, bv))
+                .find(|ord| *ord != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let mut output_rows = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let group_rows = &groups[key];
+            let mut row = Vec::with_capacity(resolved.len());
+            for item_plan in &resolved {
+                let value = match item_plan {
+                    ResolvedAggregateItem::GroupColumn(pos) => key[*pos].clone(),
+                    ResolvedAggregateItem::Aggregate(name, arg_col) => {
+                        evaluate_aggregate(name, *arg_col, group_rows)?
+                    }
+                };
+                row.push(value);
+            }
+            output_rows.push(row);
+        }
+
+        // ORDER BY resolves against the OUTPUT columns (by name/alias), not
+        // the source table — an aggregate query's ORDER BY commonly names an
+        // aggregate's own alias (`ORDER BY total DESC`), which may not even
+        // exist as a column in the table.
+        if !order_by.is_empty() {
+            let sort_keys = order_by
+                .iter()
+                .map(|item| {
+                    let idx = output_columns
+                        .iter()
+                        .position(|c| c.name == item.column)
+                        .ok_or_else(|| {
+                            Error::Execution(format!("Unknown column '{}'", item.column))
+                        })?;
+                    Ok((idx, item.descending))
+                })
+                .collect::<Result<Vec<(usize, bool)>>>()?;
+            output_rows.sort_by(|a, b| {
+                sort_keys
+                    .iter()
+                    .map(|&(idx, descending)| {
+                        let ord = value_ordering(&a[idx], &b[idx]);
+                        if descending {
+                            ord.reverse()
+                        } else {
+                            ord
+                        }
+                    })
+                    .find(|ord| *ord != Ordering::Equal)
+                    .unwrap_or(Ordering::Equal)
+            });
+        }
+
+        let paged_rows: Vec<Vec<Value>> = output_rows
+            .into_iter()
+            .skip(offset.unwrap_or(0) as usize)
+            .take(limit.unwrap_or(u64::MAX) as usize)
+            .collect();
+
+        Ok(QueryResult {
+            columns: output_columns,
+            rows: paged_rows,
+            rows_affected: 0,
+        })
+    }
+}
+
+/// A projection item's meaning once resolved against `GROUP BY` and the
+/// source schema — computed once per query, then reused for every group.
+enum ResolvedAggregateItem {
+    /// A `GROUP BY` column: its position within `group_by` (and the group
+    /// key, which is built in that same order).
+    GroupColumn(usize),
+    /// An aggregate function call: its name and, for anything but
+    /// `COUNT(*)`, the source column's index and type.
+    Aggregate(String, Option<(usize, ColumnType)>),
+}
+
+fn is_aggregate_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+    )
+}
+
+/// Whether a `SELECT` needs the aggregate execution path: a non-empty
+/// `GROUP BY`, or any aggregate function call in the projection.
+fn is_aggregate_query(projection: &[SelectItem], group_by: &[String]) -> bool {
+    !group_by.is_empty()
+        || projection.iter().any(|item| {
+            matches!(item, SelectItem::Expr(Expr::Function(name, _), _) if is_aggregate_function_name(name))
+        })
+}
+
+/// Resolve an aggregate function's argument to a source column, if any.
+/// `[]` (i.e. `COUNT(*)`) resolves to `None`; a single bare-column argument
+/// resolves to that column's index and type; anything else (a literal, a
+/// nested call, more than one argument) is `Unsupported` — this engine has
+/// no arithmetic operators, so an aggregate can only ever operate directly
+/// on a stored column.
+fn resolve_aggregate_arg(
+    args: &[Expr],
+    schema: &TableSchema,
+) -> Result<Option<(usize, ColumnType)>> {
+    match args {
+        [] => Ok(None),
+        [Expr::Column(name)] => {
+            let idx = column_index(&schema.columns, name)?;
+            Ok(Some((idx, schema.columns[idx].column_type)))
+        }
+        _ => Err(Error::Unsupported(
+            "aggregate functions only support a single column argument (or none, for COUNT(*))",
+        )),
+    }
+}
+
+/// The result type of an aggregate function, given its argument's column
+/// type (`None` for `COUNT(*)`) — used to build the output column schema
+/// independent of any actual group's data (see `execute_select_aggregate`).
+fn aggregate_result_type(name: &str, arg_type: Option<ColumnType>) -> Result<ColumnType> {
+    match name.to_ascii_uppercase().as_str() {
+        "COUNT" => Ok(ColumnType::Int),
+        "SUM" => match arg_type {
+            Some(ColumnType::Int) => Ok(ColumnType::Int),
+            Some(ColumnType::Decimal(scale)) => Ok(ColumnType::Decimal(scale)),
+            _ => Err(Error::Execution(
+                "SUM() requires a numeric column".to_string(),
+            )),
+        },
+        "AVG" => match arg_type {
+            Some(ColumnType::Int) => Ok(ColumnType::Decimal(4)),
+            Some(ColumnType::Decimal(scale)) => {
+                Ok(ColumnType::Decimal(scale.saturating_add(4).min(30)))
+            }
+            _ => Err(Error::Execution(
+                "AVG() requires a numeric column".to_string(),
+            )),
+        },
+        "MIN" | "MAX" => {
+            arg_type.ok_or_else(|| Error::Execution(format!("{name}() requires a column argument")))
+        }
+        other => unreachable!("caller already checked is_aggregate_function_name: {other}"),
+    }
+}
+
+/// Evaluate one aggregate function call over `group_rows`. `arg_col` is the
+/// source column's index and type (`None` for `COUNT(*)`) — see
+/// `resolve_aggregate_arg`. `SUM`/`AVG`/`MIN`/`MAX` skip `NULL` values;
+/// `SUM`/`AVG` return `NULL` (not `0`) if every value was `NULL`, matching
+/// standard SQL. Checked arithmetic throughout: an absurd magnitude is a
+/// clean `Error::Execution`, never an overflow panic.
+fn evaluate_aggregate(
+    name: &str,
+    arg_col: Option<(usize, ColumnType)>,
+    group_rows: &[Vec<Value>],
+) -> Result<Value> {
+    match name.to_ascii_uppercase().as_str() {
+        "COUNT" => {
+            let count = match arg_col {
+                None => group_rows.len(),
+                Some((idx, _)) => group_rows.iter().filter(|r| r[idx] != Value::Null).count(),
+            };
+            Ok(Value::Int(count as i64))
+        }
+        "SUM" => {
+            let (idx, col_type) = arg_col
+                .ok_or_else(|| Error::Execution("SUM() requires a column argument".to_string()))?;
+            let overflow = || Error::Execution("SUM value out of range".to_string());
+            match col_type {
+                ColumnType::Int => {
+                    let mut sum: i64 = 0;
+                    let mut any = false;
+                    for row in group_rows {
+                        if let Value::Int(n) = row[idx] {
+                            any = true;
+                            sum = sum.checked_add(n).ok_or_else(overflow)?;
+                        }
+                    }
+                    Ok(if any { Value::Int(sum) } else { Value::Null })
+                }
+                ColumnType::Decimal(scale) => {
+                    let mut sum: i64 = 0;
+                    let mut any = false;
+                    for row in group_rows {
+                        if let Value::Decimal(unscaled, _) = row[idx] {
+                            any = true;
+                            sum = sum.checked_add(unscaled).ok_or_else(overflow)?;
+                        }
+                    }
+                    Ok(if any {
+                        Value::Decimal(sum, scale)
+                    } else {
+                        Value::Null
+                    })
+                }
+                _ => Err(Error::Execution(
+                    "SUM() requires a numeric column".to_string(),
+                )),
+            }
+        }
+        "AVG" => {
+            let (idx, col_type) = arg_col
+                .ok_or_else(|| Error::Execution("AVG() requires a column argument".to_string()))?;
+            let source_scale = match col_type {
+                ColumnType::Int => 0u8,
+                ColumnType::Decimal(s) => s,
+                _ => {
+                    return Err(Error::Execution(
+                        "AVG() requires a numeric column".to_string(),
+                    ))
+                }
+            };
+            let avg_scale = source_scale.saturating_add(4).min(30);
+            let overflow = || Error::Execution("AVG value out of range".to_string());
+
+            let mut sum: i64 = 0;
+            let mut count: i64 = 0;
+            for row in group_rows {
+                let n = match &row[idx] {
+                    Value::Int(n) => Some(*n),
+                    Value::Decimal(u, _) => Some(*u),
+                    _ => None,
+                };
+                if let Some(n) = n {
+                    sum = sum.checked_add(n).ok_or_else(overflow)?;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+            let factor = 10i64
+                .checked_pow(u32::from(avg_scale - source_scale))
+                .ok_or_else(overflow)?;
+            let scaled_sum = sum.checked_mul(factor).ok_or_else(overflow)?;
+            let magnitude = scaled_sum.unsigned_abs();
+            let count_u = count as u64;
+            let rounded = (magnitude + count_u / 2) / count_u;
+            let rounded = i64::try_from(rounded).map_err(|_| overflow())?;
+            let avg_unscaled = if scaled_sum < 0 { -rounded } else { rounded };
+            Ok(Value::Decimal(avg_unscaled, avg_scale))
+        }
+        "MIN" | "MAX" => {
+            let (idx, _) = arg_col
+                .ok_or_else(|| Error::Execution(format!("{name}() requires a column argument")))?;
+            let want_min = name.eq_ignore_ascii_case("MIN");
+            let mut best: Option<Value> = None;
+            for row in group_rows {
+                let v = &row[idx];
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                best = Some(match best {
+                    None => v.clone(),
+                    Some(current) => {
+                        let ord = value_ordering(v, &current);
+                        let keep_new = (want_min && ord == Ordering::Less)
+                            || (!want_min && ord == Ordering::Greater);
+                        if keep_new {
+                            v.clone()
+                        } else {
+                            current
+                        }
+                    }
+                });
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        other => unreachable!("caller already checked is_aggregate_function_name: {other}"),
     }
 }
 
@@ -1468,6 +1871,266 @@ mod tests {
             result.rows,
             vec![vec![Value::Decimal(4, 0), Value::Decimal(4, 0)]]
         );
+    }
+
+    // ---- GROUP BY / aggregate functions (Phase 11) ----
+
+    fn seed_sales_table(storage: &InMemoryStorage) {
+        run(
+            storage,
+            "CREATE TABLE sales (id INT PRIMARY KEY, category VARCHAR, amount DECIMAL(10,2))",
+        )
+        .expect("create");
+        for (id, category, amount) in [
+            (1, "fruit", "10.00"),
+            (2, "fruit", "5.50"),
+            (3, "veg", "3.25"),
+            (4, "veg", "7.75"),
+            (5, "veg", "1.00"),
+        ] {
+            run(
+                storage,
+                &format!("INSERT INTO sales VALUES ({id}, '{category}', {amount})"),
+            )
+            .expect("insert");
+        }
+    }
+
+    #[test]
+    fn count_star_counts_all_rows_including_null_columns() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT, b VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, NULL)").expect("insert");
+        run(&storage, "INSERT INTO t VALUES (2, 'x')").expect("insert");
+        let result = run(&storage, "SELECT COUNT(*) FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![int(2)]]);
+        assert_eq!(result.columns[0].column_type, ColumnType::Int);
+    }
+
+    #[test]
+    fn count_column_skips_null_values() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT, b VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, NULL)").expect("insert");
+        run(&storage, "INSERT INTO t VALUES (2, 'x')").expect("insert");
+        let result = run(&storage, "SELECT COUNT(b) FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![int(1)]]);
+    }
+
+    #[test]
+    fn count_on_an_empty_table_is_zero_not_no_rows() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        let result = run(&storage, "SELECT COUNT(*) FROM t").expect("select");
+        // No GROUP BY: always exactly one output row, even for zero source
+        // rows — distinct from an explicit GROUP BY with zero matches.
+        assert_eq!(result.rows, vec![vec![int(0)]]);
+    }
+
+    #[test]
+    fn sum_int_and_decimal_columns() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        let result = run(&storage, "SELECT SUM(amount) FROM sales").expect("select");
+        // 10.00 + 5.50 + 3.25 + 7.75 + 1.00 = 27.50
+        assert_eq!(result.rows, vec![vec![Value::Decimal(2750, 2)]]);
+    }
+
+    #[test]
+    fn sum_of_all_null_is_null_not_zero() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (NULL)").expect("insert");
+        run(&storage, "INSERT INTO t VALUES (NULL)").expect("insert");
+        let result = run(&storage, "SELECT SUM(a) FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn avg_int_column_returns_decimal() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        for v in [1, 2, 4] {
+            run(&storage, &format!("INSERT INTO t VALUES ({v})")).expect("insert");
+        }
+        let result = run(&storage, "SELECT AVG(a) FROM t").expect("select");
+        // (1+2+4)/3 = 2.3333... at scale 4 (0 + 4).
+        assert_eq!(result.rows, vec![vec![Value::Decimal(23333, 4)]]);
+        assert_eq!(result.columns[0].column_type, ColumnType::Decimal(4));
+    }
+
+    #[test]
+    fn avg_decimal_column() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        let result = run(&storage, "SELECT AVG(amount) FROM sales").expect("select");
+        // 27.50 / 5 = 5.5000 at scale 6 (2 + 4).
+        assert_eq!(result.rows, vec![vec![Value::Decimal(5500000, 6)]]);
+    }
+
+    #[test]
+    fn avg_of_zero_rows_is_null() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        let result = run(&storage, "SELECT AVG(a) FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn min_and_max_skip_nulls_and_work_on_any_comparable_type() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT, b VARCHAR, c DATE)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (5, 'banana', '2024-06-01')").expect("insert");
+        run(&storage, "INSERT INTO t VALUES (NULL, NULL, NULL)").expect("insert");
+        run(&storage, "INSERT INTO t VALUES (1, 'apple', '2024-01-01')").expect("insert");
+        let result = run(&storage, "SELECT MIN(a), MAX(a), MIN(b), MAX(c) FROM t").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                int(1),
+                int(5),
+                vc("apple"),
+                Value::Date("2024-06-01".to_string()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn sum_on_a_non_numeric_column_is_rejected() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a VARCHAR)").expect("create");
+        assert!(matches!(
+            run(&storage, "SELECT SUM(a) FROM t"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn group_by_partitions_and_aggregates_per_group() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        let result = run(
+            &storage,
+            "SELECT category, COUNT(*), SUM(amount) FROM sales GROUP BY category",
+        )
+        .expect("select");
+        // Deterministic (sorted-by-key) group order: "fruit" before "veg".
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![vc("fruit"), int(2), Value::Decimal(1550, 2)], // 10.00+5.50
+                vec![vc("veg"), int(3), Value::Decimal(1200, 2)],   // 3.25+7.75+1.00
+            ]
+        );
+        assert_eq!(
+            result.column_names(),
+            vec!["category", "COUNT(*)", "SUM(amount)"]
+        );
+    }
+
+    #[test]
+    fn group_by_aggregate_column_aliases_are_used_as_output_names() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        let result = run(
+            &storage,
+            "SELECT category, COUNT(*) AS total FROM sales GROUP BY category",
+        )
+        .expect("select");
+        assert_eq!(result.column_names(), vec!["category", "total"]);
+    }
+
+    #[test]
+    fn group_by_where_filters_before_grouping() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        let result = run(
+            &storage,
+            "SELECT category, COUNT(*) FROM sales WHERE amount > 4.00 GROUP BY category",
+        )
+        .expect("select");
+        // Only rows with amount > 4.00: fruit(10.00, 5.50) both qualify;
+        // veg only 7.75 does (3.25 and 1.00 don't).
+        assert_eq!(
+            result.rows,
+            vec![vec![vc("fruit"), int(2)], vec![vc("veg"), int(1)]]
+        );
+    }
+
+    #[test]
+    fn group_by_order_by_resolves_against_the_aggregate_alias() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        let result = run(
+            &storage,
+            "SELECT category, COUNT(*) AS total FROM sales GROUP BY category ORDER BY total DESC",
+        )
+        .expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![vc("veg"), int(3)], vec![vc("fruit"), int(2)],]
+        );
+    }
+
+    #[test]
+    fn group_by_with_limit() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        let result = run(
+            &storage,
+            "SELECT category, COUNT(*) AS total FROM sales GROUP BY category \
+             ORDER BY total DESC LIMIT 1",
+        )
+        .expect("select");
+        assert_eq!(result.rows, vec![vec![vc("veg"), int(3)]]);
+    }
+
+    #[test]
+    fn group_by_on_an_empty_table_yields_zero_groups() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (category VARCHAR, a INT)").expect("create");
+        let result = run(
+            &storage,
+            "SELECT category, COUNT(*) FROM t GROUP BY category",
+        )
+        .expect("select");
+        // Unlike a plain (no-GROUP-BY) aggregate, an explicit GROUP BY with
+        // zero matching rows produces zero *rows* — but still the right
+        // *columns*.
+        assert!(result.rows.is_empty());
+        assert_eq!(result.column_names(), vec!["category", "COUNT(*)"]);
+    }
+
+    #[test]
+    fn non_grouped_bare_column_in_a_group_by_query_is_rejected() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        // `id` is neither aggregated nor in GROUP BY — standard SQL rejects
+        // this (MySQL's own ONLY_FULL_GROUP_BY default does too).
+        assert!(matches!(
+            run(&storage, "SELECT id, category FROM sales GROUP BY category"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn wildcard_in_a_group_by_query_is_unsupported() {
+        let storage = InMemoryStorage::new();
+        seed_sales_table(&storage);
+        assert!(matches!(
+            run(&storage, "SELECT * FROM sales GROUP BY category"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn aggregate_with_more_than_one_argument_is_unsupported() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT, b INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "SELECT COUNT(a, b) FROM t"),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]

@@ -472,6 +472,99 @@ async fn real_driver_decimal_date_and_boolean() {
     drop(server);
 }
 
+/// `GROUP BY` + aggregate functions (Phase 11): a realistic "totals by
+/// category" report — exactly the kind of query a GUI's aggregate/pivot
+/// view or a dashboard would issue.
+#[tokio::test]
+async fn real_driver_group_by_and_aggregates() {
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    conn.query_drop(
+        "CREATE TABLE sales (id INT PRIMARY KEY, category VARCHAR, amount DECIMAL(10,2))",
+    )
+    .await
+    .expect("CREATE TABLE");
+    conn.query_drop(
+        "INSERT INTO sales VALUES \
+         (1, 'fruit', 10.00), (2, 'fruit', 5.50), \
+         (3, 'veg', 3.25), (4, 'veg', 7.75), (5, 'veg', 1.00)",
+    )
+    .await
+    .expect("INSERT");
+
+    // A plain aggregate (no GROUP BY) over the whole table.
+    let total_count: Option<i64> = conn
+        .query_first("SELECT COUNT(*) FROM sales")
+        .await
+        .expect("COUNT(*)");
+    assert_eq!(total_count, Some(5));
+
+    let grand_total: Option<String> = conn
+        .query_first("SELECT SUM(amount) FROM sales")
+        .await
+        .expect("SUM(amount)");
+    assert_eq!(grand_total.as_deref(), Some("27.50"));
+
+    // GROUP BY: one row per category, with a count and a sum, sorted by the
+    // aggregate's own alias — a report a real dashboard would generate.
+    let report: Vec<(String, i64, String)> = conn
+        .query(
+            "SELECT category, COUNT(*) AS n, SUM(amount) AS total \
+             FROM sales GROUP BY category ORDER BY total DESC",
+        )
+        .await
+        .expect("GROUP BY report");
+    assert_eq!(
+        report,
+        vec![
+            ("fruit".to_string(), 2, "15.50".to_string()),
+            ("veg".to_string(), 3, "12.00".to_string()),
+        ]
+    );
+
+    // WHERE filters before grouping (not after).
+    let filtered: Vec<(String, i64)> = conn
+        .query("SELECT category, COUNT(*) FROM sales WHERE amount > 4.00 GROUP BY category")
+        .await
+        .expect("filtered GROUP BY");
+    assert_eq!(
+        filtered,
+        vec![("fruit".to_string(), 2), ("veg".to_string(), 1)]
+    );
+
+    // AVG returns exact fixed-point, not a float approximation.
+    let avg: Option<String> = conn
+        .query_first("SELECT AVG(amount) FROM sales")
+        .await
+        .expect("AVG(amount)");
+    assert_eq!(avg.as_deref(), Some("5.500000"));
+
+    // MIN/MAX.
+    let bounds: Option<(String, String)> = conn
+        .query_first("SELECT MIN(amount), MAX(amount) FROM sales")
+        .await
+        .expect("MIN/MAX");
+    assert_eq!(bounds, Some(("1.00".to_string(), "10.00".to_string())));
+
+    // A non-grouped, non-aggregated column is a clean ERR, not a crash or
+    // silently-wrong data (standard SQL; MySQL's own default too).
+    let bad = conn
+        .query_drop("SELECT id, category FROM sales GROUP BY category")
+        .await;
+    assert!(bad.is_err());
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
 #[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`

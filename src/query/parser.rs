@@ -26,6 +26,11 @@ pub enum Statement {
         projection: Vec<SelectItem>,
         from: Option<String>,
         selection: Option<Condition>,
+        /// `GROUP BY` column names. A non-empty list, or any aggregate
+        /// function (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) in `projection`, puts
+        /// the query on the aggregate execution path — see
+        /// `Executor::execute_select_aggregate`.
+        group_by: Vec<String>,
         order_by: Vec<OrderByItem>,
         limit: Option<u64>,
         offset: Option<u64>,
@@ -223,6 +228,7 @@ enum Keyword {
     Order,
     By,
     Limit,
+    Group,
 }
 
 fn keyword_text(kw: Keyword) -> String {
@@ -254,6 +260,7 @@ fn keyword_from_ident(s: &str) -> Option<Keyword> {
         "ORDER" => Some(Keyword::Order),
         "BY" => Some(Keyword::By),
         "LIMIT" => Some(Keyword::Limit),
+        "GROUP" => Some(Keyword::Group),
         "DROP" => Some(Keyword::Drop),
         _ => None,
     }
@@ -1299,6 +1306,7 @@ impl<'a> Parser<'a> {
             (None, None)
         };
 
+        let group_by = self.parse_optional_group_by()?;
         let order_by = self.parse_optional_order_by()?;
         let (limit, offset) = self.parse_optional_limit()?;
 
@@ -1307,10 +1315,30 @@ impl<'a> Parser<'a> {
             projection,
             from,
             selection,
+            group_by,
             order_by,
             limit,
             offset,
         })
+    }
+
+    /// An optional `GROUP BY col [, col ...]`.
+    fn parse_optional_group_by(&mut self) -> Result<Vec<String>> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Group))) {
+            return Ok(Vec::new());
+        }
+        self.pos += 1;
+        self.expect_keyword(Keyword::By)?;
+
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident()?);
+            match self.peek() {
+                Some(Token::Comma) => self.pos += 1,
+                _ => break,
+            }
+        }
+        Ok(columns)
     }
 
     /// An optional `ORDER BY col [ASC|DESC] [, col [ASC|DESC] ...]`.
@@ -1436,8 +1464,20 @@ impl<'a> Parser<'a> {
 
     /// Parse a function call whose name is already consumed and `peek()` is at
     /// the opening `(`, e.g. `DATABASE()` or `CONCAT(a, b)`.
+    ///
+    /// `COUNT(*)` is a special case reusing this same `Expr::Function`
+    /// shape: `*` isn't a value expression, so it's represented as `COUNT`
+    /// with an *empty* argument list — a convention private to this parser
+    /// and `Executor::evaluate_aggregate`, which counts all rows (including
+    /// ones with `NULL` columns) for zero-arg `COUNT`, vs. only non-`NULL`
+    /// values for `COUNT(column)`.
     fn parse_function_call(&mut self, name: String) -> Result<Expr> {
         self.expect_punct(&Token::LParen)?;
+        if name.eq_ignore_ascii_case("COUNT") && matches!(self.peek(), Some(Token::Star)) {
+            self.pos += 1;
+            self.expect_punct(&Token::RParen)?;
+            return Ok(Expr::Function(name, Vec::new()));
+        }
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::RParen)) {
             loop {
@@ -1539,6 +1579,7 @@ pub fn bind_parameters(statement: Statement, params: &[Expr]) -> Result<Statemen
             projection,
             from,
             selection,
+            group_by,
             order_by,
             limit,
             offset,
@@ -1560,8 +1601,9 @@ pub fn bind_parameters(statement: Statement, params: &[Expr]) -> Result<Statemen
                 }),
                 None => None,
             },
-            // ORDER BY/LIMIT/OFFSET carry no placeholders (see `OrderByItem`
-            // and their `Option<u64>` types) — nothing to bind.
+            // GROUP BY/ORDER BY/LIMIT/OFFSET carry no placeholders (plain
+            // column names and `Option<u64>` types) — nothing to bind.
+            group_by,
             order_by,
             limit,
             offset,
@@ -1898,6 +1940,7 @@ mod tests {
             projection: vec![SelectItem::Expr(expr, None)],
             from: None,
             selection: None,
+            group_by: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -2148,6 +2191,7 @@ mod tests {
                 projection: vec![SelectItem::Wildcard],
                 from: Some("TABLES".to_string()),
                 selection: None,
+                group_by: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
@@ -2172,6 +2216,7 @@ mod tests {
                 projection: vec![SelectItem::Wildcard],
                 from: Some("t".to_string()),
                 selection: None,
+                group_by: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
@@ -2195,6 +2240,7 @@ mod tests {
                     op: CompareOp::Eq,
                     value: Expr::Integer(1),
                 }),
+                group_by: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
@@ -2330,6 +2376,88 @@ mod tests {
         ));
     }
 
+    // ---- GROUP BY / aggregate functions ----
+
+    #[test]
+    fn group_by_single_and_multiple_columns() {
+        let stmt = parse("SELECT category FROM t GROUP BY category").unwrap();
+        match stmt {
+            Statement::Select { group_by, .. } => {
+                assert_eq!(group_by, vec!["category".to_string()]);
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+
+        let stmt = parse("SELECT a, b FROM t GROUP BY a, b").unwrap();
+        match stmt {
+            Statement::Select { group_by, .. } => {
+                assert_eq!(group_by, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_star_parses_as_a_zero_arg_function_call() {
+        let stmt = parse("SELECT COUNT(*) FROM t").unwrap();
+        match stmt {
+            Statement::Select { projection, .. } => {
+                assert_eq!(
+                    projection,
+                    vec![SelectItem::Expr(
+                        Expr::Function("COUNT".to_string(), Vec::new()),
+                        None
+                    )]
+                );
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_functions_with_a_column_argument() {
+        let stmt = parse("SELECT SUM(price), AVG(price), MIN(price), MAX(price) FROM t").unwrap();
+        match stmt {
+            Statement::Select { projection, .. } => {
+                let names: Vec<&str> = projection
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::Expr(Expr::Function(name, args), _) => {
+                            assert_eq!(args, &vec![Expr::Column("price".to_string())]);
+                            name.as_str()
+                        }
+                        other => panic!("expected a function call, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["SUM", "AVG", "MIN", "MAX"]);
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_by_with_order_by_and_limit_together() {
+        let stmt = parse(
+            "SELECT category, COUNT(*) AS total FROM t GROUP BY category \
+             ORDER BY total DESC LIMIT 5",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select {
+                group_by,
+                order_by,
+                limit,
+                ..
+            } => {
+                assert_eq!(group_by, vec!["category".to_string()]);
+                assert_eq!(order_by.len(), 1);
+                assert_eq!(order_by[0].column, "total");
+                assert_eq!(limit, Some(5));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
     #[test]
     fn select_literal_without_from() {
         let stmt = parse("SELECT 1").unwrap();
@@ -2339,6 +2467,7 @@ mod tests {
                 projection: vec![SelectItem::Expr(Expr::Integer(1), None)],
                 from: None,
                 selection: None,
+                group_by: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
@@ -2358,6 +2487,7 @@ mod tests {
                 )],
                 from: None,
                 selection: None,
+                group_by: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
