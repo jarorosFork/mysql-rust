@@ -37,3 +37,9 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # runtime). default-features off drops TLS/compression backends we don't
 # need for the plaintext conformance test and keeps the build lean.
 mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+
+# A standalone runnable e2e app (not a `cargo test`): boots a real server and
+# drives it with the real driver, one entry at a time. `cargo run --example e2e`.
+[[example]]
+name = "e2e"
+path = "e2e/main.rs"

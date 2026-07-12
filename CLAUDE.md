@@ -47,6 +47,10 @@ cargo check          # fast type-check
 cargo test           # run tests
 cargo clippy --all-targets -- -D warnings   # lints — keep this clean
 cargo fmt            # format before committing
+cargo run --example e2e   # standalone e2e app: boots a server, runs a real
+                           # driver through a scripted list of SQL entries
+                           # (e2e/main.rs) — a runnable smoke test, not a
+                           # `cargo test`; exits non-zero on any failure
 ```
 
 The default listen port is 3306; if a local MySQL already uses it, change
@@ -87,6 +91,11 @@ src/
     engine.rs          InMemoryStorage: RwLock<HashMap> tables, optional persistence
     value.rs           Value/ColumnType/ColumnSchema/TableSchema
     log.rs             append-only on-disk log (encode/decode/replay)
+tests/                 cargo test integration suite (real sockets, real client bytes)
+e2e/
+  main.rs              standalone runnable e2e app (cargo run --example e2e):
+                        boots a Server, drives it with the real mysql_async
+                        driver through a scripted list of SQL entries
 ```
 
 ## Conventions
