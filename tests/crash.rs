@@ -287,8 +287,8 @@ fn varchar_col(name: &str) -> ColumnSchema {
 /// refusing to start at all. Sweeps every possible truncation point within
 /// the final record so the fix has to be correct at each byte boundary,
 /// not just "mostly".
-#[test]
-fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
+#[tokio::test]
+async fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
     let path = temp_data_dir("torn-tail").join("data.log");
     let storage = InMemoryStorage::open(&path, SyncPolicy::Never).expect("open");
     storage
@@ -297,13 +297,16 @@ fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
             vec![int_pk_col("id"), varchar_col("name")],
             Some("id".to_string()),
         )
+        .await
         .expect("create table");
     storage
         .insert_row("t", vec![Value::Int(1), Value::Varchar("ada".to_string())])
+        .await
         .expect("insert row 1");
     let before_last_record = std::fs::metadata(&path).expect("stat").len();
     storage
         .insert_row("t", vec![Value::Int(2), Value::Varchar("bob".to_string())])
+        .await
         .expect("insert row 2");
     let after_last_record = std::fs::metadata(&path).expect("stat").len();
     drop(storage);
@@ -335,16 +338,23 @@ fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
 /// today (any framing break is refused) and must keep passing once D4/D5
 /// land: recovering from a torn *tail* is not license to paper over
 /// mid-file damage by discarding everything after the first problem.
-#[test]
-fn mid_file_corruption_with_valid_data_after_it_is_still_refused() {
+#[tokio::test]
+async fn mid_file_corruption_with_valid_data_after_it_is_still_refused() {
     let path = temp_data_dir("mid-file-corrupt").join("data.log");
     let storage = InMemoryStorage::open(&path, SyncPolicy::Never).expect("open");
     storage
         .create_table("t", vec![int_pk_col("id")], Some("id".to_string()))
+        .await
         .expect("create table");
     let before_row2 = std::fs::metadata(&path).expect("stat").len();
-    storage.insert_row("t", vec![Value::Int(1)]).expect("row 1");
-    storage.insert_row("t", vec![Value::Int(2)]).expect("row 2");
+    storage
+        .insert_row("t", vec![Value::Int(1)])
+        .await
+        .expect("row 1");
+    storage
+        .insert_row("t", vec![Value::Int(2)])
+        .await
+        .expect("row 2");
     drop(storage);
 
     let mut bytes = std::fs::read(&path).expect("read log");

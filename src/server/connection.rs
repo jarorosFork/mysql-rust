@@ -461,9 +461,9 @@ impl Connection {
     /// with it (see `InMemoryStorage::lock_table`).
     async fn execute_statement(&mut self, statement: Statement) -> Result<QueryResult> {
         match &statement {
-            Statement::Begin => return self.begin_transaction(),
-            Statement::Commit => return self.commit_transaction(),
-            Statement::Rollback => return self.rollback_transaction(),
+            Statement::Begin => return self.begin_transaction().await,
+            Statement::Commit => return self.commit_transaction().await,
+            Statement::Rollback => return self.rollback_transaction().await,
             _ => {}
         }
 
@@ -481,8 +481,16 @@ impl Connection {
         };
 
         match &self.transaction {
-            Some(tx) => Executor::new(tx, &self.system_variables).execute(statement),
-            None => Executor::new(self.storage.as_ref(), &self.system_variables).execute(statement),
+            Some(tx) => {
+                Executor::new(tx, &self.system_variables)
+                    .execute(statement)
+                    .await
+            }
+            None => {
+                Executor::new(self.storage.as_ref(), &self.system_variables)
+                    .execute(statement)
+                    .await
+            }
         }
     }
 
@@ -625,22 +633,22 @@ impl Connection {
 
     /// `BEGIN` / `START TRANSACTION`. Starting one while another is already
     /// open implicitly commits the old one first (matches real MySQL).
-    fn begin_transaction(&mut self) -> Result<QueryResult> {
+    async fn begin_transaction(&mut self) -> Result<QueryResult> {
         if let Some(old) = self.transaction.take() {
-            old.commit()?;
+            old.commit().await?;
         }
         self.transaction = Some(Transaction::new(Arc::clone(&self.storage)));
         Ok(QueryResult::default())
     }
 
-    fn commit_transaction(&mut self) -> Result<QueryResult> {
+    async fn commit_transaction(&mut self) -> Result<QueryResult> {
         if let Some(tx) = self.transaction.take() {
-            tx.commit()?;
+            tx.commit().await?;
         }
         Ok(QueryResult::default())
     }
 
-    fn rollback_transaction(&mut self) -> Result<QueryResult> {
+    async fn rollback_transaction(&mut self) -> Result<QueryResult> {
         if let Some(tx) = self.transaction.take() {
             tx.rollback();
         }

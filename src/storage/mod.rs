@@ -5,6 +5,7 @@
 
 pub mod engine;
 pub mod log;
+pub mod log_writer;
 pub mod transaction;
 pub mod value;
 
@@ -12,19 +13,35 @@ pub use engine::InMemoryStorage;
 pub use transaction::Transaction;
 pub use value::{format_decimal, ColumnSchema, ColumnType, TableSchema, Value};
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::Result;
+
+/// The return type of every [`Storage`] method that has to reach the log
+/// (and, once PERFORMANCE_DURABILITY_PLAN.md PD-2's dedicated writer thread
+/// is in the mix, genuinely `.await` an ack rather than block a caller).
+/// Hand-rolled rather than pulling in the `async-trait` crate: `Storage` is
+/// used as `&dyn Storage` (see [`crate::query::executor::Executor`]), and
+/// native `async fn` in traits isn't dyn-compatible — a boxed future is
+/// exactly what that crate expands to anyway, just written out directly for
+/// the handful of methods that actually need it.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A pluggable storage backend. `&self` (not `&mut self`) so a single
 /// instance can eventually be shared across connections (Phase 6); engines
-/// use interior mutability.
-pub trait Storage {
+/// use interior mutability. `Send + Sync`: a `Connection`'s per-task future
+/// holds a `&dyn Storage` (or a `Transaction`, which implements it) across
+/// `.await` points, so both the trait object and everything reachable
+/// through it must be safe to send between threads.
+pub trait Storage: Send + Sync {
     /// Create a table with the given schema and optional primary-key column.
-    fn create_table(
-        &self,
-        name: &str,
+    fn create_table<'a>(
+        &'a self,
+        name: &'a str,
         columns: Vec<ColumnSchema>,
         primary_key: Option<String>,
-    ) -> Result<()>;
+    ) -> BoxFuture<'a, Result<()>>;
 
     /// Return the names of all tables.
     fn tables(&self) -> Result<Vec<String>>;
@@ -34,7 +51,7 @@ pub trait Storage {
 
     /// Append a row. `row` must have exactly as many values as the table
     /// has columns, in column order, and already be type-checked.
-    fn insert_row(&self, table: &str, row: Vec<Value>) -> Result<()>;
+    fn insert_row<'a>(&'a self, table: &'a str, row: Vec<Value>) -> BoxFuture<'a, Result<()>>;
 
     /// Insert several `(table, row)` pairs as one atomic unit where the
     /// underlying engine supports it — a durable engine logs them as a
@@ -47,11 +64,13 @@ pub trait Storage {
     /// [`Transaction`]: its buffered pending rows aren't durable until
     /// `commit()` — which itself calls this same method on the *real*
     /// storage, where the override's atomicity actually applies.
-    fn insert_rows(&self, rows: Vec<(String, Vec<Value>)>) -> Result<()> {
-        for (table, row) in rows {
-            self.insert_row(&table, row)?;
-        }
-        Ok(())
+    fn insert_rows(&self, rows: Vec<(String, Vec<Value>)>) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            for (table, row) in rows {
+                self.insert_row(&table, row).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Return every row in `table`, in insertion order.

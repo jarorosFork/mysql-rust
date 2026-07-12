@@ -19,6 +19,8 @@
 //! in PERFORMANCE_DURABILITY_PLAN.md's "Baseline" section.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mysql_async::prelude::*;
@@ -46,6 +48,8 @@ async fn run_all() -> Vec<Stats> {
         single_row_insert(InsertMode::PersistentAlways).await,
         single_row_insert(InsertMode::PersistentNever).await,
         concurrent_commits().await,
+        concurrent_inserts_across_many_tables().await,
+        read_latency_under_write_load().await,
         join_group_by_report().await,
     ]
 }
@@ -182,14 +186,22 @@ async fn single_row_insert(mode: InsertMode) -> Stats {
     stats(label, samples)
 }
 
+/// A realistic "hot table" scenario: many concurrent transactions all
+/// writing to the *same* table (e.g. a shared queue/counter). Recorded
+/// against PD-1's baseline (829ms median) since D1 first added `fsync`, but
+/// **this benchmark cannot show PD-2's group-commit win** — `lock_table`'s
+/// per-table lock (Phase 7) is held for a transaction's whole lifetime, so
+/// with every task contending for table `t`'s one lock, only one
+/// transaction is ever actually inside its `COMMIT` (and therefore only
+/// one request ever reaches the log-writer thread) at a time regardless of
+/// PD-2. It's kept as a real-world reference point (see
+/// `concurrent_inserts_across_many_tables` below for the benchmark that
+/// actually isolates the log writer's own concurrency).
 async fn concurrent_commits() -> Stats {
     const CONCURRENCY: usize = 200;
     const BURSTS: usize = 5;
 
     let dir = temp_data_dir("concurrent-commits");
-    // Always: the realistic default a real deployment runs under, and the
-    // scenario PD-2's group-commit work is scored against (watch this row
-    // specifically once that lands).
     let addr = start_server(Some(dir.path()), SyncPolicy::Always).await;
     {
         let mut conn = connect(addr).await;
@@ -219,7 +231,124 @@ async fn concurrent_commits() -> Stats {
         samples.push(start.elapsed());
     }
     stats(
-        &format!("{CONCURRENCY} concurrent BEGIN+INSERT+COMMIT, total wall/burst"),
+        &format!("{CONCURRENCY} concurrent BEGIN+INSERT+COMMIT (same table), total wall/burst"),
+        samples,
+    )
+}
+
+/// PERFORMANCE_DURABILITY_PLAN.md PD-2's actual acceptance scenario: each of
+/// `CONCURRENCY` connections writes to its *own* table, so — unlike
+/// `concurrent_commits` above — `lock_table`'s per-table lock never
+/// serializes them against each other; the only thing left to serialize on
+/// is the log-writer thread itself. Before PD-2, every one of these paid
+/// its own separate inline `fsync` (roughly `CONCURRENCY *
+/// single-row-insert-latency`, i.e. close to flat-line growth with
+/// concurrency); group commit should make this scale far better than that,
+/// since the writer thread drains and batches whatever's queued into one
+/// `write` + one `fsync` per burst instead of one each.
+async fn concurrent_inserts_across_many_tables() -> Stats {
+    const CONCURRENCY: usize = 200;
+    const BURSTS: usize = 5;
+
+    let dir = temp_data_dir("concurrent-inserts-many-tables");
+    let addr = start_server(Some(dir.path()), SyncPolicy::Always).await;
+    {
+        let mut conn = connect(addr).await;
+        for t in 0..CONCURRENCY {
+            conn.query_drop(format!(
+                "CREATE TABLE t{t} (id INT PRIMARY KEY, name VARCHAR)"
+            ))
+            .await
+            .expect("create table");
+        }
+    }
+
+    let mut samples = Vec::with_capacity(BURSTS);
+    for burst in 0..BURSTS {
+        let start = Instant::now();
+        let mut tasks = Vec::with_capacity(CONCURRENCY);
+        for table in 0..CONCURRENCY {
+            let id = burst * CONCURRENCY + table;
+            tasks.push(tokio::spawn(async move {
+                let mut conn = connect(addr).await;
+                conn.query_drop(format!("INSERT INTO t{table} VALUES ({id}, 'row{id}')"))
+                    .await
+                    .expect("insert");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("connection task panicked");
+        }
+        samples.push(start.elapsed());
+    }
+    stats(
+        &format!("{CONCURRENCY} concurrent autocommit INSERTs (distinct tables), total wall/burst"),
+        samples,
+    )
+}
+
+/// PERFORMANCE_DURABILITY_PLAN.md PD-2's second acceptance clause: "no
+/// runtime worker blocks on file I/O (verified by the read-latency-under-
+/// write-load benchmark not degrading)". Before PD-2, every INSERT's
+/// `fsync` ran inline on whatever tokio worker was running that statement
+/// (P3) — a worker stalled for the duration of the syscall couldn't poll
+/// *any* other connection meanwhile, so a concurrent point-SELECT sharing
+/// that worker would see its own latency spike in lockstep with the
+/// writers' fsyncs. With the dedicated log-writer thread, a worker that
+/// sent a write off to that thread is immediately free to poll other
+/// connections while waiting for the ack — this measures point-SELECT
+/// latency on its own connection while several other connections hammer
+/// persistent (`sync=always`) INSERTs concurrently, so a regression back to
+/// inline blocking would show up here as read p99/max latency tracking the
+/// fsync cost instead of staying close to the uncontended point-SELECT
+/// baseline above.
+async fn read_latency_under_write_load() -> Stats {
+    const ROWS: usize = 5_000;
+    const ITERS: usize = 500;
+    const WRITERS: usize = 8;
+
+    let dir = temp_data_dir("read-under-write-load");
+    let addr = start_server(Some(dir.path()), SyncPolicy::Always).await;
+    let mut conn = connect(addr).await;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
+        .await
+        .expect("create table");
+    seed_id_name_rows(&mut conn, ROWS).await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut writer_tasks = Vec::with_capacity(WRITERS);
+    for w in 0..WRITERS {
+        let stop = Arc::clone(&stop);
+        writer_tasks.push(tokio::spawn(async move {
+            let mut conn = connect(addr).await;
+            let mut i = ROWS + w * 1_000_000;
+            while !stop.load(Ordering::Relaxed) {
+                conn.query_drop(format!("INSERT INTO t VALUES ({i}, 'w{i}')"))
+                    .await
+                    .expect("background writer insert");
+                i += 1;
+            }
+        }));
+    }
+
+    let mut samples = Vec::with_capacity(ITERS);
+    for i in 0..ITERS {
+        let id = (i * 37) % ROWS;
+        let start = Instant::now();
+        let _: Option<String> = conn
+            .query_first(format!("SELECT name FROM t WHERE id = {id}"))
+            .await
+            .expect("point select under write load");
+        samples.push(start.elapsed());
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for task in writer_tasks {
+        task.await.expect("background writer task panicked");
+    }
+
+    stats(
+        &format!("point SELECT (PK) under {WRITERS}-writer concurrent persistent INSERT load"),
         samples,
     )
 }

@@ -73,14 +73,16 @@ impl<'a> Executor<'a> {
         Executor { storage, vars }
     }
 
-    pub fn execute(&self, statement: Statement) -> Result<QueryResult> {
+    pub async fn execute(&self, statement: Statement) -> Result<QueryResult> {
         match statement {
-            Statement::CreateTable { table, columns } => self.execute_create_table(&table, columns),
+            Statement::CreateTable { table, columns } => {
+                self.execute_create_table(&table, columns).await
+            }
             Statement::Insert {
                 table,
                 columns,
                 rows,
-            } => self.execute_insert(&table, columns, rows),
+            } => self.execute_insert(&table, columns, rows).await,
             Statement::Select {
                 projection,
                 from,
@@ -221,7 +223,11 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn execute_create_table(&self, table: &str, columns: Vec<ColumnDef>) -> Result<QueryResult> {
+    async fn execute_create_table(
+        &self,
+        table: &str,
+        columns: Vec<ColumnDef>,
+    ) -> Result<QueryResult> {
         let mut primary_key = None;
         let mut auto_increment_column = None;
         let mut schema_columns = Vec::with_capacity(columns.len());
@@ -270,11 +276,12 @@ impl<'a> Executor<'a> {
         }
 
         self.storage
-            .create_table(table, schema_columns, primary_key)?;
+            .create_table(table, schema_columns, primary_key)
+            .await?;
         Ok(QueryResult::default())
     }
 
-    fn execute_insert(
+    async fn execute_insert(
         &self,
         table: &str,
         columns: Option<Vec<String>>,
@@ -332,7 +339,7 @@ impl<'a> Executor<'a> {
         }
 
         let affected = batch.len() as u64;
-        self.storage.insert_rows(batch)?;
+        self.storage.insert_rows(batch).await?;
 
         Ok(QueryResult {
             rows_affected: affected,
@@ -1571,9 +1578,24 @@ mod tests {
         SystemVariables::new("8.0.0-mysql-rust-test", 64 * 1024 * 1024)
     }
 
+    /// Drive a future to completion on a throwaway current-thread runtime.
+    /// `Executor::execute` became `async` in PERFORMANCE_DURABILITY_PLAN.md
+    /// PD-2 (it now genuinely awaits the log-writer thread's ack for
+    /// mutating statements), but the ~150 tests below call it through
+    /// `run()` alone — wrapping just this one chokepoint keeps every test
+    /// function itself synchronous rather than converting each one to
+    /// `#[tokio::test] async fn` and adding `.await` at every call site.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build a test runtime")
+            .block_on(fut)
+    }
+
     fn run(storage: &InMemoryStorage, sql: &str) -> Result<QueryResult> {
         let vars = test_vars();
-        Executor::new(storage, &vars).execute(parse(sql)?)
+        block_on(Executor::new(storage, &vars).execute(parse(sql)?))
     }
 
     fn int(n: i64) -> Value {

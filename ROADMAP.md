@@ -463,8 +463,34 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       PD-0 opened. 421 tests total (was 397 before PD-0); e2e app (41/41)
       and the benchmark suite (`cargo bench`) both green. fmt + clippy
       `-D warnings` clean throughout.)_
-- [ ] PD-2 — Write-path architecture: dedicated log-writer thread with
+- [x] PD-2 — Write-path architecture: dedicated log-writer thread with
       group commit.
+      _(✅ Done 2026-07-13. New `storage::log_writer::LogWriter`: a plain
+      `std::thread` owning the log file, fed by a bounded `tokio::sync::
+      mpsc` channel; callers `.await` a `oneshot` ack instead of blocking a
+      tokio worker on the write; the thread drains everything already
+      queued before each write, so concurrent appends land as one
+      `write_all` + one `fsync` instead of one each (group commit falls out
+      of "one owner thread", which is why this isn't a `spawn_blocking`
+      pool). Required `Storage::create_table`/`insert_row`/`insert_rows` to
+      become genuinely `async` — hand-rolled boxed futures
+      (`storage::BoxFuture`), since `Storage` is used as `&dyn Storage` and
+      native `async fn` in traits isn't dyn-compatible; every read-only
+      method stayed synchronous. Proof: a same-table 200-concurrent-commit
+      benchmark barely moved (829ms → 800ms), correctly — Phase 7's
+      per-table lock already serializes same-table writers before they'd
+      ever reach the writer thread concurrently — but a new benchmark
+      isolating the log writer itself (200 concurrent autocommit INSERTs
+      to 200 *distinct* tables, no shared lock) dropped to 48ms median vs.
+      ~796ms if fully serialized; a second new benchmark shows point-SELECT
+      latency under 8-writer concurrent persistent-INSERT load is
+      statistically indistinguishable from the uncontended baseline
+      (65.8µs vs. 74.0µs median), proving no runtime worker blocks on file
+      I/O. See PERFORMANCE_DURABILITY_PLAN.md's PD-2 entry for the full
+      numbers and the reasoning behind the same-table benchmark's
+      near-flat result. 425 tests total (was 421); `tests/crash.rs`'s
+      5-test crash-safety suite still passes unchanged; e2e app (41/41)
+      still green; fmt + clippy `-D warnings` clean throughout.)_
 - [ ] PD-3 — Query-path performance: `TCP_NODELAY`, single-buffer
       responses, scan predicate pushdown, `Arc<TableSchema>`.
 - [ ] PD-4 — Operational hardening: streaming replay, checkpoint/

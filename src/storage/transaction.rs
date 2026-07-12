@@ -17,7 +17,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::storage::engine::InMemoryStorage;
 use crate::storage::value::{ColumnSchema, TableSchema, Value};
-use crate::storage::Storage;
+use crate::storage::{BoxFuture, Storage};
 use crate::{Error, Result};
 
 /// An in-progress transaction. Logically owned by exactly one `Connection`,
@@ -78,13 +78,13 @@ impl Transaction {
     /// else could have changed these tables since they were buffered, so
     /// this cannot fail on a conflict it didn't already check for at
     /// insert time.
-    pub fn commit(self) -> Result<()> {
+    pub async fn commit(self) -> Result<()> {
         let pending = self.pending.into_inner().unwrap_or_else(|e| e.into_inner());
         let rows: Vec<(String, Vec<Value>)> = pending
             .into_iter()
             .flat_map(|(table, rows)| rows.into_iter().map(move |row| (table.clone(), row)))
             .collect();
-        self.storage.insert_rows(rows) // locks release as `self.locks` drops here.
+        self.storage.insert_rows(rows).await // locks release as `self.locks` drops here.
     }
 
     /// Discard every buffered row and release all locks. Nothing was ever
@@ -98,16 +98,16 @@ impl Transaction {
 }
 
 impl Storage for Transaction {
-    fn create_table(
-        &self,
-        name: &str,
+    fn create_table<'a>(
+        &'a self,
+        name: &'a str,
         columns: Vec<ColumnSchema>,
         primary_key: Option<String>,
-    ) -> Result<()> {
+    ) -> BoxFuture<'a, Result<()>> {
         // DDL auto-commits immediately, even inside a transaction — matches
         // real MySQL (CREATE TABLE implicitly commits any open transaction
         // first); we don't go quite that far, but we don't buffer it either.
-        self.storage.create_table(name, columns, primary_key)
+        Box::pin(async move { self.storage.create_table(name, columns, primary_key).await })
     }
 
     fn tables(&self) -> Result<Vec<String>> {
@@ -118,39 +118,45 @@ impl Storage for Transaction {
         self.storage.table_schema(name)
     }
 
-    fn insert_row(&self, table: &str, row: Vec<Value>) -> Result<()> {
-        let schema = self.storage.table_schema(table)?;
-        if row.len() != schema.columns.len() {
-            return Err(Error::Execution(format!(
-                "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
-                schema.columns.len(),
-                row.len()
-            )));
-        }
-
-        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pk_idx) = self.primary_key_index(&schema) {
-            let key = &row[pk_idx];
-            let committed = self.storage.lookup_by_primary_key(table, key)?.is_some();
-            let already_pending = pending
-                .get(table)
-                .is_some_and(|rows| rows.iter().any(|r| &r[pk_idx] == key));
-            if committed || already_pending {
+    fn insert_row<'a>(&'a self, table: &'a str, row: Vec<Value>) -> BoxFuture<'a, Result<()>> {
+        // Purely in-memory buffering — no log I/O, so nothing here actually
+        // needs to suspend; this is `async` only because the `Storage`
+        // trait's signature is (every implementor must match, since it's
+        // used as `&dyn Storage` — see `storage::BoxFuture`'s doc comment).
+        Box::pin(async move {
+            let schema = self.storage.table_schema(table)?;
+            if row.len() != schema.columns.len() {
                 return Err(Error::Execution(format!(
-                    "Duplicate entry '{}' for key 'PRIMARY'",
-                    key.to_display_string().unwrap_or_default()
+                    "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
+                    schema.columns.len(),
+                    row.len()
                 )));
             }
-        }
-        drop(pending);
 
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(table.to_string())
-            .or_default()
-            .push(row);
-        Ok(())
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pk_idx) = self.primary_key_index(&schema) {
+                let key = &row[pk_idx];
+                let committed = self.storage.lookup_by_primary_key(table, key)?.is_some();
+                let already_pending = pending
+                    .get(table)
+                    .is_some_and(|rows| rows.iter().any(|r| &r[pk_idx] == key));
+                if committed || already_pending {
+                    return Err(Error::Execution(format!(
+                        "Duplicate entry '{}' for key 'PRIMARY'",
+                        key.to_display_string().unwrap_or_default()
+                    )));
+                }
+            }
+            drop(pending);
+
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(table.to_string())
+                .or_default()
+                .push(row);
+            Ok(())
+        })
     }
 
     fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>> {
@@ -209,7 +215,7 @@ mod tests {
     use super::*;
     use crate::storage::value::ColumnType;
 
-    fn setup() -> Arc<InMemoryStorage> {
+    async fn setup() -> Arc<InMemoryStorage> {
         let storage = Arc::new(InMemoryStorage::new());
         storage
             .create_table(
@@ -230,19 +236,21 @@ mod tests {
                 ],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
         storage
     }
 
     #[tokio::test]
     async fn transaction_sees_its_own_pending_writes() {
-        let storage = setup();
+        let storage = setup().await;
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         tx.insert_row(
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -254,13 +262,14 @@ mod tests {
 
     #[tokio::test]
     async fn other_readers_do_not_see_pending_writes() {
-        let storage = setup();
+        let storage = setup().await;
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         tx.insert_row(
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
 
         // Reading straight from storage (as any other connection would) —
@@ -270,16 +279,17 @@ mod tests {
 
     #[tokio::test]
     async fn commit_applies_pending_rows_to_storage() {
-        let storage = setup();
+        let storage = setup().await;
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         tx.insert_row(
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
 
-        tx.commit().unwrap();
+        tx.commit().await.unwrap();
 
         assert_eq!(
             storage.scan("t").unwrap(),
@@ -289,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_applies_rows_across_multiple_tables_as_one_atomic_batch() {
-        let storage = setup();
+        let storage = setup().await;
         storage
             .create_table(
                 "u",
@@ -301,6 +311,7 @@ mod tests {
                 }],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
 
         let tx = Transaction::new(Arc::clone(&storage));
@@ -310,11 +321,12 @@ mod tests {
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
-        tx.insert_row("u", vec![Value::Int(100)]).unwrap();
-        tx.insert_row("u", vec![Value::Int(101)]).unwrap();
+        tx.insert_row("u", vec![Value::Int(100)]).await.unwrap();
+        tx.insert_row("u", vec![Value::Int(101)]).await.unwrap();
 
-        tx.commit().unwrap();
+        tx.commit().await.unwrap();
 
         // PERFORMANCE_DURABILITY_PLAN.md D2: one log record for the whole
         // transaction, regardless of how many tables it touched -- all of
@@ -331,13 +343,14 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_discards_pending_rows() {
-        let storage = setup();
+        let storage = setup().await;
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         tx.insert_row(
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
 
         tx.rollback();
@@ -350,33 +363,37 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_primary_key_within_the_same_transaction_is_rejected() {
-        let storage = setup();
+        let storage = setup().await;
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         tx.insert_row(
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
         assert!(tx
             .insert_row("t", vec![Value::Int(1), Value::Varchar("bob".to_string())])
+            .await
             .is_err());
     }
 
     #[tokio::test]
     async fn duplicate_primary_key_against_already_committed_data_is_rejected() {
-        let storage = setup();
+        let storage = setup().await;
         storage
             .insert_row(
                 "t",
                 vec![Value::Int(1), Value::Varchar("alice".to_string())],
             )
+            .await
             .unwrap();
 
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         assert!(tx
             .insert_row("t", vec![Value::Int(1), Value::Varchar("bob".to_string())])
+            .await
             .is_err());
     }
 
@@ -385,7 +402,7 @@ mod tests {
         // A non-reentrant lock acquired twice by the same "owner" without a
         // guard would deadlock — this is exactly what multiple INSERTs into
         // the same table within one transaction do in practice.
-        let storage = setup();
+        let storage = setup().await;
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         tx.ensure_locked("t").await.unwrap(); // must not hang
@@ -393,21 +410,24 @@ mod tests {
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
         tx.insert_row("t", vec![Value::Int(2), Value::Varchar("bob".to_string())])
+            .await
             .unwrap();
         assert_eq!(tx.scan("t").unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn lookup_by_primary_key_checks_pending_too() {
-        let storage = setup();
+        let storage = setup().await;
         let tx = Transaction::new(Arc::clone(&storage));
         tx.ensure_locked("t").await.unwrap();
         tx.insert_row(
             "t",
             vec![Value::Int(1), Value::Varchar("alice".to_string())],
         )
+        .await
         .unwrap();
 
         assert_eq!(

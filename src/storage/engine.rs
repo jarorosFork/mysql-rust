@@ -3,13 +3,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::config::SyncPolicy;
 use crate::storage::log::{Entry, Log};
+use crate::storage::log_writer::LogWriter;
 use crate::storage::value::{ColumnSchema, TableSchema, Value};
-use crate::storage::Storage;
+use crate::storage::{BoxFuture, Storage};
 use crate::{Error, Result};
 
 /// How long a transaction waits for a table's write lock before giving up
@@ -136,7 +137,15 @@ fn apply_entry(tables: &mut HashMap<String, Table>, entry: Entry) {
 #[derive(Default)]
 pub struct InMemoryStorage {
     tables: RwLock<HashMap<String, Table>>,
-    log: Mutex<Option<Log>>,
+    /// The dedicated log-writer thread (PERFORMANCE_DURABILITY_PLAN.md
+    /// PD-2) — `None` for a purely in-memory store with nothing to persist
+    /// (see [`Self::new`]). Every mutating `Storage` method `.await`s an
+    /// ack from it rather than writing inline, so a multi-millisecond
+    /// `fsync` never blocks the tokio worker running the caller's
+    /// statement, and concurrent writers naturally get group commit (many
+    /// queued appends become one write + one fsync) instead of paying their
+    /// own separate fsync each.
+    log_writer: Option<LogWriter>,
     /// One dedicated async mutex per table, handed out by [`Self::lock_table`]
     /// so a transaction (see `storage::transaction`) can hold a table's
     /// write lock across multiple statements/await points — something a
@@ -177,7 +186,7 @@ impl InMemoryStorage {
         let log = Log::open(path, sync_policy, |entry| apply_entry(&mut tables, entry))?;
         Ok(InMemoryStorage {
             tables: RwLock::new(tables),
-            log: Mutex::new(Some(log)),
+            log_writer: Some(LogWriter::spawn(log)),
             table_locks: tokio::sync::Mutex::new(HashMap::new()),
             databases: RwLock::new(HashSet::new()),
             #[cfg(test)]
@@ -185,12 +194,34 @@ impl InMemoryStorage {
         })
     }
 
-    /// Test-only: make the next [`Self::append_log`] call fail, once, as
-    /// if the real log write had failed at the OS level.
+    /// Test-only: make the next log append fail, once, as if the real
+    /// write had failed at the OS level — checked by every mutating
+    /// `Storage` method just before it hands a record to the log writer.
     #[cfg(test)]
     fn fail_next_log_write(&self) {
         self.fail_next_log_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: `Err` (consuming the one-shot fault) if
+    /// [`Self::fail_next_log_write`] armed it, `Ok` otherwise — see that
+    /// method's doc comment. A real OS-level write failure isn't reliably
+    /// triggerable on an already-open file handle, so this is the seam
+    /// tests use instead (mirrors `LogWriter`'s own `set_fail_batches`,
+    /// which covers the writer thread's *batch* semantics specifically;
+    /// this one covers "the caller's append attempt never happened at
+    /// all").
+    #[cfg(test)]
+    fn check_fault_injection(&self) -> Result<()> {
+        if self
+            .fail_next_log_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Io(std::io::Error::other(
+                "fault-injected log write failure (test only)",
+            )));
+        }
+        Ok(())
     }
 
     /// Acquire `table`'s exclusive write lock, waiting up to
@@ -222,57 +253,71 @@ impl InMemoryStorage {
         std::fs::create_dir_all(dir)?;
         Self::open(&dir.join("data.log"), sync_policy)
     }
-
-    fn append_log(&self, write: impl FnOnce(&mut Log) -> Result<()>) -> Result<()> {
-        #[cfg(test)]
-        if self
-            .fail_next_log_write
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(Error::Io(std::io::Error::other(
-                "fault-injected log write failure (test only)",
-            )));
-        }
-        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
-        match log.as_mut() {
-            Some(l) => write(l),
-            None => Ok(()),
-        }
-    }
 }
 
 impl Storage for InMemoryStorage {
-    fn create_table(
-        &self,
-        name: &str,
+    fn create_table<'a>(
+        &'a self,
+        name: &'a str,
         columns: Vec<ColumnSchema>,
         primary_key: Option<String>,
-    ) -> Result<()> {
-        if let Some(pk) = &primary_key {
-            if !columns.iter().any(|c| &c.name == pk) {
-                return Err(Error::Execution(format!(
-                    "Primary key column '{pk}' is not defined"
-                )));
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Some(pk) = &primary_key {
+                if !columns.iter().any(|c| &c.name == pk) {
+                    return Err(Error::Execution(format!(
+                        "Primary key column '{pk}' is not defined"
+                    )));
+                }
             }
-        }
 
-        // Log-before-memory (PERFORMANCE_DURABILITY_PLAN.md D3): both the
-        // existence check and the memory apply stay under one held write
-        // lock, unlike `insert_row` below. Unlike an INSERT, CREATE TABLE
-        // has no connection-level per-table lock to lean on instead (see
-        // `InMemoryStorage::lock_table` / `server::connection::execute_
-        // statement`) — there's no table yet to lock by name — so this is
-        // the one place a log append still happens inside the `tables`
-        // critical section. Accepted: schema changes are rare relative to
-        // row inserts, so this doesn't cost meaningful throughput the way
-        // doing the same for every INSERT would.
-        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
-        if tables.contains_key(name) {
-            return Err(Error::Execution(format!("Table '{name}' already exists")));
-        }
-        self.append_log(|log| log.append_create_table(name, &columns, primary_key.as_deref()))?;
-        tables.insert(name.to_string(), Table::new(columns, primary_key));
-        Ok(())
+            // Log-before-memory (PERFORMANCE_DURABILITY_PLAN.md D3), same
+            // shape as `insert_row` below: check under a read lock
+            // (released), append durably (no lock held across the
+            // `.await`), then apply under a freshly-acquired write lock.
+            // Before PD-2 this held one write lock across the whole
+            // operation instead — CREATE TABLE has no connection-level
+            // per-table lock to lean on the way INSERT does (there's no
+            // table yet to lock by name), so that was the one place a log
+            // append happened inside a critical section. Holding a
+            // `std::sync` lock across an `.await` now that the log append
+            // genuinely awaits the writer thread would block every other
+            // reader/writer for however long that takes, and risks
+            // stalling a tokio worker if another task's blocking
+            // `.read()`/`.write()` call lands while this task is
+            // suspended holding the guard — so this drops the lock instead
+            // and re-checks after re-acquiring it. The rare cost: two
+            // concurrent `CREATE TABLE t` calls can now both pass the
+            // first check and both durably log a `CreateTable` record for
+            // the same name; the loser's apply below sees the name already
+            // taken and returns "already exists" instead of silently
+            // overwriting the winner. On replay this is harmless (a
+            // `CreateTable` for an already-existing name simply re-creates
+            // the same empty table, exactly matching the winner's own
+            // record), so the outcome is a wasted log record on a genuinely
+            // rare race, never data loss or corruption.
+            {
+                let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
+                if tables.contains_key(name) {
+                    return Err(Error::Execution(format!("Table '{name}' already exists")));
+                }
+            }
+
+            #[cfg(test)]
+            self.check_fault_injection()?;
+            if let Some(writer) = &self.log_writer {
+                writer
+                    .append_create_table(name, &columns, primary_key.as_deref())
+                    .await?;
+            }
+
+            let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+            if tables.contains_key(name) {
+                return Err(Error::Execution(format!("Table '{name}' already exists")));
+            }
+            tables.insert(name.to_string(), Table::new(columns, primary_key));
+            Ok(())
+        })
     }
 
     fn tables(&self) -> Result<Vec<String>> {
@@ -291,64 +336,24 @@ impl Storage for InMemoryStorage {
             .ok_or_else(|| Error::Execution(format!("Table '{name}' doesn't exist")))
     }
 
-    fn insert_row(&self, table: &str, row: Vec<Value>) -> Result<()> {
-        // Log-before-memory (PERFORMANCE_DURABILITY_PLAN.md D3): validate
-        // under a read lock, append durably, *then* apply — not the other
-        // way around. If the log append fails, nothing here has mutated
-        // any state a reader could observe, so the row simply never
-        // happened: no phantom row, no undo needed. Safe to validate under
-        // only a read lock (rather than extending the write lock across
-        // the log I/O the way `create_table` above has to) because the
-        // caller already holds this table's exclusive lock for the whole
-        // statement (`InMemoryStorage::lock_table`), so no concurrent
-        // writer to this same table can appear between the check and the
-        // apply below.
-        {
-            let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
-            let t = tables
-                .get(table)
-                .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
-            if row.len() != t.columns.len() {
-                return Err(Error::Execution(format!(
-                    "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
-                    t.columns.len(),
-                    row.len()
-                )));
-            }
-            t.check_insertable(&row)?;
-        }
-
-        self.append_log(|log| log.append_insert_row(table, &row))?;
-
-        // Infallible: everything that could make it fail was already
-        // checked above under the same guarantee that nothing could have
-        // changed in between (see the comment above).
-        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
-        let t = tables
-            .get_mut(table)
-            .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
-        t.push_trusted(row);
-        Ok(())
-    }
-
-    fn insert_rows(&self, rows: Vec<(String, Vec<Value>)>) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        // Same log-before-memory shape as `insert_row` above, just for a
-        // whole batch: validate everything (including duplicate keys
-        // *within* this batch, which `check_insertable` alone can't see
-        // since it only ever looks at already-committed state) under a
-        // read lock, append the whole batch as one durable record, then
-        // apply every row — infallible, for the same reason `insert_row`'s
-        // apply is.
-        {
-            let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
-            let mut seen_in_batch: HashMap<&str, HashSet<&Value>> = HashMap::new();
-            for (table, row) in &rows {
+    fn insert_row<'a>(&'a self, table: &'a str, row: Vec<Value>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // Log-before-memory (PERFORMANCE_DURABILITY_PLAN.md D3): validate
+            // under a read lock, append durably, *then* apply — not the other
+            // way around. If the log append fails, nothing here has mutated
+            // any state a reader could observe, so the row simply never
+            // happened: no phantom row, no undo needed. Safe to validate
+            // under only a read lock (rather than extending the write lock
+            // across the log I/O the way `create_table` above has to)
+            // because the caller already holds this table's exclusive lock
+            // for the whole statement (`InMemoryStorage::lock_table`), so no
+            // concurrent writer to this same table can appear between the
+            // check and the apply below — and no lock is held across the
+            // `.await` either way (PERFORMANCE_DURABILITY_PLAN.md PD-2).
+            {
+                let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
                 let t = tables
-                    .get(table.as_str())
+                    .get(table)
                     .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
                 if row.len() != t.columns.len() {
                     return Err(Error::Execution(format!(
@@ -357,31 +362,84 @@ impl Storage for InMemoryStorage {
                         row.len()
                     )));
                 }
-                t.check_insertable(row)?;
-                if let Some(key) = t.primary_key_value(row) {
-                    if !seen_in_batch.entry(table.as_str()).or_default().insert(key) {
+                t.check_insertable(&row)?;
+            }
+
+            #[cfg(test)]
+            self.check_fault_injection()?;
+            if let Some(writer) = &self.log_writer {
+                writer.append_insert_row(table, &row).await?;
+            }
+
+            // Infallible: everything that could make it fail was already
+            // checked above under the same guarantee that nothing could have
+            // changed in between (see the comment above).
+            let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+            let t = tables
+                .get_mut(table)
+                .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
+            t.push_trusted(row);
+            Ok(())
+        })
+    }
+
+    fn insert_rows(&self, rows: Vec<(String, Vec<Value>)>) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if rows.is_empty() {
+                return Ok(());
+            }
+
+            // Same log-before-memory shape as `insert_row` above, just for a
+            // whole batch: validate everything (including duplicate keys
+            // *within* this batch, which `check_insertable` alone can't see
+            // since it only ever looks at already-committed state) under a
+            // read lock (released before the `.await` below), append the
+            // whole batch as one durable record, then apply every row —
+            // infallible, for the same reason `insert_row`'s apply is.
+            {
+                let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
+                let mut seen_in_batch: HashMap<&str, HashSet<&Value>> = HashMap::new();
+                for (table, row) in &rows {
+                    let t = tables.get(table.as_str()).ok_or_else(|| {
+                        Error::Execution(format!("Table '{table}' doesn't exist"))
+                    })?;
+                    if row.len() != t.columns.len() {
                         return Err(Error::Execution(format!(
-                            "Duplicate entry '{}' for key 'PRIMARY'",
-                            key.to_display_string().unwrap_or_default()
+                            "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
+                            t.columns.len(),
+                            row.len()
                         )));
+                    }
+                    t.check_insertable(row)?;
+                    if let Some(key) = t.primary_key_value(row) {
+                        if !seen_in_batch.entry(table.as_str()).or_default().insert(key) {
+                            return Err(Error::Execution(format!(
+                                "Duplicate entry '{}' for key 'PRIMARY'",
+                                key.to_display_string().unwrap_or_default()
+                            )));
+                        }
                     }
                 }
             }
-        }
 
-        self.append_log(|log| log.append_transaction(&rows))?;
-
-        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
-        for (table, row) in rows {
-            // Trusted for the same reason `insert_row`'s apply is; a
-            // missing table here would mean one vanished between the
-            // check above and here, which can't happen under the same
-            // per-table-lock guarantee `insert_row` relies on.
-            if let Some(t) = tables.get_mut(&table) {
-                t.push_trusted(row);
+            #[cfg(test)]
+            self.check_fault_injection()?;
+            if let Some(writer) = &self.log_writer {
+                writer.append_transaction(&rows).await?;
             }
-        }
-        Ok(())
+
+            let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+            for (table, row) in rows {
+                // Trusted for the same reason `insert_row`'s apply is; a
+                // missing table here would mean one vanished between the
+                // check above and here, which can't happen under the same
+                // per-table-lock guarantee `insert_row` relies on.
+                if let Some(t) = tables.get_mut(&table) {
+                    t.push_trusted(row);
+                }
+            }
+            Ok(())
+        })
     }
 
     fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>> {
@@ -449,6 +507,7 @@ impl Storage for InMemoryStorage {
 mod tests {
     use super::*;
     use crate::storage::value::ColumnType;
+    use std::sync::Mutex;
 
     fn col(name: &str, ty: ColumnType) -> ColumnSchema {
         ColumnSchema {
@@ -459,28 +518,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_table_then_list_it() {
+    #[tokio::test]
+    async fn create_table_then_list_it() {
         let storage = InMemoryStorage::new();
         storage
             .create_table("t", vec![col("a", ColumnType::Int)], None)
+            .await
             .unwrap();
         assert_eq!(storage.tables().unwrap(), vec!["t".to_string()]);
     }
 
-    #[test]
-    fn create_table_rejects_duplicate() {
+    #[tokio::test]
+    async fn create_table_rejects_duplicate() {
         let storage = InMemoryStorage::new();
         storage
             .create_table("t", vec![col("a", ColumnType::Int)], None)
+            .await
             .unwrap();
         assert!(storage
             .create_table("t", vec![col("a", ColumnType::Int)], None)
+            .await
             .is_err());
     }
 
-    #[test]
-    fn create_table_rejects_primary_key_not_in_columns() {
+    #[tokio::test]
+    async fn create_table_rejects_primary_key_not_in_columns() {
         let storage = InMemoryStorage::new();
         assert!(storage
             .create_table(
@@ -488,11 +550,12 @@ mod tests {
                 vec![col("a", ColumnType::Int)],
                 Some("bogus".to_string())
             )
+            .await
             .is_err());
     }
 
-    #[test]
-    fn insert_and_scan_round_trips() {
+    #[tokio::test]
+    async fn insert_and_scan_round_trips() {
         let storage = InMemoryStorage::new();
         storage
             .create_table(
@@ -500,12 +563,15 @@ mod tests {
                 vec![col("a", ColumnType::Int), col("b", ColumnType::Varchar)],
                 None,
             )
+            .await
             .unwrap();
         storage
             .insert_row("t", vec![Value::Int(1), Value::Varchar("x".to_string())])
+            .await
             .unwrap();
         storage
             .insert_row("t", vec![Value::Null, Value::Varchar("y".to_string())])
+            .await
             .unwrap();
 
         assert_eq!(
@@ -517,22 +583,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn insert_rejects_wrong_column_count() {
+    #[tokio::test]
+    async fn insert_rejects_wrong_column_count() {
         let storage = InMemoryStorage::new();
         storage
             .create_table("t", vec![col("a", ColumnType::Int)], None)
+            .await
             .unwrap();
         assert!(storage
             .insert_row("t", vec![Value::Int(1), Value::Int(2)])
+            .await
             .is_err());
     }
 
-    #[test]
-    fn operations_on_missing_table_error_not_panic() {
+    #[tokio::test]
+    async fn operations_on_missing_table_error_not_panic() {
         let storage = InMemoryStorage::new();
         assert!(storage.table_schema("missing").is_err());
-        assert!(storage.insert_row("missing", vec![]).is_err());
+        assert!(storage.insert_row("missing", vec![]).await.is_err());
         assert!(storage.scan("missing").is_err());
         assert!(storage
             .lookup_by_primary_key("missing", &Value::Int(1))
@@ -565,8 +633,8 @@ mod tests {
         storage.drop_database("mydb", true).unwrap(); // no-op, not an error
     }
 
-    #[test]
-    fn primary_key_enforces_uniqueness() {
+    #[tokio::test]
+    async fn primary_key_enforces_uniqueness() {
         let storage = InMemoryStorage::new();
         storage
             .create_table(
@@ -574,14 +642,15 @@ mod tests {
                 vec![col("id", ColumnType::Int)],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
-        storage.insert_row("t", vec![Value::Int(1)]).unwrap();
-        assert!(storage.insert_row("t", vec![Value::Int(1)]).is_err());
-        storage.insert_row("t", vec![Value::Int(2)]).unwrap(); // distinct key still fine
+        storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
+        assert!(storage.insert_row("t", vec![Value::Int(1)]).await.is_err());
+        storage.insert_row("t", vec![Value::Int(2)]).await.unwrap(); // distinct key still fine
     }
 
-    #[test]
-    fn primary_key_lookup_finds_and_misses() {
+    #[tokio::test]
+    async fn primary_key_lookup_finds_and_misses() {
         let storage = InMemoryStorage::new();
         storage
             .create_table(
@@ -589,12 +658,14 @@ mod tests {
                 vec![col("id", ColumnType::Int), col("name", ColumnType::Varchar)],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
         storage
             .insert_row(
                 "t",
                 vec![Value::Int(1), Value::Varchar("alice".to_string())],
             )
+            .await
             .unwrap();
 
         assert_eq!(
@@ -618,8 +689,8 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn failed_log_append_on_insert_leaves_no_trace_in_memory() {
+    #[tokio::test]
+    async fn failed_log_append_on_insert_leaves_no_trace_in_memory() {
         let path = temp_path("fault-injection-insert");
         std::fs::remove_file(&path).ok();
         let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
@@ -629,11 +700,12 @@ mod tests {
                 vec![col("id", ColumnType::Int)],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
-        storage.insert_row("t", vec![Value::Int(1)]).unwrap();
+        storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
 
         storage.fail_next_log_write();
-        let result = storage.insert_row("t", vec![Value::Int(2)]);
+        let result = storage.insert_row("t", vec![Value::Int(2)]).await;
         assert!(
             result.is_err(),
             "a failed log append must surface as an error, not succeed silently"
@@ -655,20 +727,22 @@ mod tests {
         // The fault only fires once -- a retry with the same value must
         // succeed cleanly, proving the failed attempt left no phantom PK
         // entry that would incorrectly reject it as a duplicate.
-        storage.insert_row("t", vec![Value::Int(2)]).unwrap();
+        storage.insert_row("t", vec![Value::Int(2)]).await.unwrap();
         assert_eq!(storage.scan("t").unwrap().len(), 2);
 
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn failed_log_append_on_create_table_leaves_it_absent() {
+    #[tokio::test]
+    async fn failed_log_append_on_create_table_leaves_it_absent() {
         let path = temp_path("fault-injection-create");
         std::fs::remove_file(&path).ok();
         let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
 
         storage.fail_next_log_write();
-        let result = storage.create_table("t", vec![col("id", ColumnType::Int)], None);
+        let result = storage
+            .create_table("t", vec![col("id", ColumnType::Int)], None)
+            .await;
         assert!(result.is_err());
         assert!(
             storage.tables().unwrap().is_empty(),
@@ -678,14 +752,15 @@ mod tests {
         // The fault only fires once -- retrying must succeed cleanly.
         storage
             .create_table("t", vec![col("id", ColumnType::Int)], None)
+            .await
             .unwrap();
         assert_eq!(storage.tables().unwrap(), vec!["t".to_string()]);
 
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn insert_rows_rejects_a_duplicate_key_within_the_batch_and_applies_none_of_it() {
+    #[tokio::test]
+    async fn insert_rows_rejects_a_duplicate_key_within_the_batch_and_applies_none_of_it() {
         let storage = InMemoryStorage::new();
         storage
             .create_table(
@@ -693,22 +768,25 @@ mod tests {
                 vec![col("id", ColumnType::Int), col("name", ColumnType::Varchar)],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
 
-        let result = storage.insert_rows(vec![
-            (
-                "t".to_string(),
-                vec![Value::Int(1), Value::Varchar("alice".to_string())],
-            ),
-            (
-                "t".to_string(),
-                vec![Value::Int(2), Value::Varchar("bob".to_string())],
-            ),
-            (
-                "t".to_string(),
-                vec![Value::Int(1), Value::Varchar("carol".to_string())],
-            ),
-        ]);
+        let result = storage
+            .insert_rows(vec![
+                (
+                    "t".to_string(),
+                    vec![Value::Int(1), Value::Varchar("alice".to_string())],
+                ),
+                (
+                    "t".to_string(),
+                    vec![Value::Int(2), Value::Varchar("bob".to_string())],
+                ),
+                (
+                    "t".to_string(),
+                    vec![Value::Int(1), Value::Varchar("carol".to_string())],
+                ),
+            ])
+            .await;
         assert!(result.is_err());
         assert!(
             storage.scan("t").unwrap().is_empty(),
@@ -717,8 +795,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn insert_rows_rejects_a_row_that_collides_with_already_committed_data() {
+    #[tokio::test]
+    async fn insert_rows_rejects_a_row_that_collides_with_already_committed_data() {
         let storage = InMemoryStorage::new();
         storage
             .create_table(
@@ -726,13 +804,16 @@ mod tests {
                 vec![col("id", ColumnType::Int)],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
-        storage.insert_row("t", vec![Value::Int(1)]).unwrap();
+        storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
 
-        let result = storage.insert_rows(vec![
-            ("t".to_string(), vec![Value::Int(2)]),
-            ("t".to_string(), vec![Value::Int(1)]), // collides with the already-committed row
-        ]);
+        let result = storage
+            .insert_rows(vec![
+                ("t".to_string(), vec![Value::Int(2)]),
+                ("t".to_string(), vec![Value::Int(1)]), // collides with the already-committed row
+            ])
+            .await;
         assert!(result.is_err());
         assert_eq!(
             storage.scan("t").unwrap(),
@@ -741,8 +822,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_log_append_on_insert_rows_leaves_no_trace_of_the_whole_batch() {
+    #[tokio::test]
+    async fn failed_log_append_on_insert_rows_leaves_no_trace_of_the_whole_batch() {
         let path = temp_path("fault-injection-insert-rows");
         std::fs::remove_file(&path).ok();
         let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
@@ -752,14 +833,17 @@ mod tests {
                 vec![col("id", ColumnType::Int)],
                 Some("id".to_string()),
             )
+            .await
             .unwrap();
 
         storage.fail_next_log_write();
-        let result = storage.insert_rows(vec![
-            ("t".to_string(), vec![Value::Int(1)]),
-            ("t".to_string(), vec![Value::Int(2)]),
-            ("t".to_string(), vec![Value::Int(3)]),
-        ]);
+        let result = storage
+            .insert_rows(vec![
+                ("t".to_string(), vec![Value::Int(1)]),
+                ("t".to_string(), vec![Value::Int(2)]),
+                ("t".to_string(), vec![Value::Int(3)]),
+            ])
+            .await;
         assert!(result.is_err());
         assert!(
             storage.scan("t").unwrap().is_empty(),
@@ -775,14 +859,15 @@ mod tests {
                 ("t".to_string(), vec![Value::Int(2)]),
                 ("t".to_string(), vec![Value::Int(3)]),
             ])
+            .await
             .unwrap();
         assert_eq!(storage.scan("t").unwrap().len(), 3);
 
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn data_survives_reopening_the_same_path() {
+    #[tokio::test]
+    async fn data_survives_reopening_the_same_path() {
         let path = temp_path("persist");
         std::fs::remove_file(&path).ok();
 
@@ -794,15 +879,18 @@ mod tests {
                     vec![col("id", ColumnType::Int), col("name", ColumnType::Varchar)],
                     Some("id".to_string()),
                 )
+                .await
                 .unwrap();
             storage
                 .insert_row(
                     "t",
                     vec![Value::Int(1), Value::Varchar("alice".to_string())],
                 )
+                .await
                 .unwrap();
             storage
                 .insert_row("t", vec![Value::Int(2), Value::Varchar("bob".to_string())])
+                .await
                 .unwrap();
         } // `storage` (and its log file handle) dropped here — simulates a restart.
 
@@ -824,8 +912,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn decimal_and_date_columns_survive_reopening() {
+    #[tokio::test]
+    async fn decimal_and_date_columns_survive_reopening() {
         let path = temp_path("persist-decimal-date");
         std::fs::remove_file(&path).ok();
 
@@ -850,6 +938,7 @@ mod tests {
                     ],
                     None,
                 )
+                .await
                 .unwrap();
             storage
                 .insert_row(
@@ -859,6 +948,7 @@ mod tests {
                         Value::Date("2024-06-01".to_string()),
                     ],
                 )
+                .await
                 .unwrap();
         } // dropped here — simulates a restart.
 
@@ -874,8 +964,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn reopening_still_enforces_primary_key_uniqueness() {
+    #[tokio::test]
+    async fn reopening_still_enforces_primary_key_uniqueness() {
         let path = temp_path("persist-pk");
         std::fs::remove_file(&path).ok();
 
@@ -887,12 +977,13 @@ mod tests {
                     vec![col("id", ColumnType::Int)],
                     Some("id".to_string()),
                 )
+                .await
                 .unwrap();
-            storage.insert_row("t", vec![Value::Int(1)]).unwrap();
+            storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
         }
 
         let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
-        assert!(reopened.insert_row("t", vec![Value::Int(1)]).is_err());
+        assert!(reopened.insert_row("t", vec![Value::Int(1)]).await.is_err());
 
         std::fs::remove_file(&path).ok();
     }
@@ -906,24 +997,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn next_auto_increment_returns_sequential_values() {
+    #[tokio::test]
+    async fn next_auto_increment_returns_sequential_values() {
         let storage = InMemoryStorage::new();
         storage
             .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
+            .await
             .unwrap();
         assert_eq!(storage.next_auto_increment("t").unwrap(), 1);
         assert_eq!(storage.next_auto_increment("t").unwrap(), 2);
         assert_eq!(storage.next_auto_increment("t").unwrap(), 3);
     }
 
-    #[test]
-    fn next_auto_increment_errors_on_missing_table_or_no_such_column() {
+    #[tokio::test]
+    async fn next_auto_increment_errors_on_missing_table_or_no_such_column() {
         let storage = InMemoryStorage::new();
         assert!(storage.next_auto_increment("missing").is_err());
 
         storage
             .create_table("t", vec![col("a", ColumnType::Int)], None)
+            .await
             .unwrap();
         assert!(
             storage.next_auto_increment("t").is_err(),
@@ -931,20 +1024,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inserting_an_explicit_value_advances_the_auto_increment_counter() {
+    #[tokio::test]
+    async fn inserting_an_explicit_value_advances_the_auto_increment_counter() {
         let storage = InMemoryStorage::new();
         storage
             .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
+            .await
             .unwrap();
-        storage.insert_row("t", vec![Value::Int(41)]).unwrap();
+        storage.insert_row("t", vec![Value::Int(41)]).await.unwrap();
         // The counter must jump past the manually-inserted value, not
         // collide with it.
         assert_eq!(storage.next_auto_increment("t").unwrap(), 42);
     }
 
-    #[test]
-    fn auto_increment_sequence_continues_correctly_after_reopening() {
+    #[tokio::test]
+    async fn auto_increment_sequence_continues_correctly_after_reopening() {
         let path = temp_path("persist-auto-increment");
         std::fs::remove_file(&path).ok();
 
@@ -952,9 +1046,10 @@ mod tests {
             let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
             storage
                 .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
+                .await
                 .unwrap();
-            storage.insert_row("t", vec![Value::Int(1)]).unwrap();
-            storage.insert_row("t", vec![Value::Int(2)]).unwrap();
+            storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
+            storage.insert_row("t", vec![Value::Int(2)]).await.unwrap();
         }
 
         // Reopening must replay the rows and pick the counter up from the

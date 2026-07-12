@@ -121,7 +121,7 @@ fn write_value(buf: &mut Vec<u8>, value: &Value) {
     }
 }
 
-fn encode_create_table(
+pub(super) fn encode_create_table(
     table: &str,
     columns: &[ColumnSchema],
     primary_key: Option<&str>,
@@ -161,7 +161,7 @@ fn encode_create_table(
     buf
 }
 
-fn encode_insert_row(table: &str, row: &[Value]) -> Vec<u8> {
+pub(super) fn encode_insert_row(table: &str, row: &[Value]) -> Vec<u8> {
     let mut buf = vec![TAG_INSERT_ROW];
     write_string(&mut buf, table);
     write_u32(&mut buf, row.len() as u32);
@@ -171,7 +171,7 @@ fn encode_insert_row(table: &str, row: &[Value]) -> Vec<u8> {
     buf
 }
 
-fn encode_transaction(rows: &[(String, Vec<Value>)]) -> Vec<u8> {
+pub(super) fn encode_transaction(rows: &[(String, Vec<Value>)]) -> Vec<u8> {
     let mut buf = vec![TAG_TRANSACTION];
     write_u32(&mut buf, rows.len() as u32);
     for (table, row) in rows {
@@ -219,6 +219,23 @@ fn record_crc(len: u32, payload: &[u8]) -> u32 {
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(payload);
     crc32(&buf)
+}
+
+/// Frame one entry's payload as `[len: u32][crc: u32][payload]` (see the
+/// module doc comment on record framing). Pure and allocation-only —
+/// [`Log::append`] uses it for a single record, and
+/// [`crate::storage::log_writer::LogWriter`] uses it on the *calling* task
+/// to prepare a record before handing the already-framed bytes to the
+/// dedicated writer thread, so only the actual file write — not this cheap
+/// encoding step — has to happen on that one thread.
+pub(super) fn frame_record(entry_bytes: &[u8]) -> Vec<u8> {
+    let len = entry_bytes.len() as u32;
+    let crc = record_crc(len, entry_bytes);
+    let mut framed = Vec::with_capacity(8 + entry_bytes.len());
+    write_u32(&mut framed, len);
+    write_u32(&mut framed, crc);
+    framed.extend_from_slice(entry_bytes);
+    framed
 }
 
 fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
@@ -496,13 +513,18 @@ impl Log {
     }
 
     fn append(&mut self, entry_bytes: &[u8]) -> Result<()> {
-        let len = entry_bytes.len() as u32;
-        let crc = record_crc(len, entry_bytes);
-        let mut framed = Vec::with_capacity(8 + entry_bytes.len());
-        write_u32(&mut framed, len);
-        write_u32(&mut framed, crc);
-        framed.extend_from_slice(entry_bytes);
-        self.file.write_all(&framed)?;
+        self.write_framed_batch(&frame_record(entry_bytes))
+    }
+
+    /// Write an already-framed batch of one or more records (see
+    /// [`frame_record`]) as a single `write_all`, then sync once per
+    /// `sync_policy` — the primitive [`crate::storage::log_writer::LogWriter`]'s
+    /// dedicated thread uses to implement group commit
+    /// (PERFORMANCE_DURABILITY_PLAN.md PD-2): many queued appends become one
+    /// write and one fsync instead of one each, regardless of how many
+    /// records `framed` actually contains.
+    pub(super) fn write_framed_batch(&mut self, framed: &[u8]) -> Result<()> {
+        self.file.write_all(framed)?;
         if self.sync_policy == SyncPolicy::Always {
             // `fdatasync`, not `fsync`: this log's own length change is
             // exactly the metadata that needs to hit disk for the new

@@ -274,8 +274,8 @@ fn reopening_a_file_with_a_torn_trailing_record_recovers_without_panicking() {
 /// damaged while the second, fully-valid one still follows it — can never
 /// be explained by a crash (which only ever damages the tail), so it must
 /// still be refused, not silently truncated away.
-#[test]
-fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking() {
+#[tokio::test]
+async fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking() {
     use mysql_rust::storage::{ColumnSchema, ColumnType, Storage, Value};
 
     let dir = temp_dir("mid-file-corrupt");
@@ -297,10 +297,11 @@ fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking() {
             }],
             Some("id".to_string()),
         )
+        .await
         .unwrap();
     let before_inserts = std::fs::metadata(&path).unwrap().len(); // end of the CREATE TABLE record
-    storage.insert_row("t", vec![Value::Int(1)]).unwrap(); // record: gets corrupted below
-    storage.insert_row("t", vec![Value::Int(2)]).unwrap(); // record: stays valid, still follows
+    storage.insert_row("t", vec![Value::Int(1)]).await.unwrap(); // record: gets corrupted below
+    storage.insert_row("t", vec![Value::Int(2)]).await.unwrap(); // record: stays valid, still follows
     drop(storage);
 
     let mut bytes = std::fs::read(&path).unwrap();
