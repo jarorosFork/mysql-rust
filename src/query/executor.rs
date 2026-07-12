@@ -3,7 +3,9 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::query::parser::{ColumnDef, CompareOp, Condition, Expr, SelectItem, Statement};
+use crate::query::parser::{
+    ColumnDef, CompareOp, Condition, Expr, SelectItem, ShowStatement, Statement,
+};
 use crate::storage::{ColumnSchema, ColumnType, Storage, Value};
 use crate::{Error, Result};
 
@@ -92,6 +94,58 @@ impl<'a> Executor<'a> {
                 "transaction control statements must be handled by the connection layer"
                     .to_string(),
             )),
+            // Client/session boilerplate we accept and acknowledge with an OK
+            // (see the parser): session settings and database selection are
+            // not modelled, so they have no effect but must not error.
+            Statement::Set | Statement::Use => Ok(QueryResult::default()),
+            Statement::Show(show) => self.execute_show(show),
+        }
+    }
+
+    /// Execute a `SHOW` — enough introspection that GUI clients don't error.
+    /// Unmodelled forms return an empty result set.
+    fn execute_show(&self, show: ShowStatement) -> Result<QueryResult> {
+        let text_col = |name: &str| ColumnSchema {
+            name: name.to_string(),
+            column_type: ColumnType::Varchar,
+        };
+        match show {
+            ShowStatement::Databases => Ok(QueryResult {
+                columns: vec![text_col("Database")],
+                rows: Vec::new(),
+                rows_affected: 0,
+            }),
+            ShowStatement::Tables => {
+                let mut names = self.storage.tables()?;
+                names.sort();
+                Ok(QueryResult {
+                    columns: vec![text_col("Tables_in_mysql_rust")],
+                    rows: names.into_iter().map(|t| vec![Value::Varchar(t)]).collect(),
+                    rows_affected: 0,
+                })
+            }
+            ShowStatement::Warnings => Ok(QueryResult {
+                columns: vec![text_col("Level"), text_col("Code"), text_col("Message")],
+                rows: Vec::new(),
+                rows_affected: 0,
+            }),
+            ShowStatement::Variables { like } => {
+                let rows = self
+                    .known_variables()
+                    .into_iter()
+                    .filter(|(name, _)| match &like {
+                        Some(pattern) => like_matches(pattern, name),
+                        None => true,
+                    })
+                    .map(|(name, value)| vec![Value::Varchar(name.to_string()), value])
+                    .collect();
+                Ok(QueryResult {
+                    columns: vec![text_col("Variable_name"), text_col("Value")],
+                    rows,
+                    rows_affected: 0,
+                })
+            }
+            ShowStatement::Other => Ok(QueryResult::default()),
         }
     }
 
@@ -189,40 +243,27 @@ impl<'a> Executor<'a> {
         let mut values = Vec::with_capacity(projection.len());
 
         for item in projection {
-            let expr = match item {
+            let (expr, alias) = match item {
                 SelectItem::Wildcard => {
                     return Err(Error::Execution(
                         "SELECT * requires a FROM clause".to_string(),
                     ));
                 }
-                SelectItem::Expr(Expr::Column(name)) => {
-                    return Err(Error::Execution(format!(
-                        "Unknown column '{name}' (no FROM clause)"
-                    )));
-                }
-                SelectItem::Expr(expr) => expr,
+                SelectItem::Expr(expr, alias) => (expr, alias),
             };
 
-            let (name, column_type, value) = match expr {
-                Expr::Integer(n) => (n.to_string(), ColumnType::Int, Value::Int(n)),
-                Expr::String(s) => (s.clone(), ColumnType::Varchar, Value::Varchar(s)),
-                Expr::Null => ("NULL".to_string(), ColumnType::Varchar, Value::Null),
-                Expr::SystemVariable(name) => {
-                    let value = self.system_variable(&name)?;
-                    // Numeric system variables (e.g. @@max_allowed_packet) are
-                    // reported as an INT column so drivers read them as numbers.
-                    let column_type = match &value {
-                        Value::Int(_) => ColumnType::Int,
-                        _ => ColumnType::Varchar,
-                    };
-                    (format!("@@{name}"), column_type, value)
+            let (default_name, value) = match expr {
+                Expr::Integer(n) => (n.to_string(), Value::Int(n)),
+                Expr::String(s) => (s.clone(), Value::Varchar(s)),
+                Expr::Null => ("NULL".to_string(), Value::Null),
+                Expr::SystemVariable(name) => (format!("@@{name}"), self.system_variable(&name)),
+                Expr::Function(name, args) => {
+                    (format!("{name}()"), self.evaluate_function(&name, &args))
                 }
-                // `Column` is handled by the outer match above; reaching here
-                // would be a logic bug, but return an error rather than panic
-                // on a client-reachable path.
+                // A bare column with no FROM clause is an error, as in MySQL.
                 Expr::Column(name) => {
                     return Err(Error::Execution(format!(
-                        "Unknown column '{name}' (no FROM clause)"
+                        "Unknown column '{name}' in 'field list'"
                     )));
                 }
                 Expr::Placeholder(_) => {
@@ -231,7 +272,16 @@ impl<'a> Executor<'a> {
                     ));
                 }
             };
-            columns.push(ColumnSchema { name, column_type });
+            // Numeric values (e.g. @@max_allowed_packet) are reported as an INT
+            // column so clients read them as numbers, not strings.
+            let column_type = match &value {
+                Value::Int(_) => ColumnType::Int,
+                _ => ColumnType::Varchar,
+            };
+            columns.push(ColumnSchema {
+                name: alias.unwrap_or(default_name),
+                column_type,
+            });
             values.push(value);
         }
 
@@ -242,24 +292,75 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// Resolve a `@@name` system variable to a typed value. Covers the
-    /// variables a standard client reads on connect and a few common ones;
-    /// unknown variables error (as MySQL does), not silently return NULL.
-    fn system_variable(&self, name: &str) -> Result<Value> {
-        // i64 is plenty: max_allowed_packet caps well below i64::MAX, but
-        // clamp defensively so a huge configured value can't wrap negative.
+    /// Resolve a `@@name` system variable to a typed value. Scope prefixes
+    /// (`@@session.`, `@@global.`, `@@local.`) are accepted and stripped.
+    /// Unknown variables resolve to `NULL` rather than erroring, so a client's
+    /// connect-time batch of `@@…` reads never fails on one we didn't model.
+    fn system_variable(&self, name: &str) -> Value {
+        let lower = name.to_ascii_lowercase();
+        let bare = lower
+            .strip_prefix("session.")
+            .or_else(|| lower.strip_prefix("global."))
+            .or_else(|| lower.strip_prefix("local."))
+            .unwrap_or(lower.as_str());
+        self.known_variables()
+            .into_iter()
+            .find(|(n, _)| *n == bare)
+            .map(|(_, v)| v)
+            .unwrap_or(Value::Null)
+    }
+
+    /// The system variables this server reports, with plausible values — the
+    /// set a standard client (JDBC/GUI) reads on connect. Backs both
+    /// `@@variable` reads and `SHOW VARIABLES`.
+    fn known_variables(&self) -> Vec<(&'static str, Value)> {
+        // Clamp to i64 defensively so a huge configured value can't wrap.
         let as_int = |v: u64| Value::Int(v.min(i64::MAX as u64) as i64);
-        match name.to_ascii_lowercase().as_str() {
-            "version" => Ok(Value::Varchar(self.vars.version.clone())),
-            "version_comment" => Ok(Value::Varchar("mysql-rust".to_string())),
-            "max_allowed_packet" => Ok(as_int(self.vars.max_allowed_packet)),
-            "wait_timeout" => Ok(as_int(self.vars.wait_timeout)),
-            "autocommit" => Ok(Value::Int(1)),
+        let s = |v: &str| Value::Varchar(v.to_string());
+        vec![
+            ("version", Value::Varchar(self.vars.version.clone())),
+            ("version_comment", s("mysql-rust")),
+            ("max_allowed_packet", as_int(self.vars.max_allowed_packet)),
+            ("wait_timeout", as_int(self.vars.wait_timeout)),
+            ("interactive_timeout", as_int(self.vars.wait_timeout)),
+            ("net_write_timeout", Value::Int(60)),
+            ("net_read_timeout", Value::Int(30)),
+            ("autocommit", Value::Int(1)),
+            ("auto_increment_increment", Value::Int(1)),
+            ("character_set_client", s("utf8mb4")),
+            ("character_set_connection", s("utf8mb4")),
+            ("character_set_results", s("utf8mb4")),
+            ("character_set_server", s("utf8mb4")),
+            ("collation_server", s("utf8mb4_general_ci")),
+            ("collation_connection", s("utf8mb4_general_ci")),
+            ("init_connect", s("")),
+            ("license", s("MIT OR Apache-2.0")),
+            ("lower_case_table_names", Value::Int(0)),
+            ("performance_schema", Value::Int(0)),
+            ("query_cache_size", Value::Int(0)),
+            ("query_cache_type", s("OFF")),
+            ("have_query_cache", s("NO")),
+            ("sql_mode", s("")),
+            ("system_time_zone", s("UTC")),
+            ("time_zone", s("SYSTEM")),
+            ("transaction_isolation", s("READ-COMMITTED")),
+            ("tx_isolation", s("READ-COMMITTED")),
+            ("transaction_read_only", Value::Int(0)),
             // TCP-only server: there is no unix socket to report.
-            "socket" => Ok(Value::Null),
-            other => Err(Error::Execution(format!(
-                "Unknown system variable '{other}'"
-            ))),
+            ("socket", Value::Null),
+        ]
+    }
+
+    /// Evaluate a small set of no-argument informational functions clients use
+    /// (`DATABASE()`, `VERSION()`, ...). Unknown functions resolve to `NULL`.
+    fn evaluate_function(&self, name: &str, _args: &[Expr]) -> Value {
+        match name.to_ascii_lowercase().as_str() {
+            // Schemaless server: no current database.
+            "database" | "schema" => Value::Null,
+            "version" => Value::Varchar(self.vars.version.clone()),
+            "connection_id" => Value::Int(1),
+            "last_insert_id" => Value::Int(0),
+            _ => Value::Null,
         }
     }
 
@@ -330,10 +431,10 @@ fn resolve_projection(
                     "'*' cannot be combined with other selected columns".to_string(),
                 ));
             }
-            SelectItem::Expr(Expr::Column(name)) => {
+            SelectItem::Expr(Expr::Column(name), _) => {
                 indices.push(column_index(table_columns, name)?)
             }
-            SelectItem::Expr(_) => {
+            SelectItem::Expr(_, _) => {
                 return Err(Error::Unsupported(
                     "literal expressions in a SELECT list alongside a FROM clause",
                 ));
@@ -341,6 +442,33 @@ fn resolve_projection(
         }
     }
     Ok(indices)
+}
+
+/// A minimal MySQL `LIKE` matcher for `SHOW ... LIKE '<pattern>'`: `%` matches
+/// any run of characters, `_` matches one. Case-insensitive, which is enough
+/// for the variable-name lookups clients use.
+fn like_matches(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    // Classic dynamic-programming wildcard match.
+    let (np, nt) = (p.len(), t.len());
+    let mut dp = vec![vec![false; nt + 1]; np + 1];
+    dp[0][0] = true;
+    for i in 1..=np {
+        if p[i - 1] == '%' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=np {
+        for j in 1..=nt {
+            dp[i][j] = match p[i - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && c == t[j - 1],
+            };
+        }
+    }
+    dp[np][nt]
 }
 
 fn column_index(table_columns: &[ColumnSchema], name: &str) -> Result<usize> {
@@ -407,9 +535,11 @@ fn coerce(expr: &Expr, column_type: ColumnType, column_name: &str) -> Result<Val
                 "Incorrect integer value: '{s}' for column '{column_name}'"
             ))
         }),
-        (Expr::SystemVariable(_) | Expr::Column(_), _) => Err(Error::Execution(format!(
-            "a literal value is required for column '{column_name}'"
-        ))),
+        (Expr::SystemVariable(_) | Expr::Column(_) | Expr::Function(..), _) => {
+            Err(Error::Execution(format!(
+                "a literal value is required for column '{column_name}'"
+            )))
+        }
         // Placeholders are always replaced with literals by
         // `parser::bind_parameters` before execution; one reaching here means
         // a prepared statement was executed without binding its parameters.
@@ -503,12 +633,53 @@ mod tests {
     }
 
     #[test]
-    fn unknown_system_variable_is_an_execution_error() {
+    fn unknown_system_variable_resolves_to_null() {
+        // Lenient by design: an unknown @@var yields NULL, not an error, so a
+        // client's connect-time batch of variable reads never fails on one we
+        // don't model.
         let storage = InMemoryStorage::new();
-        assert!(matches!(
-            run(&storage, "SELECT @@bogus"),
-            Err(Error::Execution(_))
-        ));
+        let result = run(&storage, "SELECT @@bogus").expect("execute");
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn scope_qualified_and_aliased_system_variables() {
+        let storage = InMemoryStorage::new();
+        let result = run(&storage, "SELECT @@session.max_allowed_packet AS m").expect("execute");
+        assert_eq!(result.column_names(), vec!["m"]);
+        assert_eq!(result.rows, vec![vec![int(64 * 1024 * 1024)]]);
+    }
+
+    #[test]
+    fn set_use_and_show_are_accepted() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "SET NAMES utf8mb4").expect("SET");
+        run(&storage, "SET @@session.autocommit = 1").expect("SET session");
+        run(&storage, "USE mydb").expect("USE");
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        let tables = run(&storage, "SHOW TABLES").expect("SHOW TABLES");
+        assert_eq!(tables.rows, vec![vec![vc("t")]]);
+        let warnings = run(&storage, "SHOW WARNINGS").expect("SHOW WARNINGS");
+        assert!(warnings.rows.is_empty());
+        assert_eq!(warnings.column_names(), vec!["Level", "Code", "Message"]);
+    }
+
+    #[test]
+    fn show_variables_like_filters() {
+        let storage = InMemoryStorage::new();
+        let result = run(&storage, "SHOW VARIABLES LIKE 'max_allowed%'").expect("SHOW VARIABLES");
+        assert_eq!(result.column_names(), vec!["Variable_name", "Value"]);
+        assert_eq!(
+            result.rows,
+            vec![vec![vc("max_allowed_packet"), int(64 * 1024 * 1024)]]
+        );
+    }
+
+    #[test]
+    fn database_function_is_null_without_a_schema() {
+        let storage = InMemoryStorage::new();
+        let result = run(&storage, "SELECT DATABASE()").expect("execute");
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
     }
 
     #[test]

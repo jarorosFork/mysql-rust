@@ -122,6 +122,83 @@ async fn real_driver_native_password_end_to_end() {
 }
 
 #[tokio::test]
+async fn real_driver_handles_jdbc_style_connection_boilerplate() {
+    // The statements a JDBC driver (Connector/J) and GUI clients like DBeaver
+    // fire around connect — none of which may error: a comment-wrapped,
+    // multi-`@@variable` SELECT with `AS` aliases; `SET`/`USE`/`SHOW`; and
+    // backtick-quoted identifiers.
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    // Connector/J's connect-time settings query: a leading `/* ... */` comment
+    // then many `@@session.<var> AS <alias>` reads. Read back by alias.
+    let row: Option<(i64, String, String, String)> = conn
+        .query_first(
+            "/* mysql-connector-java-8.0 */ SELECT \
+             @@session.auto_increment_increment AS auto_increment_increment, \
+             @@character_set_client AS character_set_client, \
+             @@sql_mode AS sql_mode, \
+             @@time_zone AS time_zone",
+        )
+        .await
+        .expect("JDBC-style init SELECT must succeed");
+    let (auto_inc, charset, _sql_mode, _tz) = row.expect("one row");
+    assert_eq!(auto_inc, 1);
+    assert_eq!(charset, "utf8mb4");
+
+    // Session setup statements — accepted as no-ops.
+    for stmt in [
+        "SET NAMES utf8mb4",
+        "SET character_set_results = NULL",
+        "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'",
+        "SET autocommit = 1",
+        "SET @my_user_var = 42",
+        "USE mysql",
+    ] {
+        conn.query_drop(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt:?} should be accepted: {e}"));
+    }
+
+    // Introspection the navigator uses.
+    let vars: Vec<(String, String)> = conn
+        .query("SHOW VARIABLES LIKE 'max_allowed_packet'")
+        .await
+        .expect("SHOW VARIABLES");
+    assert_eq!(vars.len(), 1);
+    assert_eq!(vars[0].0, "max_allowed_packet");
+    let _: Vec<String> = conn.query("SHOW WARNINGS").await.expect("SHOW WARNINGS");
+    let db: Option<Option<String>> = conn
+        .query_first("SELECT DATABASE()")
+        .await
+        .expect("DATABASE()");
+    assert_eq!(db, Some(None)); // NULL — schemaless
+
+    // Backtick-quoted identifiers, used pervasively by GUI clients.
+    conn.query_drop("CREATE TABLE `my tbl` (`id` INT PRIMARY KEY, `full name` VARCHAR)")
+        .await
+        .expect("backtick DDL");
+    conn.query_drop("INSERT INTO `my tbl` (`id`, `full name`) VALUES (1, 'Ada')")
+        .await
+        .expect("backtick INSERT");
+    let names: Vec<String> = conn
+        .query("SELECT `full name` FROM `my tbl` WHERE `id` = 1")
+        .await
+        .expect("backtick SELECT");
+    assert_eq!(names, vec!["Ada".to_string()]);
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
+#[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`
     // produces — built through the same `from_env` code path, but with an

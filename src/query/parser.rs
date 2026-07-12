@@ -30,6 +30,26 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// `SET ...` — accepted and ignored. Session settings (`SET NAMES`,
+    /// `SET autocommit`, `SET sql_mode`, ...) are common client boilerplate;
+    /// this server doesn't model them, so it acknowledges them with an OK.
+    Set,
+    /// `USE <db>` — accepted as a no-op; this server is schemaless.
+    Use,
+    /// `SHOW ...` — limited introspection (see [`ShowStatement`]).
+    Show(ShowStatement),
+}
+
+/// The recognized forms of `SHOW`. Anything not modelled here parses to
+/// [`ShowStatement::Other`] and yields an empty result rather than an error,
+/// so client/GUI introspection queries don't break the session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShowStatement {
+    Databases,
+    Tables,
+    Warnings,
+    Variables { like: Option<String> },
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +65,10 @@ pub struct ColumnDef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
-    Expr(Expr),
+    /// A projected expression with an optional `AS` alias (the column label the
+    /// client sees). Clients like JDBC read connect-time variables by their
+    /// alias, so the alias must be honored.
+    Expr(Expr, Option<String>),
 }
 
 /// A literal or column reference.
@@ -56,6 +79,10 @@ pub enum Expr {
     Null,
     SystemVariable(String),
     Column(String),
+    /// A function call such as `DATABASE()` or `VERSION()`. Arguments are
+    /// captured but only a small set of no-argument informational functions is
+    /// evaluated (see the executor); unknown functions yield `NULL`.
+    Function(String, Vec<Expr>),
     /// A `?` placeholder in a prepared statement, carrying its zero-based
     /// positional index. Only produced when placeholders are allowed (see
     /// [`parse_prepared`]); it must be replaced with a concrete literal by
@@ -73,6 +100,7 @@ impl Expr {
             Expr::Null => None,
             Expr::SystemVariable(name) => Some(format!("@@{name}")),
             Expr::Column(name) => Some(name.clone()),
+            Expr::Function(name, _) => Some(format!("{name}()")),
             Expr::Placeholder(i) => Some(format!("?{i}")),
         }
     }
@@ -137,6 +165,10 @@ enum Keyword {
     Transaction,
     Commit,
     Rollback,
+    Set,
+    Use,
+    Show,
+    As,
 }
 
 fn keyword_text(kw: Keyword) -> String {
@@ -161,6 +193,10 @@ fn keyword_from_ident(s: &str) -> Option<Keyword> {
         "TRANSACTION" => Some(Keyword::Transaction),
         "COMMIT" => Some(Keyword::Commit),
         "ROLLBACK" => Some(Keyword::Rollback),
+        "SET" => Some(Keyword::Set),
+        "USE" => Some(Keyword::Use),
+        "SHOW" => Some(Keyword::Show),
+        "AS" => Some(Keyword::As),
         _ => None,
     }
 }
@@ -204,6 +240,59 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
 
         if c.is_whitespace() {
             i += 1;
+            continue;
+        }
+
+        // --- Comments ---------------------------------------------------
+        // Block comments `/* ... */`. MySQL executable comments `/*! ... */`
+        // (optionally version-gated, e.g. `/*!40101 ... */`) have their inner
+        // SQL unwrapped and tokenized; plain block comments are skipped. This
+        // is what lets a JDBC driver's `/* driver-name */SELECT ...` init
+        // queries parse.
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let executable = chars.get(i + 2) == Some(&'!');
+            let mut j = i + 2;
+            let mut closed = false;
+            while j + 1 < chars.len() {
+                if chars[j] == '*' && chars[j + 1] == '/' {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !closed {
+                return Err(Error::Parse(format!(
+                    "unterminated block comment starting at position {i}"
+                )));
+            }
+            if executable {
+                // Skip `/*!` and any immediately-following version digits.
+                let mut inner_start = i + 3;
+                while inner_start < j && chars[inner_start].is_ascii_digit() {
+                    inner_start += 1;
+                }
+                let inner: String = chars[inner_start..j].iter().collect();
+                tokens.append(&mut tokenize(&inner)?);
+            }
+            i = j + 2; // past the closing `*/`
+            continue;
+        }
+        // Line comments: `# ...` and `-- ...` (the `--` form requires the
+        // dashes be followed by whitespace or end-of-input, per MySQL, so
+        // negative numbers like `--5` are unaffected).
+        if c == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '-'
+            && chars.get(i + 1) == Some(&'-')
+            && chars.get(i + 2).is_none_or(|c| c.is_whitespace())
+        {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
             continue;
         }
 
@@ -272,20 +361,39 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Str(s));
                 i += consumed;
             }
+            '`' => {
+                // Backtick-quoted identifier, e.g. `my table`. Standard MySQL
+                // quoting used pervasively by GUI clients and drivers.
+                let (name, consumed) = scan_backtick_ident(&chars[i..])?;
+                tokens.push(Token::Ident(name));
+                i += consumed;
+            }
             '@' => {
                 if chars.get(i + 1) == Some(&'@') {
-                    let (name, consumed) = scan_ident(&chars[i + 2..]);
+                    // System variable, optionally scope-qualified:
+                    // `@@x`, `@@session.x`, `@@global.x`.
+                    let (mut name, mut consumed) = scan_ident(&chars[i + 2..]);
                     if name.is_empty() {
                         return Err(Error::Parse(format!(
                             "expected an identifier after '@@' at position {i}"
                         )));
                     }
+                    if chars.get(i + 2 + consumed) == Some(&'.') {
+                        let (second, c2) = scan_ident(&chars[i + 2 + consumed + 1..]);
+                        if !second.is_empty() {
+                            name = format!("{name}.{second}");
+                            consumed += 1 + c2;
+                        }
+                    }
                     tokens.push(Token::SystemVariable(name));
                     i += 2 + consumed;
                 } else {
-                    return Err(Error::Parse(format!(
-                        "unexpected character '@' at position {i}"
-                    )));
+                    // User-defined variable `@name`. We don't model these, but
+                    // lex them (as an Ident carrying the `@`) so statements like
+                    // `SET @x = 1` don't fail — `SET` is accepted and ignored.
+                    let (name, consumed) = scan_ident(&chars[i + 1..]);
+                    tokens.push(Token::Ident(format!("@{name}")));
+                    i += 1 + consumed;
                 }
             }
             c if c.is_ascii_digit()
@@ -341,6 +449,35 @@ fn scan_integer(chars: &[char]) -> Result<(i64, usize)> {
         .parse::<i64>()
         .map_err(|_| Error::Parse(format!("integer literal '{text}' out of range")))?;
     Ok((value, n))
+}
+
+/// `chars[0]` must be the opening backtick. A doubled backtick (```` `` ````)
+/// inside is an escaped literal backtick, matching MySQL.
+fn scan_backtick_ident(chars: &[char]) -> Result<(String, usize)> {
+    let mut n = 1;
+    let mut s = String::new();
+    loop {
+        match chars.get(n) {
+            None => return Err(Error::Parse("unterminated `identifier`".to_string())),
+            Some('`') => {
+                if chars.get(n + 1) == Some(&'`') {
+                    s.push('`');
+                    n += 2;
+                } else {
+                    n += 1;
+                    break;
+                }
+            }
+            Some(&c) => {
+                s.push(c);
+                n += 1;
+            }
+        }
+    }
+    if s.is_empty() {
+        return Err(Error::Parse("empty `` identifier".to_string()));
+    }
+    Ok((s, n))
 }
 
 /// `chars[0]` must be the opening `'`.
@@ -461,10 +598,96 @@ impl<'a> Parser<'a> {
             Some(Token::Keyword(Keyword::Rollback)) => {
                 self.parse_simple(Keyword::Rollback, Statement::Rollback)
             }
+            Some(Token::Keyword(Keyword::Set)) => self.parse_set(),
+            Some(Token::Keyword(Keyword::Use)) => self.parse_use(),
+            Some(Token::Keyword(Keyword::Show)) => self.parse_show(),
             other => Err(Error::Parse(format!(
-                "expected CREATE, INSERT, SELECT, BEGIN, START, COMMIT, or ROLLBACK, found {}",
+                "expected CREATE, INSERT, SELECT, BEGIN, START, COMMIT, ROLLBACK, SET, USE, or SHOW, found {}",
                 describe(other)
             ))),
+        }
+    }
+
+    /// `SET ...` — consume and ignore the rest of the statement. Covers the
+    /// whole family (`SET NAMES`, `SET autocommit=1`, `SET @@session.x=y`,
+    /// `SET SESSION TRANSACTION ...`) that clients send on connect.
+    fn parse_set(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Set)?;
+        while let Some(tok) = self.peek() {
+            if *tok == Token::Semicolon {
+                break;
+            }
+            self.pos += 1;
+        }
+        self.eat_semicolon_and_ensure_end()?;
+        Ok(Statement::Set)
+    }
+
+    /// `USE <db>` — consume and ignore (schemaless server).
+    fn parse_use(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Use)?;
+        while let Some(tok) = self.peek() {
+            if *tok == Token::Semicolon {
+                break;
+            }
+            self.pos += 1;
+        }
+        self.eat_semicolon_and_ensure_end()?;
+        Ok(Statement::Use)
+    }
+
+    /// `SHOW <what>` — recognizes a few common forms; anything else becomes
+    /// [`ShowStatement::Other`] (consumed, yields an empty result).
+    fn parse_show(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Show)?;
+        // The word after SHOW (WARNINGS/VARIABLES/TABLES/DATABASES/...) lexes
+        // as an ordinary identifier; match it case-insensitively.
+        let head = match self.peek() {
+            Some(Token::Ident(s)) => Some(s.to_ascii_uppercase()),
+            _ => None,
+        };
+        let show = match head.as_deref() {
+            Some("WARNINGS") | Some("ERRORS") => ShowStatement::Warnings,
+            Some("DATABASES") | Some("SCHEMAS") => ShowStatement::Databases,
+            Some("TABLES") => ShowStatement::Tables,
+            Some("VARIABLES") | Some("STATUS") => {
+                self.pos += 1; // consume the head word
+                let like = self.parse_optional_like()?;
+                self.consume_to_statement_end();
+                self.eat_semicolon_and_ensure_end()?;
+                return Ok(Statement::Show(ShowStatement::Variables { like }));
+            }
+            _ => ShowStatement::Other,
+        };
+        self.consume_to_statement_end();
+        self.eat_semicolon_and_ensure_end()?;
+        Ok(Statement::Show(show))
+    }
+
+    /// After `SHOW VARIABLES`, an optional `LIKE '<pattern>'`.
+    fn parse_optional_like(&mut self) -> Result<Option<String>> {
+        let is_like =
+            matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("LIKE"));
+        if !is_like {
+            return Ok(None);
+        }
+        self.pos += 1; // LIKE
+        match self.advance() {
+            Some(Token::Str(pattern)) => Ok(Some(pattern.clone())),
+            other => Err(Error::Parse(format!(
+                "expected a string pattern after LIKE, found {}",
+                describe(other)
+            ))),
+        }
+    }
+
+    /// Consume any remaining tokens up to `;` or end of input.
+    fn consume_to_statement_end(&mut self) {
+        while let Some(tok) = self.peek() {
+            if *tok == Token::Semicolon {
+                break;
+            }
+            self.pos += 1;
         }
     }
 
@@ -613,7 +836,9 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 projection.push(SelectItem::Wildcard);
             } else {
-                projection.push(SelectItem::Expr(self.parse_expr()?));
+                let expr = self.parse_expr()?;
+                let alias = self.parse_optional_alias()?;
+                projection.push(SelectItem::Expr(expr, alias));
             }
             match self.peek() {
                 Some(Token::Comma) => self.pos += 1,
@@ -665,12 +890,21 @@ impl<'a> Parser<'a> {
 
     fn parse_expr(&mut self) -> Result<Expr> {
         let allow_placeholders = self.allow_placeholders;
-        match self.advance() {
-            Some(Token::Integer(n)) => Ok(Expr::Integer(*n)),
-            Some(Token::Str(s)) => Ok(Expr::String(s.clone())),
+        // Take an owned copy so the borrow on `self` ends and we can look
+        // ahead (e.g. to detect `name(` as a function call).
+        let token = self.advance().cloned();
+        match token {
+            Some(Token::Integer(n)) => Ok(Expr::Integer(n)),
+            Some(Token::Str(s)) => Ok(Expr::String(s)),
             Some(Token::Keyword(Keyword::Null)) => Ok(Expr::Null),
-            Some(Token::SystemVariable(name)) => Ok(Expr::SystemVariable(name.clone())),
-            Some(Token::Ident(name)) => Ok(Expr::Column(name.clone())),
+            Some(Token::SystemVariable(name)) => Ok(Expr::SystemVariable(name)),
+            Some(Token::Ident(name)) => {
+                if matches!(self.peek(), Some(Token::LParen)) {
+                    self.parse_function_call(name)
+                } else {
+                    Ok(Expr::Column(name))
+                }
+            }
             Some(Token::Placeholder) if allow_placeholders => {
                 let index = self.param_count;
                 self.param_count += 1;
@@ -681,9 +915,43 @@ impl<'a> Parser<'a> {
             )),
             other => Err(Error::Parse(format!(
                 "expected a value or column, found {}",
-                describe(other)
+                describe(other.as_ref())
             ))),
         }
+    }
+
+    /// Parse a function call whose name is already consumed and `peek()` is at
+    /// the opening `(`, e.g. `DATABASE()` or `CONCAT(a, b)`.
+    fn parse_function_call(&mut self, name: String) -> Result<Expr> {
+        self.expect_punct(&Token::LParen)?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            loop {
+                args.push(self.parse_expr()?);
+                match self.peek() {
+                    Some(Token::Comma) => self.pos += 1,
+                    _ => break,
+                }
+            }
+        }
+        self.expect_punct(&Token::RParen)?;
+        Ok(Expr::Function(name, args))
+    }
+
+    /// An optional column alias after a projected expression: `expr AS name`
+    /// or the bare `expr name` form. A following clause keyword (`FROM`, ...)
+    /// or punctuation is not an alias.
+    fn parse_optional_alias(&mut self) -> Result<Option<String>> {
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::As))) {
+            self.pos += 1;
+            return Ok(Some(self.expect_ident()?));
+        }
+        if let Some(Token::Ident(name)) = self.peek() {
+            let name = name.clone();
+            self.pos += 1;
+            return Ok(Some(name));
+        }
+        Ok(None)
     }
 }
 
@@ -762,7 +1030,9 @@ pub fn bind_parameters(statement: Statement, params: &[Expr]) -> Result<Statemen
                 .into_iter()
                 .map(|item| match item {
                     SelectItem::Wildcard => Ok(SelectItem::Wildcard),
-                    SelectItem::Expr(e) => bind_expr(e, params).map(SelectItem::Expr),
+                    SelectItem::Expr(e, alias) => {
+                        Ok(SelectItem::Expr(bind_expr(e, params)?, alias))
+                    }
                 })
                 .collect::<Result<Vec<SelectItem>>>()?,
             from,
@@ -786,6 +1056,12 @@ fn bind_expr(expr: Expr, params: &[Expr]) -> Result<Expr> {
             .get(i)
             .cloned()
             .ok_or_else(|| Error::Execution(format!("missing value for parameter {}", i + 1))),
+        Expr::Function(name, args) => Ok(Expr::Function(
+            name,
+            args.into_iter()
+                .map(|a| bind_expr(a, params))
+                .collect::<Result<Vec<_>>>()?,
+        )),
         other => Ok(other),
     }
 }
@@ -820,7 +1096,7 @@ mod tests {
             Statement::Select { projection, .. } => {
                 assert_eq!(
                     projection,
-                    vec![SelectItem::Expr(Expr::String("it's".to_string()))]
+                    vec![SelectItem::Expr(Expr::String("it's".to_string()), None)]
                 );
             }
             other => panic!("expected Select, got {other:?}"),
@@ -832,7 +1108,7 @@ mod tests {
         let stmt = parse("SELECT -5").unwrap();
         match stmt {
             Statement::Select { projection, .. } => {
-                assert_eq!(projection, vec![SelectItem::Expr(Expr::Integer(-5))]);
+                assert_eq!(projection, vec![SelectItem::Expr(Expr::Integer(-5), None)]);
             }
             other => panic!("expected Select, got {other:?}"),
         }
@@ -843,7 +1119,7 @@ mod tests {
         let stmt = parse("SELECT NULL").unwrap();
         match stmt {
             Statement::Select { projection, .. } => {
-                assert_eq!(projection, vec![SelectItem::Expr(Expr::Null)]);
+                assert_eq!(projection, vec![SelectItem::Expr(Expr::Null, None)]);
             }
             other => panic!("expected Select, got {other:?}"),
         }
@@ -858,7 +1134,26 @@ mod tests {
 
     #[test]
     fn rejects_unexpected_character() {
-        assert!(matches!(parse("SELECT 1 # comment"), Err(Error::Parse(_))));
+        // `~` isn't part of the supported grammar (unlike `#`/`--`/`/* */`,
+        // which are comments).
+        assert!(matches!(parse("SELECT ~1"), Err(Error::Parse(_))));
+    }
+
+    #[test]
+    fn comments_are_skipped() {
+        // Line comments (`#`, `-- `) and block comments, including the MySQL
+        // executable form `/*! ... */`, whose inner SQL is unwrapped.
+        assert!(parse("SELECT 1 # trailing line comment").is_ok());
+        assert!(parse("SELECT 1 -- trailing line comment").is_ok());
+        assert!(parse("/* leading block comment */ SELECT 1").is_ok());
+        assert!(parse("SELECT /* inline */ 1").is_ok());
+        assert!(parse("/*! SELECT 1 */").is_ok());
+        assert!(parse("/*!40101 SELECT 1 */").is_ok());
+    }
+
+    #[test]
+    fn backtick_quoted_identifiers() {
+        assert!(parse("SELECT `id`, `full name` FROM `my table`").is_ok());
     }
 
     // ---- CREATE TABLE ----
@@ -1149,8 +1444,8 @@ mod tests {
             stmt,
             Statement::Select {
                 projection: vec![
-                    SelectItem::Expr(Expr::Column("a".to_string())),
-                    SelectItem::Expr(Expr::Column("b".to_string())),
+                    SelectItem::Expr(Expr::Column("a".to_string()), None),
+                    SelectItem::Expr(Expr::Column("b".to_string()), None),
                 ],
                 from: Some("t".to_string()),
                 selection: Some(Condition {
@@ -1191,7 +1486,7 @@ mod tests {
         assert_eq!(
             stmt,
             Statement::Select {
-                projection: vec![SelectItem::Expr(Expr::Integer(1))],
+                projection: vec![SelectItem::Expr(Expr::Integer(1), None)],
                 from: None,
                 selection: None,
             }
@@ -1204,9 +1499,10 @@ mod tests {
         assert_eq!(
             stmt,
             Statement::Select {
-                projection: vec![SelectItem::Expr(Expr::SystemVariable(
-                    "version".to_string()
-                ))],
+                projection: vec![SelectItem::Expr(
+                    Expr::SystemVariable("version".to_string()),
+                    None
+                )],
                 from: None,
                 selection: None,
             }
@@ -1221,7 +1517,34 @@ mod tests {
 
     #[test]
     fn select_rejects_trailing_garbage() {
-        assert!(matches!(parse("SELECT 1 GARBAGE"), Err(Error::Parse(_))));
+        // A trailing integer isn't a valid alias, so it's genuine garbage.
+        // (`SELECT 1 alias` *is* accepted now — a bare identifier is an alias.)
+        assert!(matches!(parse("SELECT 1 2"), Err(Error::Parse(_))));
+    }
+
+    #[test]
+    fn select_supports_column_aliases() {
+        let stmt = parse("SELECT @@version AS v, 1 AS one, 2 three").unwrap();
+        match stmt {
+            Statement::Select { projection, .. } => {
+                let aliases: Vec<Option<String>> = projection
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::Expr(_, alias) => alias.clone(),
+                        SelectItem::Wildcard => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    aliases,
+                    vec![
+                        Some("v".to_string()),
+                        Some("one".to_string()),
+                        Some("three".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
     }
 
     #[test]
