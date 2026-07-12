@@ -335,6 +335,61 @@ async fn real_driver_dbeaver_create_table_and_auto_increment_insert() {
     drop(server);
 }
 
+/// `ORDER BY`/`LIMIT`/`OFFSET` — a GUI data grid's column-sort-click and
+/// page-through-results both compile down to exactly this.
+#[tokio::test]
+async fn real_driver_order_by_limit_offset() {
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
+        .await
+        .expect("CREATE TABLE");
+    conn.query_drop("INSERT INTO t (id, name) VALUES (1, 'carol'), (2, 'alice'), (3, 'bob')")
+        .await
+        .expect("INSERT");
+
+    // Column-sort-click: ORDER BY name ASC / DESC.
+    let ascending: Vec<String> = conn
+        .query("SELECT name FROM t ORDER BY name")
+        .await
+        .expect("ORDER BY ASC");
+    assert_eq!(
+        ascending,
+        vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+    );
+    let descending: Vec<String> = conn
+        .query("SELECT name FROM t ORDER BY name DESC")
+        .await
+        .expect("ORDER BY DESC");
+    assert_eq!(
+        descending,
+        vec!["carol".to_string(), "bob".to_string(), "alice".to_string()]
+    );
+
+    // Page-through-results: LIMIT/OFFSET, ordered by the primary key.
+    let page1: Vec<i32> = conn
+        .query("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 0")
+        .await
+        .expect("page 1");
+    assert_eq!(page1, vec![1, 2]);
+    let page2: Vec<i32> = conn
+        .query("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 2")
+        .await
+        .expect("page 2");
+    assert_eq!(page2, vec![3]);
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
 #[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`

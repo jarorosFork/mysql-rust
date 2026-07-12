@@ -25,6 +25,9 @@ pub enum Statement {
         projection: Vec<SelectItem>,
         from: Option<String>,
         selection: Option<Condition>,
+        order_by: Vec<OrderByItem>,
+        limit: Option<u64>,
+        offset: Option<u64>,
     },
     /// `BEGIN` or `START TRANSACTION`.
     Begin,
@@ -151,6 +154,14 @@ pub struct Condition {
     pub value: Expr,
 }
 
+/// One `ORDER BY` key: a column name (this server doesn't support ordering
+/// by a positional index or an arbitrary expression) and direction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderByItem {
+    pub column: String,
+    pub descending: bool,
+}
+
 // ---------- Tokenizer ----------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +212,9 @@ enum Keyword {
     Show,
     As,
     Drop,
+    Order,
+    By,
+    Limit,
 }
 
 fn keyword_text(kw: Keyword) -> String {
@@ -229,6 +243,9 @@ fn keyword_from_ident(s: &str) -> Option<Keyword> {
         "USE" => Some(Keyword::Use),
         "SHOW" => Some(Keyword::Show),
         "AS" => Some(Keyword::As),
+        "ORDER" => Some(Keyword::Order),
+        "BY" => Some(Keyword::By),
+        "LIMIT" => Some(Keyword::Limit),
         "DROP" => Some(Keyword::Drop),
         _ => None,
     }
@@ -1238,12 +1255,80 @@ impl<'a> Parser<'a> {
             (None, None)
         };
 
+        let order_by = self.parse_optional_order_by()?;
+        let (limit, offset) = self.parse_optional_limit()?;
+
         self.eat_semicolon_and_ensure_end()?;
         Ok(Statement::Select {
             projection,
             from,
             selection,
+            order_by,
+            limit,
+            offset,
         })
+    }
+
+    /// An optional `ORDER BY col [ASC|DESC] [, col [ASC|DESC] ...]`.
+    fn parse_optional_order_by(&mut self) -> Result<Vec<OrderByItem>> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+            return Ok(Vec::new());
+        }
+        self.pos += 1;
+        self.expect_keyword(Keyword::By)?;
+
+        let mut items = Vec::new();
+        loop {
+            let column = self.expect_ident()?;
+            let descending = if self.peek_is_ident_ci("DESC") {
+                self.pos += 1;
+                true
+            } else {
+                if self.peek_is_ident_ci("ASC") {
+                    self.pos += 1;
+                }
+                false
+            };
+            items.push(OrderByItem { column, descending });
+            match self.peek() {
+                Some(Token::Comma) => self.pos += 1,
+                _ => break,
+            }
+        }
+        Ok(items)
+    }
+
+    /// An optional `LIMIT`, in either MySQL form: `LIMIT count [OFFSET n]`
+    /// or `LIMIT offset, count`. Returns `(limit, offset)`.
+    fn parse_optional_limit(&mut self) -> Result<(Option<u64>, Option<u64>)> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            return Ok((None, None));
+        }
+        self.pos += 1;
+        let first = self.expect_unsigned_integer()?;
+
+        if matches!(self.peek(), Some(Token::Comma)) {
+            // `LIMIT offset, count`
+            self.pos += 1;
+            let count = self.expect_unsigned_integer()?;
+            return Ok((Some(count), Some(first)));
+        }
+        if self.peek_is_ident_ci("OFFSET") {
+            self.pos += 1;
+            let offset = self.expect_unsigned_integer()?;
+            return Ok((Some(first), Some(offset)));
+        }
+        Ok((Some(first), None))
+    }
+
+    fn expect_unsigned_integer(&mut self) -> Result<u64> {
+        match self.advance() {
+            Some(Token::Integer(n)) if *n >= 0 => Ok(*n as u64),
+            other => Err(Error::Parse(format!(
+                "expected a non-negative integer, found {}",
+                describe(other)
+            ))),
+        }
     }
 
     fn parse_condition(&mut self) -> Result<Condition> {
@@ -1403,6 +1488,9 @@ pub fn bind_parameters(statement: Statement, params: &[Expr]) -> Result<Statemen
             projection,
             from,
             selection,
+            order_by,
+            limit,
+            offset,
         } => Statement::Select {
             projection: projection
                 .into_iter()
@@ -1421,6 +1509,11 @@ pub fn bind_parameters(statement: Statement, params: &[Expr]) -> Result<Statemen
                 }),
                 None => None,
             },
+            // ORDER BY/LIMIT/OFFSET carry no placeholders (see `OrderByItem`
+            // and their `Option<u64>` types) — nothing to bind.
+            order_by,
+            limit,
+            offset,
         },
         // CREATE TABLE and transaction-control statements carry no exprs.
         other => other,
@@ -1952,6 +2045,9 @@ mod tests {
                 projection: vec![SelectItem::Wildcard],
                 from: Some("TABLES".to_string()),
                 selection: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             }
         );
     }
@@ -1973,6 +2069,9 @@ mod tests {
                 projection: vec![SelectItem::Wildcard],
                 from: Some("t".to_string()),
                 selection: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             }
         );
     }
@@ -1993,6 +2092,9 @@ mod tests {
                     op: CompareOp::Eq,
                     value: Expr::Integer(1),
                 }),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             }
         );
     }
@@ -2020,6 +2122,111 @@ mod tests {
         }
     }
 
+    // ---- ORDER BY / LIMIT ----
+
+    #[test]
+    fn order_by_single_column_defaults_to_ascending() {
+        let stmt = parse("SELECT * FROM t ORDER BY name").unwrap();
+        match stmt {
+            Statement::Select { order_by, .. } => {
+                assert_eq!(
+                    order_by,
+                    vec![OrderByItem {
+                        column: "name".to_string(),
+                        descending: false,
+                    }]
+                );
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_explicit_asc_and_desc() {
+        let stmt = parse("SELECT * FROM t ORDER BY a ASC, b DESC").unwrap();
+        match stmt {
+            Statement::Select { order_by, .. } => {
+                assert_eq!(
+                    order_by,
+                    vec![
+                        OrderByItem {
+                            column: "a".to_string(),
+                            descending: false,
+                        },
+                        OrderByItem {
+                            column: "b".to_string(),
+                            descending: true,
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_with_where_and_limit_together() {
+        let stmt = parse("SELECT * FROM t WHERE a = 1 ORDER BY a DESC LIMIT 10").unwrap();
+        match stmt {
+            Statement::Select {
+                selection,
+                order_by,
+                limit,
+                ..
+            } => {
+                assert!(selection.is_some());
+                assert_eq!(order_by.len(), 1);
+                assert_eq!(limit, Some(10));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn limit_count_only() {
+        let stmt = parse("SELECT * FROM t LIMIT 5").unwrap();
+        match stmt {
+            Statement::Select { limit, offset, .. } => {
+                assert_eq!(limit, Some(5));
+                assert_eq!(offset, None);
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn limit_with_offset_keyword() {
+        let stmt = parse("SELECT * FROM t LIMIT 5 OFFSET 10").unwrap();
+        match stmt {
+            Statement::Select { limit, offset, .. } => {
+                assert_eq!(limit, Some(5));
+                assert_eq!(offset, Some(10));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn limit_with_comma_offset_form() {
+        // `LIMIT offset, count` — MySQL's older/alternate form.
+        let stmt = parse("SELECT * FROM t LIMIT 10, 5").unwrap();
+        match stmt {
+            Statement::Select { limit, offset, .. } => {
+                assert_eq!(limit, Some(5));
+                assert_eq!(offset, Some(10));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn limit_rejects_a_negative_integer() {
+        assert!(matches!(
+            parse("SELECT * FROM t LIMIT -1"),
+            Err(Error::Parse(_))
+        ));
+    }
+
     #[test]
     fn select_literal_without_from() {
         let stmt = parse("SELECT 1").unwrap();
@@ -2029,6 +2236,9 @@ mod tests {
                 projection: vec![SelectItem::Expr(Expr::Integer(1), None)],
                 from: None,
                 selection: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             }
         );
     }
@@ -2045,6 +2255,9 @@ mod tests {
                 )],
                 from: None,
                 selection: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             }
         );
     }

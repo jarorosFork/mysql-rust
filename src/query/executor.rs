@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::query::parser::{
-    ColumnDef, CompareOp, Condition, Expr, SelectItem, ShowStatement, Statement,
+    ColumnDef, CompareOp, Condition, Expr, OrderByItem, SelectItem, ShowStatement, Statement,
 };
 use crate::storage::{ColumnSchema, ColumnType, Storage, Value};
 use crate::{Error, Result};
@@ -84,7 +84,10 @@ impl<'a> Executor<'a> {
                 projection,
                 from,
                 selection,
-            } => self.execute_select(projection, from, selection),
+                order_by,
+                limit,
+                offset,
+            } => self.execute_select(projection, from, selection, &order_by, limit, offset),
             // Transaction control is handled by `Connection` before a
             // statement ever reaches an `Executor` (it needs to switch
             // which `Storage` implementation subsequent statements use —
@@ -318,21 +321,32 @@ impl<'a> Executor<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_select(
         &self,
         projection: Vec<SelectItem>,
         from: Option<String>,
         selection: Option<Condition>,
+        order_by: &[OrderByItem],
+        limit: Option<u64>,
+        offset: Option<u64>,
     ) -> Result<QueryResult> {
         match from {
-            None => self.execute_select_without_table(projection),
-            Some(table) => self.execute_select_from_table(&table, projection, selection),
+            None => self.execute_select_without_table(projection, limit, offset),
+            Some(table) => self
+                .execute_select_from_table(&table, projection, selection, order_by, limit, offset),
         }
     }
 
     /// `SELECT <expr-list>` with no `FROM` — literals, `NULL`, and system
-    /// variables only.
-    fn execute_select_without_table(&self, projection: Vec<SelectItem>) -> Result<QueryResult> {
+    /// variables only. Always exactly one row unless `LIMIT`/`OFFSET` drop
+    /// it (`ORDER BY` is a no-op here — there is only one row to order).
+    fn execute_select_without_table(
+        &self,
+        projection: Vec<SelectItem>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> Result<QueryResult> {
         let mut columns = Vec::with_capacity(projection.len());
         let mut values = Vec::with_capacity(projection.len());
 
@@ -381,9 +395,14 @@ impl<'a> Executor<'a> {
             values.push(value);
         }
 
+        // Exactly one row exists to page through: OFFSET >= 1 or LIMIT 0
+        // drops it, anything else keeps it.
+        let dropped = offset.is_some_and(|o| o >= 1) || limit == Some(0);
+        let rows = if dropped { Vec::new() } else { vec![values] };
+
         Ok(QueryResult {
             columns,
-            rows: vec![values],
+            rows,
             rows_affected: 0,
         })
     }
@@ -460,16 +479,20 @@ impl<'a> Executor<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_select_from_table(
         &self,
         table: &str,
         projection: Vec<SelectItem>,
         selection: Option<Condition>,
+        order_by: &[OrderByItem],
+        limit: Option<u64>,
+        offset: Option<u64>,
     ) -> Result<QueryResult> {
         let schema = self.storage.table_schema(table)?;
         let selected_indices = resolve_projection(&schema.columns, &projection)?;
 
-        let matching_rows: Vec<Vec<Value>> = match &selection {
+        let mut matching_rows: Vec<Vec<Value>> = match &selection {
             None => self.storage.scan(table)?,
             Some(cond) => {
                 let col_idx = column_index(&schema.columns, &cond.column)?;
@@ -494,11 +517,47 @@ impl<'a> Executor<'a> {
             }
         };
 
+        // Sort before projecting: ORDER BY may name a column that isn't in
+        // the SELECT list, so this needs the full (pre-projection) row.
+        if !order_by.is_empty() {
+            let sort_keys = order_by
+                .iter()
+                .map(|item| {
+                    Ok((
+                        column_index(&schema.columns, &item.column)?,
+                        item.descending,
+                    ))
+                })
+                .collect::<Result<Vec<(usize, bool)>>>()?;
+            matching_rows.sort_by(|a, b| {
+                for &(idx, descending) in &sort_keys {
+                    let ordering = value_ordering(&a[idx], &b[idx]);
+                    let ordering = if descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+
+        // OFFSET then LIMIT, applied after ordering/filtering — matching
+        // real MySQL's evaluation order.
+        let paged_rows: Vec<Vec<Value>> = matching_rows
+            .into_iter()
+            .skip(offset.unwrap_or(0) as usize)
+            .take(limit.unwrap_or(u64::MAX) as usize)
+            .collect();
+
         let columns = selected_indices
             .iter()
             .map(|&i| schema.columns[i].clone())
             .collect();
-        let rows = matching_rows
+        let rows = paged_rows
             .into_iter()
             .map(|row| selected_indices.iter().map(|&i| row[i].clone()).collect())
             .collect();
@@ -649,11 +708,14 @@ fn coerce(expr: &Expr, column_type: ColumnType, column_name: &str) -> Result<Val
     }
 }
 
-/// Compare two typed values. SQL three-valued logic: any comparison
-/// involving `NULL` is never true (not even `NULL = NULL`).
-fn compare_values(actual: &Value, op: CompareOp, expected: &Value) -> bool {
-    let ordering = match (actual, expected) {
-        (Value::Null, _) | (_, Value::Null) => return false,
+/// Order two values for `ORDER BY` sorting. Unlike `compare_values` (a
+/// WHERE-clause filter), this needs a definite answer even when one side is
+/// `NULL` — MySQL sorts `NULL` first, as the least value, in ascending order.
+fn value_ordering(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
         // Mixed Int/Varchar: compare by display text (best-effort; real
@@ -662,7 +724,18 @@ fn compare_values(actual: &Value, op: CompareOp, expected: &Value) -> bool {
             .to_display_string()
             .unwrap_or_default()
             .cmp(&b.to_display_string().unwrap_or_default()),
-    };
+    }
+}
+
+/// Compare two typed values. SQL three-valued logic: any comparison
+/// involving `NULL` is never true (not even `NULL = NULL`) — distinct from
+/// `value_ordering`'s `ORDER BY` sorting, where NULL needs a definite
+/// position rather than "no match".
+fn compare_values(actual: &Value, op: CompareOp, expected: &Value) -> bool {
+    if matches!(actual, Value::Null) || matches!(expected, Value::Null) {
+        return false;
+    }
+    let ordering = value_ordering(actual, expected);
     match op {
         CompareOp::Eq => ordering == Ordering::Equal,
         CompareOp::NotEq => ordering != Ordering::Equal,
@@ -1181,6 +1254,163 @@ mod tests {
 
         // A NULL column value can't satisfy any comparison, even against NULL.
         assert!(run(&storage, "SELECT * FROM t WHERE b = NULL")
+            .expect("select")
+            .rows
+            .is_empty());
+    }
+
+    fn seed_order_by_table(storage: &InMemoryStorage) {
+        run(storage, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)").expect("create");
+        for (id, name) in [(1, "carol"), (2, "alice"), (3, "bob")] {
+            run(storage, &format!("INSERT INTO t VALUES ({id}, '{name}')")).expect("insert");
+        }
+    }
+
+    #[test]
+    fn order_by_ascending_sorts_a_varchar_column() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        let result = run(&storage, "SELECT name FROM t ORDER BY name").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![vc("alice")], vec![vc("bob")], vec![vc("carol")]]
+        );
+    }
+
+    #[test]
+    fn order_by_descending_reverses_the_order() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        let result = run(&storage, "SELECT name FROM t ORDER BY name DESC").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![vc("carol")], vec![vc("bob")], vec![vc("alice")]]
+        );
+    }
+
+    #[test]
+    fn order_by_can_reference_a_column_not_in_the_projection() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        // Sorted by `id` (descending) even though only `name` is projected.
+        let result = run(&storage, "SELECT name FROM t ORDER BY id DESC").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![vc("bob")], vec![vc("alice")], vec![vc("carol")]]
+        );
+    }
+
+    #[test]
+    fn order_by_sorts_null_first_ascending() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT, b VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, 'b')").expect("insert");
+        run(&storage, "INSERT INTO t VALUES (2, NULL)").expect("insert");
+        run(&storage, "INSERT INTO t VALUES (3, 'a')").expect("insert");
+        let result = run(&storage, "SELECT b FROM t ORDER BY b").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Null], vec![vc("a")], vec![vc("b")]]
+        );
+    }
+
+    #[test]
+    fn order_by_numeric_column_sorts_numerically_not_lexically() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT)").expect("create");
+        for v in ["9", "10", "1", "20"] {
+            run(&storage, &format!("INSERT INTO t VALUES ({v})")).expect("insert");
+        }
+        let result = run(&storage, "SELECT id FROM t ORDER BY id").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![int(1)], vec![int(9)], vec![int(10)], vec![int(20)]]
+        );
+    }
+
+    #[test]
+    fn order_by_multiple_columns_breaks_ties_with_the_second_key() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT, b INT)").expect("create");
+        for (a, b) in [(1, 2), (1, 1), (2, 1)] {
+            run(&storage, &format!("INSERT INTO t VALUES ({a}, {b})")).expect("insert");
+        }
+        let result = run(&storage, "SELECT a, b FROM t ORDER BY a, b").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![int(1), int(1)],
+                vec![int(1), int(2)],
+                vec![int(2), int(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_unknown_column_errors() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "SELECT a FROM t ORDER BY bogus"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn limit_caps_the_row_count() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        let result = run(&storage, "SELECT id FROM t ORDER BY id LIMIT 2").expect("select");
+        assert_eq!(result.rows, vec![vec![int(1)], vec![int(2)]]);
+    }
+
+    #[test]
+    fn limit_zero_returns_no_rows() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        let result = run(&storage, "SELECT id FROM t LIMIT 0").expect("select");
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn offset_skips_leading_rows() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        let result =
+            run(&storage, "SELECT id FROM t ORDER BY id LIMIT 10 OFFSET 1").expect("select");
+        assert_eq!(result.rows, vec![vec![int(2)], vec![int(3)]]);
+    }
+
+    #[test]
+    fn offset_past_the_end_returns_no_rows() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        let result = run(&storage, "SELECT id FROM t LIMIT 10 OFFSET 100").expect("select");
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn limit_comma_offset_form_pages_correctly() {
+        let storage = InMemoryStorage::new();
+        seed_order_by_table(&storage);
+        // `LIMIT 1, 2` = skip 1, take 2.
+        let result = run(&storage, "SELECT id FROM t ORDER BY id LIMIT 1, 2").expect("select");
+        assert_eq!(result.rows, vec![vec![int(2)], vec![int(3)]]);
+    }
+
+    #[test]
+    fn limit_without_from_clause_caps_the_single_row() {
+        let storage = InMemoryStorage::new();
+        assert_eq!(
+            run(&storage, "SELECT 1 LIMIT 1").expect("select").rows,
+            vec![vec![int(1)]]
+        );
+        assert!(run(&storage, "SELECT 1 LIMIT 0")
+            .expect("select")
+            .rows
+            .is_empty());
+        // `OFFSET` is only valid as part of a `LIMIT` clause, same as MySQL.
+        assert!(run(&storage, "SELECT 1 LIMIT 1 OFFSET 1")
             .expect("select")
             .rows
             .is_empty());

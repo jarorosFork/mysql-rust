@@ -280,6 +280,35 @@ so they come last in the phase — the roadmap's "order can flex" applies).
       proven locally each iteration.)_
 - [ ] **Acceptance:** all gates pass; declare production-ready in PROGRESS.md.
 
+## Phase 11 — Core SQL completeness
+
+Prompted by real GUI-client usage (DBeaver) surfacing how much of everyday
+SQL the Phase 4/5 subset doesn't cover yet. Scoped down from a much broader
+ask (a MariaDB quickstart-guide index spanning ~25 topics — full string/
+date-time function libraries, `LOAD DATA INFILE`, `mariadb-dump` import/
+export, `VIEW`s) to the pieces that matter for typical GUI/app usage; the
+rest stays a known, explicit gap rather than an unstated one.
+
+- [x] `ORDER BY` (multi-column, `ASC`/`DESC`) and `LIMIT`/`OFFSET` (both
+      `LIMIT n OFFSET m` and `LIMIT m, n` forms).
+      _(`OrderByItem` sorts on the full pre-projection row (so `ORDER BY` may
+      name a column outside the `SELECT` list), applied before `LIMIT`/
+      `OFFSET` slicing — matching real evaluation order. New `value_ordering`
+      gives `NULL` a definite sort position (first, ascending — matching
+      MySQL) distinct from `compare_values`'s WHERE-clause 3-valued logic,
+      which they now share via one comparison core. Proof: 21 new tests
+      (7 parser + 13 executor + 1 real-driver conformance case covering a
+      GUI's column-sort-click and page-through-results); 329 total, fmt +
+      clippy `-D warnings` clean.)_
+- [ ] More column types: `DATE`, `DECIMAL`, `BOOLEAN`.
+- [ ] `GROUP BY` + aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`).
+- [ ] `JOIN` (`INNER`, `LEFT`) — includes qualified column references
+      (`table.column`/`alias.column`), deferred until now since they only
+      matter once more than one table is in play.
+- [ ] `ALTER TABLE` (`ADD`/`DROP`/`MODIFY COLUMN`, add/drop a constraint).
+- [ ] **Acceptance:** each item above has passing unit tests and a real-driver
+      conformance test; fmt/clippy/full suite green throughout.
+
 ---
 
 ## Async runtime note
