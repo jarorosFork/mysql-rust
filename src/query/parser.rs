@@ -38,6 +38,20 @@ pub enum Statement {
     Use,
     /// `SHOW ...` — limited introspection (see [`ShowStatement`]).
     Show(ShowStatement),
+    /// `CREATE DATABASE [IF NOT EXISTS] <name> [...]` — any `CHARACTER SET`/
+    /// `COLLATE` clause is parsed and discarded (this server has exactly one
+    /// charset/collation). Database names are a lightweight, in-memory-only
+    /// namespace registry; table storage itself remains flat/global, unchanged
+    /// from before this existed (see `storage::Storage`).
+    CreateDatabase {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP DATABASE [IF EXISTS] <name>`.
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 /// The recognized forms of `SHOW`. Anything not modelled here parses to
@@ -48,7 +62,13 @@ pub enum ShowStatement {
     Databases,
     Tables,
     Warnings,
-    Variables { like: Option<String> },
+    Variables {
+        like: Option<String>,
+    },
+    /// `SHOW CHARACTER SET` / `SHOW CHARSET`.
+    CharacterSet,
+    /// `SHOW COLLATION`.
+    Collation,
     Other,
 }
 
@@ -169,6 +189,7 @@ enum Keyword {
     Use,
     Show,
     As,
+    Drop,
 }
 
 fn keyword_text(kw: Keyword) -> String {
@@ -197,6 +218,7 @@ fn keyword_from_ident(s: &str) -> Option<Keyword> {
         "USE" => Some(Keyword::Use),
         "SHOW" => Some(Keyword::Show),
         "AS" => Some(Keyword::As),
+        "DROP" => Some(Keyword::Drop),
         _ => None,
     }
 }
@@ -505,6 +527,13 @@ fn scan_string_literal(chars: &[char]) -> Result<(String, usize)> {
     Ok((s, n))
 }
 
+/// Whether `token` is the (non-reserved) identifier `DATABASE`,
+/// case-insensitively — used to disambiguate `CREATE TABLE` from
+/// `CREATE DATABASE` with one token of lookahead.
+fn is_database_ident(token: &Token) -> bool {
+    matches!(token, Token::Ident(s) if s.eq_ignore_ascii_case("DATABASE"))
+}
+
 // ---------- Parser ----------
 
 struct Parser<'a> {
@@ -538,6 +567,50 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         t
+    }
+
+    /// Peek `offset` tokens ahead of the current position (0 = same as `peek`).
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset)
+    }
+
+    /// Whether the next token is a plain identifier equal to `word`,
+    /// case-insensitively. Used for the small set of clause words (`DATABASE`,
+    /// `IF`, `NOT`, `EXISTS`, ...) that aren't reserved keywords — so they
+    /// remain valid as ordinary column/table names elsewhere.
+    fn peek_is_ident_ci(&self, word: &str) -> bool {
+        matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
+    }
+
+    fn expect_ident_ci(&mut self, word: &str) -> Result<()> {
+        match self.advance() {
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word) => Ok(()),
+            other => Err(Error::Parse(format!(
+                "expected '{word}', found {}",
+                describe(other)
+            ))),
+        }
+    }
+
+    /// Consume an optional `IF NOT EXISTS`, reporting whether it was present.
+    fn eat_if_not_exists(&mut self) -> Result<bool> {
+        if !self.peek_is_ident_ci("IF") {
+            return Ok(false);
+        }
+        self.pos += 1;
+        self.expect_ident_ci("NOT")?;
+        self.expect_ident_ci("EXISTS")?;
+        Ok(true)
+    }
+
+    /// Consume an optional `IF EXISTS`, reporting whether it was present.
+    fn eat_if_exists(&mut self) -> Result<bool> {
+        if !self.peek_is_ident_ci("IF") {
+            return Ok(false);
+        }
+        self.pos += 1;
+        self.expect_ident_ci("EXISTS")?;
+        Ok(true)
     }
 
     fn expect_keyword(&mut self, kw: Keyword) -> Result<()> {
@@ -587,7 +660,14 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek() {
-            Some(Token::Keyword(Keyword::Create)) => self.parse_create_table(),
+            Some(Token::Keyword(Keyword::Create)) => {
+                if self.peek_at(1).is_some_and(is_database_ident) {
+                    self.parse_create_database()
+                } else {
+                    self.parse_create_table()
+                }
+            }
+            Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_database(),
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(Token::Keyword(Keyword::Select)) => self.parse_select(),
             Some(Token::Keyword(Keyword::Begin)) => self.parse_begin(),
@@ -602,10 +682,36 @@ impl<'a> Parser<'a> {
             Some(Token::Keyword(Keyword::Use)) => self.parse_use(),
             Some(Token::Keyword(Keyword::Show)) => self.parse_show(),
             other => Err(Error::Parse(format!(
-                "expected CREATE, INSERT, SELECT, BEGIN, START, COMMIT, ROLLBACK, SET, USE, or SHOW, found {}",
+                "expected CREATE, DROP, INSERT, SELECT, BEGIN, START, COMMIT, ROLLBACK, SET, USE, or SHOW, found {}",
                 describe(other)
             ))),
         }
+    }
+
+    /// `CREATE DATABASE [IF NOT EXISTS] <name> [[DEFAULT] CHARACTER SET [=] x]
+    /// [[DEFAULT] COLLATE [=] y]` — the charset/collate clause is parsed only
+    /// to be discarded (this server has exactly one charset/collation).
+    fn parse_create_database(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Create)?;
+        self.expect_ident_ci("DATABASE")?;
+        let if_not_exists = self.eat_if_not_exists()?;
+        let name = self.expect_ident()?;
+        self.consume_to_statement_end();
+        self.eat_semicolon_and_ensure_end()?;
+        Ok(Statement::CreateDatabase {
+            name,
+            if_not_exists,
+        })
+    }
+
+    /// `DROP DATABASE [IF EXISTS] <name>`.
+    fn parse_drop_database(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Drop)?;
+        self.expect_ident_ci("DATABASE")?;
+        let if_exists = self.eat_if_exists()?;
+        let name = self.expect_ident()?;
+        self.eat_semicolon_and_ensure_end()?;
+        Ok(Statement::DropDatabase { name, if_exists })
     }
 
     /// `SET ...` — consume and ignore the rest of the statement. Covers the
@@ -650,6 +756,13 @@ impl<'a> Parser<'a> {
             Some("WARNINGS") | Some("ERRORS") => ShowStatement::Warnings,
             Some("DATABASES") | Some("SCHEMAS") => ShowStatement::Databases,
             Some("TABLES") => ShowStatement::Tables,
+            Some("CHARSET") => ShowStatement::CharacterSet,
+            // "CHARACTER SET": SET is a reserved keyword, not an Ident, so the
+            // second word doesn't match through `head`'s Ident-only lookahead.
+            Some("CHARACTER") if matches!(self.peek_at(1), Some(Token::Keyword(Keyword::Set))) => {
+                ShowStatement::CharacterSet
+            }
+            Some("COLLATION") => ShowStatement::Collation,
             Some("VARIABLES") | Some("STATUS") => {
                 self.pos += 1; // consume the head word
                 let like = self.parse_optional_like()?;
@@ -1545,6 +1658,72 @@ mod tests {
             }
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    // ---- CREATE/DROP DATABASE, SHOW CHARACTER SET/COLLATION ----
+
+    #[test]
+    fn create_database_basic_and_if_not_exists() {
+        assert_eq!(
+            parse("CREATE DATABASE mydb").unwrap(),
+            Statement::CreateDatabase {
+                name: "mydb".to_string(),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            parse("CREATE DATABASE IF NOT EXISTS mydb").unwrap(),
+            Statement::CreateDatabase {
+                name: "mydb".to_string(),
+                if_not_exists: true,
+            }
+        );
+        // Case-insensitive, and CREATE TABLE is unaffected by the lookahead.
+        assert!(parse("create database mydb").is_ok());
+        assert!(parse("CREATE TABLE t (a INT)").is_ok());
+    }
+
+    #[test]
+    fn create_database_discards_charset_and_collate_clauses() {
+        assert!(parse("CREATE DATABASE mydb DEFAULT CHARACTER SET utf8mb4").is_ok());
+        assert!(
+            parse("CREATE DATABASE mydb CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn drop_database_basic_and_if_exists() {
+        assert_eq!(
+            parse("DROP DATABASE mydb").unwrap(),
+            Statement::DropDatabase {
+                name: "mydb".to_string(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            parse("DROP DATABASE IF EXISTS mydb").unwrap(),
+            Statement::DropDatabase {
+                name: "mydb".to_string(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn show_character_set_and_charset_and_collation() {
+        assert_eq!(
+            parse("SHOW CHARACTER SET").unwrap(),
+            Statement::Show(ShowStatement::CharacterSet)
+        );
+        assert_eq!(
+            parse("SHOW CHARSET").unwrap(),
+            Statement::Show(ShowStatement::CharacterSet)
+        );
+        assert_eq!(
+            parse("SHOW COLLATION").unwrap(),
+            Statement::Show(ShowStatement::Collation)
+        );
     }
 
     #[test]

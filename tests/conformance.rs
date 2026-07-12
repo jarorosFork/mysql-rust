@@ -199,6 +199,51 @@ async fn real_driver_handles_jdbc_style_connection_boilerplate() {
 }
 
 #[tokio::test]
+async fn real_driver_creates_and_drops_a_database() {
+    // The exact regression this guards: a GUI client's "create database"
+    // action first reads SHOW CHARACTER SET / SHOW COLLATION to populate its
+    // dialog (previously empty, which crashed the client with no SQL error at
+    // all — nothing for the server to even reject), then actually issues
+    // CREATE DATABASE. Drive the whole sequence through the real driver.
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    // Charset, Description, Default collation, Maxlen.
+    let charsets: Vec<(String, String, String, i32)> = conn
+        .query("SHOW CHARACTER SET")
+        .await
+        .expect("SHOW CHARACTER SET");
+    assert!(!charsets.is_empty(), "charset list must not be empty");
+
+    // Collation, Charset, Id, Default, Compiled, Sortlen.
+    let collations: Vec<(String, String, i32, String, String, i32)> =
+        conn.query("SHOW COLLATION").await.expect("SHOW COLLATION");
+    assert!(!collations.is_empty(), "collation list must not be empty");
+
+    conn.query_drop("CREATE DATABASE IF NOT EXISTS my_new_db")
+        .await
+        .expect("CREATE DATABASE");
+    let databases: Vec<String> = conn.query("SHOW DATABASES").await.expect("SHOW DATABASES");
+    assert!(databases.contains(&"my_new_db".to_string()));
+
+    conn.query_drop("DROP DATABASE my_new_db")
+        .await
+        .expect("DROP DATABASE");
+    let databases: Vec<String> = conn.query("SHOW DATABASES").await.expect("SHOW DATABASES");
+    assert!(!databases.contains(&"my_new_db".to_string()));
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
+#[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`
     // produces — built through the same `from_env` code path, but with an

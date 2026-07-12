@@ -43,4 +43,20 @@ pub trait Storage {
     /// Returns `Ok(None)` if the table has no matching row (or no primary
     /// key at all — callers should check `table_schema` first).
     fn lookup_by_primary_key(&self, table: &str, key: &Value) -> Result<Option<Vec<Value>>>;
+
+    /// Register a database name. Errors if it already exists, unless
+    /// `if_not_exists` is set (in which case that's a silent no-op, matching
+    /// `CREATE DATABASE IF NOT EXISTS`). This is a lightweight namespace
+    /// registry only — table storage itself stays flat/global regardless of
+    /// which database name is "current" (this server has no `USE`-scoped
+    /// table separation); it exists so `CREATE`/`DROP`/`SHOW DATABASES`, which
+    /// standard clients and GUI tools issue, work rather than error.
+    fn create_database(&self, name: &str, if_not_exists: bool) -> Result<()>;
+
+    /// Unregister a database name. Errors if it doesn't exist, unless
+    /// `if_exists` is set.
+    fn drop_database(&self, name: &str, if_exists: bool) -> Result<()>;
+
+    /// Return the names of all registered databases.
+    fn databases(&self) -> Result<Vec<String>>;
 }

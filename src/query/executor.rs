@@ -99,6 +99,17 @@ impl<'a> Executor<'a> {
             // not modelled, so they have no effect but must not error.
             Statement::Set | Statement::Use => Ok(QueryResult::default()),
             Statement::Show(show) => self.execute_show(show),
+            Statement::CreateDatabase {
+                name,
+                if_not_exists,
+            } => {
+                self.storage.create_database(&name, if_not_exists)?;
+                Ok(QueryResult::default())
+            }
+            Statement::DropDatabase { name, if_exists } => {
+                self.storage.drop_database(&name, if_exists)?;
+                Ok(QueryResult::default())
+            }
         }
     }
 
@@ -109,10 +120,60 @@ impl<'a> Executor<'a> {
             name: name.to_string(),
             column_type: ColumnType::Varchar,
         };
+        let int_col = |name: &str| ColumnSchema {
+            name: name.to_string(),
+            column_type: ColumnType::Int,
+        };
         match show {
-            ShowStatement::Databases => Ok(QueryResult {
-                columns: vec![text_col("Database")],
-                rows: Vec::new(),
+            ShowStatement::Databases => {
+                let mut names = self.storage.databases()?;
+                names.sort();
+                Ok(QueryResult {
+                    columns: vec![text_col("Database")],
+                    rows: names.into_iter().map(|d| vec![Value::Varchar(d)]).collect(),
+                    rows_affected: 0,
+                })
+            }
+            // A single row describing the one charset/collation this server
+            // supports (`utf8mb4`/`utf8mb4_general_ci`, matching the handshake
+            // — see `protocol::handshake::DEFAULT_CHARACTER_SET`). Real MySQL
+            // lists many; a GUI client populating a charset/collation picker
+            // (e.g. a "create database" dialog) just needs a non-empty,
+            // correctly-shaped result to pick a default from — an empty result
+            // is what previously made such dialogs fail with a client-side
+            // null-pointer error before any SQL was even sent.
+            ShowStatement::CharacterSet => Ok(QueryResult {
+                columns: vec![
+                    text_col("Charset"),
+                    text_col("Description"),
+                    text_col("Default collation"),
+                    int_col("Maxlen"),
+                ],
+                rows: vec![vec![
+                    Value::Varchar("utf8mb4".to_string()),
+                    Value::Varchar("UTF-8 Unicode".to_string()),
+                    Value::Varchar("utf8mb4_general_ci".to_string()),
+                    Value::Int(4),
+                ]],
+                rows_affected: 0,
+            }),
+            ShowStatement::Collation => Ok(QueryResult {
+                columns: vec![
+                    text_col("Collation"),
+                    text_col("Charset"),
+                    int_col("Id"),
+                    text_col("Default"),
+                    text_col("Compiled"),
+                    int_col("Sortlen"),
+                ],
+                rows: vec![vec![
+                    Value::Varchar("utf8mb4_general_ci".to_string()),
+                    Value::Varchar("utf8mb4".to_string()),
+                    Value::Int(45),
+                    Value::Varchar("Yes".to_string()),
+                    Value::Varchar("Yes".to_string()),
+                    Value::Int(1),
+                ]],
                 rows_affected: 0,
             }),
             ShowStatement::Tables => {
@@ -680,6 +741,54 @@ mod tests {
         let storage = InMemoryStorage::new();
         let result = run(&storage, "SELECT DATABASE()").expect("execute");
         assert_eq!(result.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn create_drop_and_show_databases_round_trip() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE DATABASE mydb").expect("CREATE DATABASE");
+        // Duplicate without IF NOT EXISTS errors.
+        assert!(matches!(
+            run(&storage, "CREATE DATABASE mydb"),
+            Err(Error::Execution(_))
+        ));
+        // IF NOT EXISTS makes the duplicate a no-op.
+        run(&storage, "CREATE DATABASE IF NOT EXISTS mydb").expect("idempotent create");
+
+        let shown = run(&storage, "SHOW DATABASES").expect("SHOW DATABASES");
+        assert_eq!(shown.rows, vec![vec![vc("mydb")]]);
+
+        run(&storage, "DROP DATABASE mydb").expect("DROP DATABASE");
+        let shown = run(&storage, "SHOW DATABASES").expect("SHOW DATABASES");
+        assert!(shown.rows.is_empty());
+
+        // Dropping again without IF EXISTS errors; with it, a silent no-op.
+        assert!(matches!(
+            run(&storage, "DROP DATABASE mydb"),
+            Err(Error::Execution(_))
+        ));
+        run(&storage, "DROP DATABASE IF EXISTS mydb").expect("idempotent drop");
+    }
+
+    #[test]
+    fn show_character_set_and_collation_are_non_empty() {
+        // The specific regression this guards: DBeaver's "create database"
+        // dialog reads these to populate a charset/collation picker, and an
+        // empty result (the old ShowStatement::Other fallback) made its own
+        // client-side code null-pointer before ever sending more SQL.
+        let storage = InMemoryStorage::new();
+
+        let charsets = run(&storage, "SHOW CHARACTER SET").expect("SHOW CHARACTER SET");
+        assert!(!charsets.rows.is_empty());
+        assert_eq!(
+            charsets.column_names(),
+            vec!["Charset", "Description", "Default collation", "Maxlen"]
+        );
+        assert_eq!(charsets.rows[0][0], vc("utf8mb4"));
+
+        let collations = run(&storage, "SHOW COLLATION").expect("SHOW COLLATION");
+        assert!(!collations.rows.is_empty());
+        assert_eq!(collations.rows[0][0], vc("utf8mb4_general_ci"));
     }
 
     #[test]

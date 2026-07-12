@@ -1,7 +1,7 @@
 //! An in-memory storage backend with an optional on-disk log for
 //! persistence (see `storage::log`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -103,6 +103,13 @@ pub struct InMemoryStorage {
     /// itself is only ever held for the instant it takes to look up or
     /// insert an `Arc`, never across an `.await`.
     table_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Registered database names (see `Storage::create_database`). Unlike
+    /// tables, this is **not** persisted to the log or across a restart: it's
+    /// a lightweight compatibility namespace, not a real schema-separation
+    /// feature, and table data was never partitioned by database to begin
+    /// with (so nothing about table data is affected by this being in-memory
+    /// only).
+    databases: RwLock<HashSet<String>>,
 }
 
 impl InMemoryStorage {
@@ -120,6 +127,7 @@ impl InMemoryStorage {
             tables: RwLock::new(tables),
             log: Mutex::new(Some(log)),
             table_locks: tokio::sync::Mutex::new(HashMap::new()),
+            databases: RwLock::new(HashSet::new()),
         })
     }
 
@@ -241,6 +249,37 @@ impl Storage for InMemoryStorage {
             .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
         Ok(t.index.get(key).map(|&idx| t.rows[idx].clone()))
     }
+
+    fn create_database(&self, name: &str, if_not_exists: bool) -> Result<()> {
+        let mut databases = self.databases.write().unwrap_or_else(|e| e.into_inner());
+        if databases.contains(name) {
+            return if if_not_exists {
+                Ok(())
+            } else {
+                Err(Error::Execution(format!(
+                    "Can't create database '{name}'; database exists"
+                )))
+            };
+        }
+        databases.insert(name.to_string());
+        Ok(())
+    }
+
+    fn drop_database(&self, name: &str, if_exists: bool) -> Result<()> {
+        let mut databases = self.databases.write().unwrap_or_else(|e| e.into_inner());
+        if databases.remove(name) || if_exists {
+            Ok(())
+        } else {
+            Err(Error::Execution(format!(
+                "Can't drop database '{name}'; database doesn't exist"
+            )))
+        }
+    }
+
+    fn databases(&self) -> Result<Vec<String>> {
+        let databases = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        Ok(databases.iter().cloned().collect())
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +372,32 @@ mod tests {
         assert!(storage
             .lookup_by_primary_key("missing", &Value::Int(1))
             .is_err());
+    }
+
+    #[test]
+    fn create_database_then_list_it() {
+        let storage = InMemoryStorage::new();
+        storage.create_database("mydb", false).unwrap();
+        assert_eq!(storage.databases().unwrap(), vec!["mydb".to_string()]);
+    }
+
+    #[test]
+    fn create_database_rejects_duplicate_unless_if_not_exists() {
+        let storage = InMemoryStorage::new();
+        storage.create_database("mydb", false).unwrap();
+        assert!(storage.create_database("mydb", false).is_err());
+        storage.create_database("mydb", true).unwrap(); // no-op, not an error
+    }
+
+    #[test]
+    fn drop_database_removes_it_and_rejects_missing_unless_if_exists() {
+        let storage = InMemoryStorage::new();
+        storage.create_database("mydb", false).unwrap();
+        storage.drop_database("mydb", false).unwrap();
+        assert!(storage.databases().unwrap().is_empty());
+
+        assert!(storage.drop_database("mydb", false).is_err());
+        storage.drop_database("mydb", true).unwrap(); // no-op, not an error
     }
 
     #[test]

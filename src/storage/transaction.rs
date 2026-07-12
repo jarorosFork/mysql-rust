@@ -180,6 +180,21 @@ impl Storage for Transaction {
             .get(table)
             .and_then(|rows| rows.iter().find(|r| &r[pk_idx] == key).cloned()))
     }
+
+    // Database-name registration isn't part of the buffered-write model at
+    // all (unlike table rows) — same as `create_table`, it goes straight to
+    // the real storage, "auto-committing" immediately.
+    fn create_database(&self, name: &str, if_not_exists: bool) -> Result<()> {
+        self.storage.create_database(name, if_not_exists)
+    }
+
+    fn drop_database(&self, name: &str, if_exists: bool) -> Result<()> {
+        self.storage.drop_database(name, if_exists)
+    }
+
+    fn databases(&self) -> Result<Vec<String>> {
+        self.storage.databases()
+    }
 }
 
 #[cfg(test)]
