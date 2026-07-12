@@ -390,6 +390,88 @@ async fn real_driver_order_by_limit_offset() {
     drop(server);
 }
 
+/// `DECIMAL`/`DATE`/`BOOLEAN` (Phase 11): exact fixed-point money math, a
+/// calendar date sorting/filtering correctly, and BOOLEAN as the plain INT
+/// alias real MySQL treats it as. Both `Decimal` and `Date` are wire-encoded
+/// as text (see `server::connection::value_to_cell`), so the driver reads
+/// them back as ordinary strings/ints — exactly what a real client does.
+#[tokio::test]
+async fn real_driver_decimal_date_and_boolean() {
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    conn.query_drop(
+        "CREATE TABLE orders (\n\
+         \tid INT AUTO_INCREMENT PRIMARY KEY,\n\
+         \ttotal DECIMAL(10,2) NOT NULL,\n\
+         \tplaced_on DATE NOT NULL,\n\
+         \tpaid BOOLEAN NOT NULL\n\
+         )",
+    )
+    .await
+    .expect("CREATE TABLE with DECIMAL/DATE/BOOLEAN columns");
+
+    conn.query_drop(
+        "INSERT INTO orders (total, placed_on, paid) VALUES \
+         (19.99, '2024-01-15', TRUE), \
+         (5, '2023-12-25', FALSE), \
+         (100.005, '2024-06-01', TRUE)",
+    )
+    .await
+    .expect("INSERT with decimal/date/boolean literals");
+
+    // DECIMAL round-trips as exact text — no float rounding artifacts (a
+    // real f64 can't even represent 19.99 exactly; a driver reading this
+    // value as a string proves the server never went through one).
+    let totals: Vec<String> = conn
+        .query("SELECT total FROM orders ORDER BY id")
+        .await
+        .expect("SELECT total");
+    // 5 (int) normalizes to the column's scale; 100.005 rounds to 100.01
+    // (half-away-from-zero) at scale 2.
+    assert_eq!(totals, vec!["19.99", "5.00", "100.01"]);
+
+    // DATE orders chronologically (not insertion order).
+    let dates: Vec<String> = conn
+        .query("SELECT placed_on FROM orders ORDER BY placed_on")
+        .await
+        .expect("SELECT placed_on ORDER BY");
+    assert_eq!(dates, vec!["2023-12-25", "2024-01-15", "2024-06-01"]);
+
+    // BOOLEAN reads back as a plain integer 0/1.
+    let paid_flags: Vec<i32> = conn
+        .query("SELECT paid FROM orders ORDER BY id")
+        .await
+        .expect("SELECT paid");
+    assert_eq!(paid_flags, vec![1, 0, 1]);
+
+    // A DECIMAL WHERE filter compares numerically, not lexically.
+    let expensive: Vec<String> = conn
+        .query("SELECT total FROM orders WHERE total > 10.00 ORDER BY total")
+        .await
+        .expect("SELECT ... WHERE total > 10.00");
+    assert_eq!(expensive, vec!["19.99", "100.01"]);
+
+    // A malformed date is a clean ERR, not a crash.
+    let bad_date = conn
+        .query_drop("INSERT INTO orders (total, placed_on, paid) VALUES (1.00, 'not-a-date', TRUE)")
+        .await;
+    assert!(
+        bad_date.is_err(),
+        "a malformed DATE literal must be rejected"
+    );
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
 #[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`

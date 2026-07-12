@@ -120,6 +120,40 @@ const ENTRIES: &[Entry] = &[
         name: "verify the committed row is visible",
         sql: "SELECT name FROM customers WHERE name = 'Margaret Hamilton'",
     },
+    // ---- Phase 11: DECIMAL / DATE / BOOLEAN ----
+    Entry {
+        name: "create table with DECIMAL, DATE, and BOOLEAN columns",
+        sql: "CREATE TABLE orders (\n\
+              \tid INT AUTO_INCREMENT PRIMARY KEY,\n\
+              \ttotal DECIMAL(10,2) NOT NULL,\n\
+              \tplaced_on DATE NOT NULL,\n\
+              \tpaid BOOLEAN NOT NULL\n\
+              )",
+    },
+    Entry {
+        name: "insert decimal/date/boolean literals (incl. an int and an \
+               over-precise decimal, both normalized to the column's scale)",
+        sql: "INSERT INTO orders (total, placed_on, paid) VALUES \
+              (19.99, '2024-01-15', TRUE), \
+              (5, '2023-12-25', FALSE), \
+              (100.005, '2024-06-01', TRUE)",
+    },
+    Entry {
+        name: "select decimal total (exact — no float rounding artifacts)",
+        sql: "SELECT total FROM orders ORDER BY id",
+    },
+    Entry {
+        name: "select date, ORDER BY chronologically (not insertion order)",
+        sql: "SELECT placed_on FROM orders ORDER BY placed_on",
+    },
+    Entry {
+        name: "select boolean (reads back as plain 0/1)",
+        sql: "SELECT paid FROM orders ORDER BY id",
+    },
+    Entry {
+        name: "WHERE on a decimal column compares numerically, not lexically",
+        sql: "SELECT total FROM orders WHERE total > 10.00 ORDER BY total",
+    },
     Entry {
         name: "drop schema (cleanup)",
         sql: "DROP SCHEMA IF EXISTS shop_alt",

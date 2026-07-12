@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::query::parser::{
     ColumnDef, CompareOp, Condition, Expr, OrderByItem, SelectItem, ShowStatement, Statement,
 };
-use crate::storage::{ColumnSchema, ColumnType, Storage, Value};
+use crate::storage::{format_decimal, ColumnSchema, ColumnType, Storage, Value};
 use crate::{Error, Result};
 
 /// A single row in a result set: one typed value per column.
@@ -362,6 +362,10 @@ impl<'a> Executor<'a> {
 
             let (default_name, value) = match expr {
                 Expr::Integer(n) => (n.to_string(), Value::Int(n)),
+                Expr::Decimal(unscaled, scale) => (
+                    format_decimal(unscaled, scale),
+                    Value::Decimal(unscaled, scale),
+                ),
                 Expr::String(s) => (s.clone(), Value::Varchar(s)),
                 Expr::Null => ("NULL".to_string(), Value::Null),
                 Expr::SystemVariable(name) => (format!("@@{name}"), self.system_variable(&name)),
@@ -384,7 +388,9 @@ impl<'a> Executor<'a> {
             // column so clients read them as numbers, not strings.
             let column_type = match &value {
                 Value::Int(_) => ColumnType::Int,
-                _ => ColumnType::Varchar,
+                Value::Decimal(_, scale) => ColumnType::Decimal(*scale),
+                Value::Date(_) => ColumnType::Date,
+                Value::Varchar(_) | Value::Null => ColumnType::Varchar,
             };
             columns.push(ColumnSchema {
                 name: alias.unwrap_or(default_name),
@@ -682,7 +688,10 @@ fn reorder_exprs(
 /// following MySQL's permissive-but-checked conversions: a numeric string
 /// into an INT column is parsed, an integer into a VARCHAR column is
 /// stringified, and `NULL` is always allowed at this stage (primary-key
-/// not-null is enforced by the caller).
+/// not-null is enforced by the caller). Every `Decimal` value that reaches
+/// storage is rescaled to `column`'s own declared scale here, so any two
+/// values ever compared/hashed for one column already share a scale — see
+/// `storage::Value::Decimal`.
 fn coerce(expr: &Expr, column_type: ColumnType, column_name: &str) -> Result<Value> {
     match (expr, column_type) {
         (Expr::Null, _) => Ok(Value::Null),
@@ -694,6 +703,28 @@ fn coerce(expr: &Expr, column_type: ColumnType, column_name: &str) -> Result<Val
                 "Incorrect integer value: '{s}' for column '{column_name}'"
             ))
         }),
+        (Expr::Integer(n), ColumnType::Decimal(scale)) => {
+            rescale_decimal(*n, 0, scale, column_name).map(|u| Value::Decimal(u, scale))
+        }
+        (Expr::Decimal(unscaled, lit_scale), ColumnType::Decimal(scale)) => {
+            rescale_decimal(*unscaled, *lit_scale, scale, column_name)
+                .map(|u| Value::Decimal(u, scale))
+        }
+        (Expr::Decimal(unscaled, lit_scale), ColumnType::Int) => {
+            rescale_decimal(*unscaled, *lit_scale, 0, column_name).map(Value::Int)
+        }
+        (Expr::Decimal(unscaled, lit_scale), ColumnType::Varchar) => {
+            Ok(Value::Varchar(format_decimal(*unscaled, *lit_scale)))
+        }
+        (Expr::String(s), ColumnType::Decimal(scale)) => {
+            let (unscaled, lit_scale) = parse_decimal_literal(s, column_name)?;
+            rescale_decimal(unscaled, lit_scale, scale, column_name)
+                .map(|u| Value::Decimal(u, scale))
+        }
+        (Expr::String(s), ColumnType::Date) => parse_date_literal(s, column_name).map(Value::Date),
+        (Expr::Integer(_) | Expr::Decimal(..), ColumnType::Date) => Err(Error::Execution(format!(
+            "Incorrect date value for column '{column_name}': expected a 'YYYY-MM-DD' string"
+        ))),
         (Expr::SystemVariable(_) | Expr::Column(_) | Expr::Function(..), _) => {
             Err(Error::Execution(format!(
                 "a literal value is required for column '{column_name}'"
@@ -708,6 +739,99 @@ fn coerce(expr: &Expr, column_type: ColumnType, column_name: &str) -> Result<Val
     }
 }
 
+/// Convert a fixed-point value from `from_scale` to `to_scale` (widening
+/// multiplies; narrowing rounds half-away-from-zero), with checked
+/// arithmetic throughout so an absurd scale/magnitude combination is a clean
+/// `Error::Execution`, never an overflow panic.
+fn rescale_decimal(unscaled: i64, from_scale: u8, to_scale: u8, column_name: &str) -> Result<i64> {
+    let out_of_range = || {
+        Error::Execution(format!(
+            "decimal value out of range for column '{column_name}'"
+        ))
+    };
+    if to_scale >= from_scale {
+        let factor = 10i64
+            .checked_pow(u32::from(to_scale - from_scale))
+            .ok_or_else(out_of_range)?;
+        unscaled.checked_mul(factor).ok_or_else(out_of_range)
+    } else {
+        let divisor = 10u64
+            .checked_pow(u32::from(from_scale - to_scale))
+            .ok_or_else(out_of_range)?;
+        let magnitude = unscaled.unsigned_abs();
+        let rounded = (magnitude + divisor / 2) / divisor;
+        let rounded = i64::try_from(rounded).map_err(|_| out_of_range())?;
+        Ok(if unscaled < 0 { -rounded } else { rounded })
+    }
+}
+
+/// Parse a numeric string like `"123.45"`, `"-5"`, or `".5"` into
+/// `(unscaled, scale)` at the scale as written (not yet rescaled to any
+/// column). Used when a decimal value arrives as text (a quoted SQL string
+/// literal, or a prepared-statement string parameter).
+fn parse_decimal_literal(s: &str, column_name: &str) -> Result<(i64, u8)> {
+    let invalid = || {
+        Error::Execution(format!(
+            "Incorrect decimal value: '{s}' for column '{column_name}'"
+        ))
+    };
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (rest, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(invalid());
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    if frac_part.len() > u8::MAX as usize {
+        return Err(invalid());
+    }
+    let magnitude: i64 = format!("{int_part}{frac_part}")
+        .parse()
+        .map_err(|_| invalid())?;
+    Ok((
+        if negative { -magnitude } else { magnitude },
+        frac_part.len() as u8,
+    ))
+}
+
+/// Validate a `'YYYY-MM-DD'` date literal: exactly that shape, month `01`-`12`,
+/// day `01`-`31`. No calendar-correctness check beyond that (e.g. `2024-02-30`
+/// is accepted) — this server does no date arithmetic that would need it
+/// (see ROADMAP.md Phase 11's cut list), so it isn't worth the complexity.
+fn parse_date_literal(s: &str, column_name: &str) -> Result<String> {
+    let invalid = || {
+        Error::Execution(format!(
+            "Incorrect date value: '{s}' for column '{column_name}'"
+        ))
+    };
+    let bytes = s.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return Err(invalid());
+    }
+    let digits = |range: std::ops::Range<usize>| -> Result<u32> {
+        s.get(range)
+            .filter(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|part| part.parse::<u32>().ok())
+            .ok_or_else(invalid)
+    };
+    let _year = digits(0..4)?; // any 4-digit year is accepted; no range limit
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(invalid());
+    }
+    Ok(s.to_string())
+}
+
 /// Order two values for `ORDER BY` sorting. Unlike `compare_values` (a
 /// WHERE-clause filter), this needs a definite answer even when one side is
 /// `NULL` — MySQL sorts `NULL` first, as the least value, in ascending order.
@@ -718,12 +842,42 @@ fn value_ordering(a: &Value, b: &Value) -> Ordering {
         (_, Value::Null) => Ordering::Greater,
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
-        // Mixed Int/Varchar: compare by display text (best-effort; real
-        // MySQL has more nuanced coercion rules than this subset needs).
+        // `Date` stores canonical zero-padded "YYYY-MM-DD" text, which the
+        // fallback's string comparison below already orders chronologically
+        // — no dedicated arm needed there. `Decimal` is the opposite: its
+        // *text* form ("10.20" vs "9.50") does NOT sort the way the numbers
+        // do, so it needs a real numeric comparison, normalizing to a common
+        // scale first (within one column `coerce` already guarantees a
+        // shared scale, but this stays correct even if that ever isn't true).
+        (Value::Decimal(a_unscaled, a_scale), Value::Decimal(b_unscaled, b_scale)) => {
+            let (a_cmp, b_cmp) = match a_scale.cmp(b_scale) {
+                Ordering::Equal => (*a_unscaled, *b_unscaled),
+                Ordering::Less => (scale_up(*a_unscaled, b_scale - a_scale), *b_unscaled),
+                Ordering::Greater => (*a_unscaled, scale_up(*b_unscaled, a_scale - b_scale)),
+            };
+            a_cmp.cmp(&b_cmp)
+        }
+        // Mixed types (incl. Date/Varchar, or Decimal against anything else):
+        // compare by display text (best-effort; real MySQL has more nuanced
+        // coercion rules than this subset needs).
         (a, b) => a
             .to_display_string()
             .unwrap_or_default()
             .cmp(&b.to_display_string().unwrap_or_default()),
+    }
+}
+
+/// Multiply `unscaled` by `10^extra_scale`, saturating instead of
+/// overflowing — used only to bring two *differently*-scaled decimals to a
+/// common scale for comparison (`checked_pow`/`saturating_mul` so an
+/// absurd scale difference saturates rather than panicking; `value_ordering`
+/// returns a plain `Ordering`, so there's no `Result` to propagate an error
+/// through here — a client-reachable path must never panic regardless).
+fn scale_up(unscaled: i64, extra_scale: u8) -> i64 {
+    match 10i64.checked_pow(u32::from(extra_scale)) {
+        Some(factor) => unscaled.saturating_mul(factor),
+        None if unscaled < 0 => i64::MIN,
+        None => i64::MAX,
     }
 }
 
@@ -1143,6 +1297,177 @@ mod tests {
             ),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    // ---- BOOLEAN, DECIMAL, DATE (Phase 11) ----
+
+    #[test]
+    fn boolean_column_stores_true_false_as_one_and_zero() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (flag BOOLEAN)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (TRUE), (FALSE)").expect("insert");
+        let result = run(&storage, "SELECT flag FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![int(1)], vec![int(0)]]);
+        // BOOLEAN is a pure INT alias, exactly like real MySQL — not its own
+        // physical type.
+        assert_eq!(result.columns[0].column_type, ColumnType::Int);
+    }
+
+    #[test]
+    fn decimal_literal_inserted_and_selected_round_trips_exactly() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (price DECIMAL(10,2))").expect("create");
+        run(&storage, "INSERT INTO t VALUES (19.99)").expect("insert");
+        let result = run(&storage, "SELECT price FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![Value::Decimal(1999, 2)]]);
+        assert_eq!(
+            result.rows[0][0].to_display_string(),
+            Some("19.99".to_string())
+        );
+    }
+
+    #[test]
+    fn decimal_values_are_rescaled_to_the_columns_declared_scale() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (price DECIMAL(10,2))").expect("create");
+        // An integer, a decimal with fewer fractional digits, and a decimal
+        // with MORE (rounded down to the column's scale) all normalize to
+        // the same (unscaled, scale) representation.
+        run(&storage, "INSERT INTO t VALUES (5)").expect("insert int");
+        run(&storage, "INSERT INTO t VALUES (5.5)").expect("insert coarser scale");
+        run(&storage, "INSERT INTO t VALUES (5.999)").expect("insert finer scale, rounds");
+        let result = run(&storage, "SELECT price FROM t").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Decimal(500, 2)],
+                vec![Value::Decimal(550, 2)],
+                vec![Value::Decimal(600, 2)], // 5.999 rounds to 6.00 at scale 2
+            ]
+        );
+    }
+
+    #[test]
+    fn decimal_comparison_and_ordering_are_numeric_not_lexical() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (price DECIMAL(10,2))").expect("create");
+        for v in ["9.50", "10.20", "1.00"] {
+            run(&storage, &format!("INSERT INTO t VALUES ({v})")).expect("insert");
+        }
+        // Lexically "10.20" < "1.00" < "9.50"; numerically 1.00 < 9.50 < 10.20.
+        let result = run(&storage, "SELECT price FROM t ORDER BY price").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Decimal(100, 2)],
+                vec![Value::Decimal(950, 2)],
+                vec![Value::Decimal(1020, 2)],
+            ]
+        );
+        let matched = run(&storage, "SELECT price FROM t WHERE price > 5.00").expect("select");
+        assert_eq!(matched.rows.len(), 2); // 9.50 and 10.20, not 1.00
+    }
+
+    #[test]
+    fn decimal_into_int_column_rounds() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (2.6)").expect("insert");
+        let result = run(&storage, "SELECT a FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![int(3)]]);
+    }
+
+    #[test]
+    fn decimal_into_varchar_column_stringifies() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (3.50)").expect("insert");
+        let result = run(&storage, "SELECT a FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![vc("3.50")]]);
+    }
+
+    #[test]
+    fn date_literal_inserted_and_selected() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (d DATE)").expect("create");
+        run(&storage, "INSERT INTO t VALUES ('2024-01-15')").expect("insert");
+        let result = run(&storage, "SELECT d FROM t").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Date("2024-01-15".to_string())]]
+        );
+    }
+
+    #[test]
+    fn date_orders_chronologically() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (d DATE)").expect("create");
+        for d in ["2024-03-01", "2023-12-25", "2024-01-01"] {
+            run(&storage, &format!("INSERT INTO t VALUES ('{d}')")).expect("insert");
+        }
+        let result = run(&storage, "SELECT d FROM t ORDER BY d").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Date("2023-12-25".to_string())],
+                vec![Value::Date("2024-01-01".to_string())],
+                vec![Value::Date("2024-03-01".to_string())],
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_date_literal_is_rejected() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (d DATE)").expect("create");
+        for bad in [
+            "not-a-date",
+            "2024-13-01",
+            "2024-01-32",
+            "2024/01/15",
+            "2024-1-1",
+        ] {
+            assert!(
+                matches!(
+                    run(&storage, &format!("INSERT INTO t VALUES ('{bad}')")),
+                    Err(Error::Execution(_))
+                ),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn non_string_literal_into_date_column_is_rejected() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (d DATE)").expect("create");
+        assert!(matches!(
+            run(&storage, "INSERT INTO t VALUES (20240115)"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_decimal_literal_is_rejected() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (price DECIMAL(10,2))").expect("create");
+        assert!(matches!(
+            run(&storage, "INSERT INTO t VALUES ('not-a-number')"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn decimal_default_scale_is_zero() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a DECIMAL, b DECIMAL(5))").expect("create");
+        run(&storage, "INSERT INTO t VALUES (3.7, 3.7)").expect("insert");
+        let result = run(&storage, "SELECT a, b FROM t").expect("select");
+        // Both round to scale 0: 3.7 -> 4.
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Decimal(4, 0), Value::Decimal(4, 0)]]
+        );
     }
 
     #[test]

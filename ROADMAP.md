@@ -300,7 +300,35 @@ rest stays a known, explicit gap rather than an unstated one.
       (7 parser + 13 executor + 1 real-driver conformance case covering a
       GUI's column-sort-click and page-through-results); 329 total, fmt +
       clippy `-D warnings` clean.)_
-- [ ] More column types: `DATE`, `DECIMAL`, `BOOLEAN`.
+- [x] More column types: `DATE`, `DECIMAL`, `BOOLEAN`.
+      _(`BOOLEAN`/`BOOL` are pure `INT` synonyms — no new storage type, exactly
+      matching real MySQL (`TRUE`/`FALSE` parse as `Expr::Integer(1)`/`(0)`).
+      `DECIMAL` is exact fixed-point (`Value::Decimal(unscaled, scale)`; the
+      whole point of `DECIMAL` is *not* being a float — `f64` would reintroduce
+      binary rounding error and can't derive `Eq`/`Hash` for the primary-key
+      index anyway). New tokenizer support for decimal-point literals
+      (`Token::Decimal`) alongside integers; every value is rescaled to its
+      column's declared `DECIMAL(M,D)` scale in `coerce` (round-half-away-
+      from-zero via checked arithmetic, never a panic), so any two values in
+      one column always share a scale — `value_ordering` gained a numeric
+      (not lexical — "10.20" < "9.50" as text but not as numbers) comparison
+      arm for it. `DATE` stores pre-validated canonical `YYYY-MM-DD` text —
+      deliberately just a `String`: zero-padded ISO-8601 already sorts
+      chronologically under plain string comparison, so no date-arithmetic
+      code was needed anywhere. Both wire-encode as text (`VAR_STRING`),
+      reusing the existing text/binary row encoding unchanged rather than
+      hand-rolling MySQL's native binary `DATE`/`NEWDECIMAL` layouts — a
+      real client reads them back as an ordinary string/number either way.
+      On-disk log format extended (new value/column-type tags; `DECIMAL`
+      carries its scale as one extra byte) with a dedicated persistence
+      round-trip test. Proof: 23 new unit tests (parser tokenization +
+      `TRUE`/`FALSE` + type recognition; executor coercion/rescaling/
+      rounding/comparison/validation; log + engine persistence) + 1 real-
+      driver conformance test (incl. the exact `100.005 → 100.01` rounding
+      case, proven exact by reading the wire value back as a string — a
+      real `f64` can't even represent `19.99` exactly) + 6 new e2e app
+      entries (`cargo run --example e2e`, 26/26 passing). 352 tests total
+      (was 329). fmt + clippy `-D warnings` clean.)_
 - [ ] `GROUP BY` + aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`).
 - [ ] `JOIN` (`INNER`, `LEFT`) — includes qualified column references
       (`table.column`/`alias.column`), deferred until now since they only

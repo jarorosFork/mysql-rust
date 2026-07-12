@@ -528,6 +528,56 @@ mod tests {
     }
 
     #[test]
+    fn decimal_and_date_columns_survive_reopening() {
+        let path = temp_path("persist-decimal-date");
+        std::fs::remove_file(&path).ok();
+
+        {
+            let storage = InMemoryStorage::open(&path).unwrap();
+            storage
+                .create_table(
+                    "orders",
+                    vec![
+                        ColumnSchema {
+                            name: "total".to_string(),
+                            column_type: ColumnType::Decimal(2),
+                            nullable: true,
+                            auto_increment: false,
+                        },
+                        ColumnSchema {
+                            name: "placed_on".to_string(),
+                            column_type: ColumnType::Date,
+                            nullable: true,
+                            auto_increment: false,
+                        },
+                    ],
+                    None,
+                )
+                .unwrap();
+            storage
+                .insert_row(
+                    "orders",
+                    vec![
+                        Value::Decimal(4999, 2),
+                        Value::Date("2024-06-01".to_string()),
+                    ],
+                )
+                .unwrap();
+        } // dropped here — simulates a restart.
+
+        let reopened = InMemoryStorage::open(&path).unwrap();
+        assert_eq!(
+            reopened.scan("orders").unwrap(),
+            vec![vec![
+                Value::Decimal(4999, 2),
+                Value::Date("2024-06-01".to_string()),
+            ]]
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn reopening_still_enforces_primary_key_uniqueness() {
         let path = temp_path("persist-pk");
         std::fs::remove_file(&path).ok();

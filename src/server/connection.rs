@@ -702,22 +702,33 @@ fn response_has_ssl_flag(payload: &[u8]) -> bool {
 
 /// Map a storage column schema to its wire-protocol column definition,
 /// reporting the correct MySQL type code per column (an INT column as
-/// `LONGLONG`, a VARCHAR column as `VAR_STRING`) instead of always
-/// `VAR_STRING`.
+/// `LONGLONG`, everything else — `VARCHAR`, `DECIMAL`, `DATE` — as
+/// `VAR_STRING`). `DECIMAL`/`DATE` values are always sent as text (see
+/// `value_to_cell`): `VAR_STRING` is a legitimate, universally-supported wire
+/// representation for them, and it lets both types reuse the existing
+/// text/binary row encoding exactly (`protocol::resultset`) with no new
+/// type-specific binary layout to hand-roll and get subtly wrong.
 fn column_definition(schema: &ColumnSchema) -> ColumnDefinition {
     let column_type = match schema.column_type {
         StorageColumnType::Int => ColumnType::LongLong,
-        StorageColumnType::Varchar => ColumnType::VarString,
+        StorageColumnType::Varchar | StorageColumnType::Decimal(_) | StorageColumnType::Date => {
+            ColumnType::VarString
+        }
     };
     ColumnDefinition::new(schema.name.clone(), column_type)
 }
 
-/// Convert a storage value into a protocol result-set cell.
+/// Convert a storage value into a protocol result-set cell. `Decimal`/`Date`
+/// go out as text (see `column_definition` for why that's correct, not a
+/// shortcut).
 fn value_to_cell(value: Value) -> Cell {
     match value {
         Value::Int(n) => Cell::Int(n),
         Value::Varchar(s) => Cell::Text(s),
         Value::Null => Cell::Null,
+        decimal_or_date @ (Value::Decimal(..) | Value::Date(_)) => {
+            Cell::Text(decimal_or_date.to_display_string().unwrap_or_default())
+        }
     }
 }
 

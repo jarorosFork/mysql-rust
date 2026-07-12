@@ -22,9 +22,13 @@ const TAG_INSERT_ROW: u8 = 2;
 const VALUE_NULL: u8 = 0;
 const VALUE_INT: u8 = 1;
 const VALUE_VARCHAR: u8 = 2;
+const VALUE_DECIMAL: u8 = 3;
+const VALUE_DATE: u8 = 4;
 
 const COLUMN_TYPE_INT: u8 = 0;
 const COLUMN_TYPE_VARCHAR: u8 = 1;
+const COLUMN_TYPE_DECIMAL: u8 = 2;
+const COLUMN_TYPE_DATE: u8 = 3;
 
 const COLUMN_FLAG_NULLABLE: u8 = 0b01;
 const COLUMN_FLAG_AUTO_INCREMENT: u8 = 0b10;
@@ -62,6 +66,15 @@ fn write_value(buf: &mut Vec<u8>, value: &Value) {
             buf.push(VALUE_VARCHAR);
             write_string(buf, s);
         }
+        Value::Decimal(unscaled, scale) => {
+            buf.push(VALUE_DECIMAL);
+            buf.extend_from_slice(&unscaled.to_le_bytes());
+            buf.push(*scale);
+        }
+        Value::Date(s) => {
+            buf.push(VALUE_DATE);
+            write_string(buf, s);
+        }
     }
 }
 
@@ -82,10 +95,17 @@ fn encode_create_table(
     write_u32(&mut buf, columns.len() as u32);
     for col in columns {
         write_string(&mut buf, &col.name);
-        buf.push(match col.column_type {
-            ColumnType::Int => COLUMN_TYPE_INT,
-            ColumnType::Varchar => COLUMN_TYPE_VARCHAR,
-        });
+        match col.column_type {
+            ColumnType::Int => buf.push(COLUMN_TYPE_INT),
+            ColumnType::Varchar => buf.push(COLUMN_TYPE_VARCHAR),
+            ColumnType::Date => buf.push(COLUMN_TYPE_DATE),
+            // DECIMAL carries its scale as data, unlike the other types —
+            // one extra byte right after the tag.
+            ColumnType::Decimal(scale) => {
+                buf.push(COLUMN_TYPE_DECIMAL);
+                buf.push(scale);
+            }
+        }
         let mut flags = 0u8;
         if col.nullable {
             flags |= COLUMN_FLAG_NULLABLE;
@@ -164,6 +184,12 @@ fn read_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
         VALUE_NULL => Ok(Value::Null),
         VALUE_INT => Ok(Value::Int(read_i64(bytes, pos)?)),
         VALUE_VARCHAR => Ok(Value::Varchar(read_string(bytes, pos)?)),
+        VALUE_DECIMAL => {
+            let unscaled = read_i64(bytes, pos)?;
+            let scale = read_byte(bytes, pos)?;
+            Ok(Value::Decimal(unscaled, scale))
+        }
+        VALUE_DATE => Ok(Value::Date(read_string(bytes, pos)?)),
         other => Err(corrupt(&format!("unknown value tag {other}"))),
     }
 }
@@ -185,6 +211,8 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
                 let column_type = match read_byte(bytes, &mut pos)? {
                     COLUMN_TYPE_INT => ColumnType::Int,
                     COLUMN_TYPE_VARCHAR => ColumnType::Varchar,
+                    COLUMN_TYPE_DATE => ColumnType::Date,
+                    COLUMN_TYPE_DECIMAL => ColumnType::Decimal(read_byte(bytes, &mut pos)?),
                     other => return Err(corrupt(&format!("unknown column type tag {other}"))),
                 };
                 let flags = read_byte(bytes, &mut pos)?;
@@ -341,6 +369,74 @@ mod tests {
         }
         match &replayed[2] {
             Entry::InsertRow { row, .. } => assert_eq!(row[0], Value::Null),
+            _ => panic!("expected InsertRow"),
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_decimal_and_date_columns_and_values() {
+        let path = temp_path("round-trip-decimal-date");
+        let mut replayed = Vec::new();
+        {
+            let mut log = Log::open(&path, |_| {}).unwrap();
+            log.append_create_table(
+                "t",
+                &[
+                    ColumnSchema {
+                        name: "price".to_string(),
+                        column_type: ColumnType::Decimal(2),
+                        nullable: true,
+                        auto_increment: false,
+                    },
+                    ColumnSchema {
+                        name: "d".to_string(),
+                        column_type: ColumnType::Date,
+                        nullable: true,
+                        auto_increment: false,
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+            log.append_insert_row(
+                "t",
+                &[
+                    Value::Decimal(1999, 2),
+                    Value::Date("2024-01-15".to_string()),
+                ],
+            )
+            .unwrap();
+            log.append_insert_row("t", &[Value::Decimal(-500, 2), Value::Null])
+                .unwrap();
+        }
+
+        let _log = Log::open(&path, |entry| replayed.push(entry)).unwrap();
+
+        match &replayed[0] {
+            Entry::CreateTable { columns, .. } => {
+                assert_eq!(columns[0].column_type, ColumnType::Decimal(2));
+                assert_eq!(columns[1].column_type, ColumnType::Date);
+            }
+            _ => panic!("expected CreateTable"),
+        }
+        match &replayed[1] {
+            Entry::InsertRow { row, .. } => {
+                assert_eq!(
+                    row,
+                    &vec![
+                        Value::Decimal(1999, 2),
+                        Value::Date("2024-01-15".to_string())
+                    ]
+                );
+            }
+            _ => panic!("expected InsertRow"),
+        }
+        match &replayed[2] {
+            Entry::InsertRow { row, .. } => {
+                assert_eq!(row, &vec![Value::Decimal(-500, 2), Value::Null]);
+            }
             _ => panic!("expected InsertRow"),
         }
 

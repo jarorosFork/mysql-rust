@@ -10,7 +10,7 @@ pub mod value;
 
 pub use engine::InMemoryStorage;
 pub use transaction::Transaction;
-pub use value::{ColumnSchema, ColumnType, TableSchema, Value};
+pub use value::{format_decimal, ColumnSchema, ColumnType, TableSchema, Value};
 
 use crate::Result;
 

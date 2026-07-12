@@ -3,6 +3,7 @@
 //! predicate `WHERE`. AND/OR chaining, joins, and typed values are out of
 //! scope for now (see ROADMAP.md Phase 4/5).
 
+use crate::storage::format_decimal;
 use crate::{Error, Result};
 
 // ---------- AST ----------
@@ -106,6 +107,10 @@ pub enum SelectItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Integer(i64),
+    /// A decimal literal as written, e.g. `123.45` -> `Decimal(12345, 2)`
+    /// (`unscaled`, `scale` — see `storage::Value::Decimal`). Not yet
+    /// rescaled to any column; that happens in the executor's `coerce`.
+    Decimal(i64, u8),
     String(String),
     Null,
     SystemVariable(String),
@@ -127,6 +132,7 @@ impl Expr {
     pub fn to_value_string(&self) -> Option<String> {
         match self {
             Expr::Integer(n) => Some(n.to_string()),
+            Expr::Decimal(unscaled, scale) => Some(format_decimal(*unscaled, *scale)),
             Expr::String(s) => Some(s.clone()),
             Expr::Null => None,
             Expr::SystemVariable(name) => Some(format!("@@{name}")),
@@ -170,6 +176,8 @@ enum Token {
     Ident(String),
     SystemVariable(String),
     Integer(i64),
+    /// A decimal literal as written: `(unscaled, scale)` — see `Expr::Decimal`.
+    Decimal(i64, u8),
     Str(String),
     Comma,
     LParen,
@@ -257,6 +265,7 @@ fn token_text(token: &Token) -> String {
         Token::Ident(s) => s.clone(),
         Token::SystemVariable(s) => format!("@@{s}"),
         Token::Integer(n) => n.to_string(),
+        Token::Decimal(unscaled, scale) => format_decimal(*unscaled, *scale),
         Token::Str(s) => format!("'{s}'"),
         Token::Comma => ",".to_string(),
         Token::LParen => "(".to_string(),
@@ -454,8 +463,8 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
             c if c.is_ascii_digit()
                 || (c == '-' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit())) =>
             {
-                let (n, consumed) = scan_integer(&chars[i..])?;
-                tokens.push(Token::Integer(n));
+                let (token, consumed) = scan_number(&chars[i..])?;
+                tokens.push(token);
                 i += consumed;
             }
             c if c.is_alphabetic() || c == '_' => {
@@ -485,25 +494,50 @@ fn scan_ident(chars: &[char]) -> (String, usize) {
     (chars[..n].iter().collect(), n)
 }
 
-fn scan_integer(chars: &[char]) -> Result<(i64, usize)> {
-    let mut n = 0;
-    if chars.first() == Some(&'-') {
-        n += 1;
-    }
-    let start_digits = n;
+/// Scan a numeric literal: an optional leading `-`, then digits, optionally
+/// followed by a `.` and more digits (a decimal literal). The `.` only
+/// starts a fraction when immediately followed by a digit — otherwise it's
+/// left untouched for the caller to tokenize on its own (e.g. `Token::Dot`
+/// in a qualified name), so `5.` and `5.foo` don't get misread as numbers.
+fn scan_number(chars: &[char]) -> Result<(Token, usize)> {
+    let negative = chars.first() == Some(&'-');
+    let mut n = usize::from(negative);
+    let int_start = n;
     while n < chars.len() && chars[n].is_ascii_digit() {
         n += 1;
     }
-    if n == start_digits {
+    if n == int_start {
         return Err(Error::Parse(
-            "expected digits in integer literal".to_string(),
+            "expected digits in numeric literal".to_string(),
         ));
     }
-    let text: String = chars[..n].iter().collect();
+    let int_text: String = chars[int_start..n].iter().collect();
+
+    if chars.get(n) == Some(&'.') && chars.get(n + 1).is_some_and(char::is_ascii_digit) {
+        let frac_start = n + 1;
+        let mut frac_end = frac_start;
+        while frac_end < chars.len() && chars[frac_end].is_ascii_digit() {
+            frac_end += 1;
+        }
+        let frac_text: String = chars[frac_start..frac_end].iter().collect();
+        let scale = frac_text.len() as u8;
+        let combined = format!("{int_text}{frac_text}");
+        let mut unscaled: i64 = combined.parse().map_err(|_| {
+            Error::Parse(format!(
+                "decimal literal '{int_text}.{frac_text}' out of range"
+            ))
+        })?;
+        if negative {
+            unscaled = -unscaled;
+        }
+        return Ok((Token::Decimal(unscaled, scale), frac_end));
+    }
+
+    let text = format!("{}{int_text}", if negative { "-" } else { "" });
     let value = text
         .parse::<i64>()
         .map_err(|_| Error::Parse(format!("integer literal '{text}' out of range")))?;
-    Ok((value, n))
+    Ok((Token::Integer(value), n))
 }
 
 /// `chars[0]` must be the opening backtick. A doubled backtick (```` `` ````)
@@ -772,15 +806,19 @@ impl<'a> Parser<'a> {
     /// doesn't fix an attribute order.
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.expect_ident()?;
-        let type_name = self.expect_ident()?;
+        let base_type_name = self.expect_ident()?;
 
-        // Optional size/precision, e.g. VARCHAR(255) or DECIMAL(10,2);
-        // consumed, not stored (this server's types have no size parameter).
+        // Optional size/precision, e.g. VARCHAR(255) or DECIMAL(10,2). Kept
+        // (not just consumed) by folding it back onto the type name text —
+        // `ColumnType::from_name` reads `DECIMAL(M,D)`'s scale back out of
+        // exactly this shape; other types still just discard it themselves.
+        let mut type_name = base_type_name;
         if let Some(Token::LParen) = self.peek() {
             self.pos += 1;
+            let mut args = Vec::new();
             loop {
                 match self.advance() {
-                    Some(Token::Integer(_)) => {}
+                    Some(Token::Integer(n)) => args.push(*n),
                     other => {
                         return Err(Error::Parse(format!(
                             "expected an integer in type size, found {}",
@@ -799,6 +837,12 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            let args_text = args
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            type_name = format!("{type_name}({args_text})");
         }
         // UNSIGNED/ZEROFILL immediately follow a numeric type, before any
         // other attribute; consumed, not enforced (one INT range here).
@@ -1358,9 +1402,16 @@ impl<'a> Parser<'a> {
         let token = self.advance().cloned();
         match token {
             Some(Token::Integer(n)) => Ok(Expr::Integer(n)),
+            Some(Token::Decimal(unscaled, scale)) => Ok(Expr::Decimal(unscaled, scale)),
             Some(Token::Str(s)) => Ok(Expr::String(s)),
             Some(Token::Keyword(Keyword::Null)) => Ok(Expr::Null),
             Some(Token::SystemVariable(name)) => Ok(Expr::SystemVariable(name)),
+            // TRUE/FALSE are MySQL literal keywords evaluating to 1/0 — real
+            // MySQL doesn't even have a distinct boolean value at the storage
+            // level, so this is the whole implementation (see
+            // `ColumnType::from_name`'s BOOLEAN/BOOL == INT synonym).
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("TRUE") => Ok(Expr::Integer(1)),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FALSE") => Ok(Expr::Integer(0)),
             Some(Token::Ident(name)) => {
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.parse_function_call(name)
@@ -1820,6 +1871,58 @@ mod tests {
              COLLATE=utf8mb4_general_ci COMMENT='a table'"
         )
         .is_ok());
+    }
+
+    // ---- DECIMAL literals, TRUE/FALSE, DATE/DECIMAL/BOOLEAN column types ----
+
+    #[test]
+    fn decimal_literal_tokenizes_into_unscaled_and_scale() {
+        assert_eq!(
+            parse("SELECT 123.45").unwrap(),
+            select_one(Expr::Decimal(12345, 2))
+        );
+        assert_eq!(
+            parse("SELECT 0.5").unwrap(),
+            select_one(Expr::Decimal(5, 1))
+        );
+        assert_eq!(
+            parse("SELECT -3.00").unwrap(),
+            select_one(Expr::Decimal(-300, 2))
+        );
+    }
+
+    /// Shared helper: a `SELECT <expr>` statement with no `FROM`/alias, for
+    /// the decimal-literal tests above.
+    fn select_one(expr: Expr) -> Statement {
+        Statement::Select {
+            projection: vec![SelectItem::Expr(expr, None)],
+            from: None,
+            selection: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
+
+    #[test]
+    fn a_dot_not_followed_by_a_digit_is_not_folded_into_the_number() {
+        // `5.` (trailing dot, nothing after) stays a plain integer; the `.`
+        // would only be consumed if a qualified name/select-list needed it.
+        // Here it's simply trailing garbage, so this must be a parse error,
+        // not a silently-wrong decimal.
+        assert!(parse("SELECT 5.").is_err());
+    }
+
+    #[test]
+    fn true_and_false_are_integer_literals() {
+        assert_eq!(parse("SELECT TRUE").unwrap(), select_one(Expr::Integer(1)));
+        assert_eq!(parse("SELECT false").unwrap(), select_one(Expr::Integer(0)));
+        assert_eq!(parse("SELECT True").unwrap(), select_one(Expr::Integer(1)));
+    }
+
+    #[test]
+    fn create_table_recognizes_date_decimal_and_boolean_types() {
+        assert!(parse("CREATE TABLE t (a DATE, b DECIMAL(10,2), c BOOLEAN, d BOOL)").is_ok());
     }
 
     // ---- INSERT ----

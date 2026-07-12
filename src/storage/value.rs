@@ -1,14 +1,31 @@
 //! Typed values and schema definitions.
 //!
-//! `INT` and `VARCHAR` are the two required types (see ROADMAP.md Phase 5);
-//! more (`DECIMAL`, `DATE`, ...) can join `ColumnType` as they're needed.
+//! `INT` and `VARCHAR` were the two required types for Phase 5; Phase 11
+//! added `BOOLEAN` (a pure alias for `INT` — exactly how real MySQL treats
+//! it, not a distinct storage type), `DECIMAL` (exact fixed-point, not a
+//! float — see `Value::Decimal`), and `DATE`.
 
-/// A typed, storage-level value. `Null` is a distinct value from any
-/// `Int`/`Varchar`, matching SQL's `NULL`.
+/// A typed, storage-level value. `Null` is a distinct value from any other
+/// variant, matching SQL's `NULL`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Int(i64),
     Varchar(String),
+    /// An exact fixed-point number: `unscaled / 10^scale` (e.g. `(12345, 2)`
+    /// is `123.45`). Never a float — `DECIMAL`'s entire point is avoiding
+    /// binary floating-point rounding, so `f64` would defeat it, and `f64`
+    /// can't derive `Eq`/`Hash` anyway (`NAN`), which the primary-key index
+    /// needs. `coerce` (see `query::executor`) always normalizes a value to
+    /// its column's declared scale before it reaches storage, so any two
+    /// values in one column compare/hash consistently.
+    Decimal(i64, u8),
+    /// A calendar date, stored pre-validated as canonical `YYYY-MM-DD` text
+    /// (zero-padded). Deliberately just a `String`, not a `(year, month,
+    /// day)` tuple: zero-padded ISO-8601 text sorts identically to
+    /// chronological order, so ordinary string comparison is already
+    /// correct — no date-arithmetic code needed anywhere (this server
+    /// doesn't do date arithmetic; see ROADMAP.md Phase 11's cut list).
+    Date(String),
     Null,
 }
 
@@ -19,9 +36,31 @@ impl Value {
         match self {
             Value::Int(n) => Some(n.to_string()),
             Value::Varchar(s) => Some(s.clone()),
+            Value::Decimal(unscaled, scale) => Some(format_decimal(*unscaled, *scale)),
+            Value::Date(s) => Some(s.clone()),
             Value::Null => None,
         }
     }
+}
+
+/// Render a fixed-point `(unscaled, scale)` pair as decimal text, e.g.
+/// `(12345, 2)` -> `"123.45"`, `(5, 2)` -> `"0.05"`, `(100, 0)` -> `"100"`.
+pub fn format_decimal(unscaled: i64, scale: u8) -> String {
+    if scale == 0 {
+        return unscaled.to_string();
+    }
+    let negative = unscaled < 0;
+    let scale = scale as usize;
+    let digits = unscaled.unsigned_abs().to_string();
+    // Left-pad with zeros so there's always at least one integer digit plus
+    // `scale` fractional digits to split off (e.g. 5 at scale 2 -> "005").
+    let digits = if digits.len() <= scale {
+        format!("{digits:0>width$}", width = scale + 1)
+    } else {
+        digits
+    };
+    let (int_part, frac_part) = digits.split_at(digits.len() - scale);
+    format!("{}{int_part}.{frac_part}", if negative { "-" } else { "" })
 }
 
 /// A column's declared type.
@@ -29,30 +68,45 @@ impl Value {
 pub enum ColumnType {
     Int,
     Varchar,
+    /// Exact fixed-point, carrying the declared scale (digits after the
+    /// decimal point) — `DECIMAL` alone or `DECIMAL(M)` is scale 0,
+    /// `DECIMAL(M, D)` is scale `D`, matching MySQL's own default.
+    Decimal(u8),
+    Date,
 }
 
 impl ColumnType {
-    /// Recognize a type name as written in `CREATE TABLE` (case-insensitive).
-    /// Many SQL type names share one of the two physical representations —
-    /// every integer width stores as `Int` (i64) and every string/text/blob
-    /// kind stores as `Varchar` — so they're accepted as synonyms. Genuinely
-    /// distinct physical types (`DATE`, `DECIMAL` with exact scale, real
-    /// binary `BLOB`) would need their own `Value` variant and are not
-    /// accepted yet.
+    /// Recognize a type name as written in `CREATE TABLE` (case-insensitive),
+    /// e.g. `"VARCHAR(255)"` or `"DECIMAL(10,2)"`. Many SQL type names share
+    /// one of the physical representations here — every integer width
+    /// (including `BOOLEAN`/`BOOL`, exactly as real MySQL treats them) stores
+    /// as `Int`, every string/text/blob kind as `Varchar` — so they're
+    /// accepted as synonyms.
     pub fn from_name(name: &str) -> Option<Self> {
-        // Strip a size/precision suffix like `VARCHAR(255)` or `INT(11)` —
-        // the parser also consumes it, but be lenient if a bare name arrives.
-        let base = name.split('(').next().unwrap_or(name).trim();
+        let trimmed = name.trim();
+        let base = trimmed.split('(').next().unwrap_or(trimmed).trim();
         match base.to_ascii_uppercase().as_str() {
-            "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" => {
-                Some(ColumnType::Int)
-            }
+            "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" | "BOOLEAN"
+            | "BOOL" => Some(ColumnType::Int),
             "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
                 Some(ColumnType::Varchar)
             }
+            "DATE" => Some(ColumnType::Date),
+            "DECIMAL" | "NUMERIC" | "DEC" => Some(ColumnType::Decimal(decimal_scale(trimmed))),
             _ => None,
         }
     }
+}
+
+/// Parse the scale (second, comma-separated number) out of a `DECIMAL(M, D)`
+/// suffix; `DECIMAL`, `DECIMAL(M)`, or an unparseable suffix all mean scale 0.
+fn decimal_scale(type_text: &str) -> u8 {
+    type_text
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .and_then(|args| args.split(',').nth(1))
+        .and_then(|scale| scale.trim().parse::<u8>().ok())
+        .unwrap_or(0)
 }
 
 /// A single column's name and type.
@@ -96,16 +150,16 @@ mod tests {
             "SMALLINT",
             "tinyint",
             "mediumint",
+            "boolean",
+            "BOOL",
         ] {
             assert_eq!(ColumnType::from_name(name), Some(ColumnType::Int));
         }
         for name in ["varchar", "VARCHAR", "char", "text", "longtext", "TinyText"] {
             assert_eq!(ColumnType::from_name(name), Some(ColumnType::Varchar));
         }
+        assert_eq!(ColumnType::from_name("date"), Some(ColumnType::Date));
         assert_eq!(ColumnType::from_name("bogus"), None);
-        // Genuinely distinct physical types aren't accepted yet.
-        assert_eq!(ColumnType::from_name("DATE"), None);
-        assert_eq!(ColumnType::from_name("DECIMAL"), None);
     }
 
     #[test]
@@ -118,8 +172,58 @@ mod tests {
     }
 
     #[test]
+    fn decimal_scale_is_parsed_from_the_second_argument() {
+        assert_eq!(
+            ColumnType::from_name("DECIMAL"),
+            Some(ColumnType::Decimal(0))
+        );
+        assert_eq!(
+            ColumnType::from_name("DECIMAL(10)"),
+            Some(ColumnType::Decimal(0))
+        );
+        assert_eq!(
+            ColumnType::from_name("DECIMAL(10,2)"),
+            Some(ColumnType::Decimal(2))
+        );
+        assert_eq!(
+            ColumnType::from_name("numeric(8, 4)"),
+            Some(ColumnType::Decimal(4))
+        );
+        assert_eq!(
+            ColumnType::from_name("DEC(5,1)"),
+            Some(ColumnType::Decimal(1))
+        );
+    }
+
+    #[test]
     fn null_has_no_display_string() {
         assert_eq!(Value::Null.to_display_string(), None);
         assert_eq!(Value::Int(5).to_display_string(), Some("5".to_string()));
+    }
+
+    #[test]
+    fn format_decimal_places_the_decimal_point() {
+        assert_eq!(format_decimal(12345, 2), "123.45");
+        assert_eq!(format_decimal(100, 2), "1.00");
+        assert_eq!(format_decimal(5, 2), "0.05");
+        assert_eq!(format_decimal(0, 2), "0.00");
+        assert_eq!(format_decimal(-1550, 2), "-15.50");
+        assert_eq!(format_decimal(42, 0), "42");
+    }
+
+    #[test]
+    fn decimal_value_to_display_string_matches_format_decimal() {
+        assert_eq!(
+            Value::Decimal(12345, 2).to_display_string(),
+            Some("123.45".to_string())
+        );
+    }
+
+    #[test]
+    fn date_value_to_display_string_is_the_stored_text() {
+        assert_eq!(
+            Value::Date("2024-01-15".to_string()).to_display_string(),
+            Some("2024-01-15".to_string())
+        );
     }
 }
