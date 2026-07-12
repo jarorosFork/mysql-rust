@@ -243,6 +243,37 @@ async fn real_driver_creates_and_drops_a_database() {
     drop(server);
 }
 
+/// The literal statement DBeaver's "Create Database" dialog sends is
+/// `CREATE SCHEMA`, not `CREATE DATABASE` — a real MySQL synonym this server
+/// didn't originally accept (`expected TABLE, found 'SCHEMA'`), which is what
+/// actually broke the reported flow (the SHOW CHARACTER SET/COLLATION fix
+/// above addressed a *related* client-side crash, but not this one).
+#[tokio::test]
+async fn real_driver_create_schema_synonym() {
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    conn.query_drop("CREATE SCHEMA IF NOT EXISTS my_schema")
+        .await
+        .expect("CREATE SCHEMA");
+    let databases: Vec<String> = conn.query("SHOW DATABASES").await.expect("SHOW DATABASES");
+    assert!(databases.contains(&"my_schema".to_string()));
+
+    conn.query_drop("DROP SCHEMA my_schema")
+        .await
+        .expect("DROP SCHEMA");
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
 #[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`

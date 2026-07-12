@@ -167,8 +167,13 @@ impl Config {
     /// - `MYSQLRUST_AUTH_PLUGIN` — `caching_sha2_password` (default) or
     ///   `mysql_native_password` (aliases `caching_sha2` / `native` accepted,
     ///   case-insensitive).
+    /// - `MYSQLRUST_LOG_LEVEL` — `debug`/`info`/`warn`/`error` (default `info`).
+    ///   Query-level errors (e.g. a client sending SQL this server can't parse)
+    ///   log at `debug`, so set this to see exactly what a client is sending
+    ///   when something behaves unexpectedly.
     ///
-    /// Returns [`Error::Config`] on an unparseable address or an unknown plugin.
+    /// Returns [`Error::Config`] on an unparseable address, an unknown plugin,
+    /// or an unrecognized log level.
     pub fn from_env() -> Result<Self> {
         Self::from_env_with(|key| std::env::var(key).ok())
     }
@@ -192,6 +197,15 @@ impl Config {
             if !dir.is_empty() {
                 config.data_dir = Some(PathBuf::from(dir));
             }
+        }
+
+        if let Some(level) = get("MYSQLRUST_LOG_LEVEL").filter(|l| !l.is_empty()) {
+            config.log_level = LogLevel::from_name(&level).ok_or_else(|| {
+                Error::Config(format!(
+                    "MYSQLRUST_LOG_LEVEL '{level}' is not recognized; use \
+                     'debug', 'info', 'warn', or 'error'"
+                ))
+            })?;
         }
 
         if let Some(username) = get("MYSQLRUST_USER").filter(|u| !u.is_empty()) {
@@ -290,6 +304,20 @@ mod tests {
     #[test]
     fn bad_listen_addr_is_a_config_error() {
         let err = Config::from_env_with(env(&[("MYSQLRUST_LISTEN_ADDR", "not-an-addr")]))
+            .expect_err("should reject");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn log_level_is_parsed_case_insensitively() {
+        let config =
+            Config::from_env_with(env(&[("MYSQLRUST_LOG_LEVEL", "Debug")])).expect("parse");
+        assert_eq!(config.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn bad_log_level_is_a_config_error() {
+        let err = Config::from_env_with(env(&[("MYSQLRUST_LOG_LEVEL", "verbose")]))
             .expect_err("should reject");
         assert!(matches!(err, Error::Config(_)));
     }

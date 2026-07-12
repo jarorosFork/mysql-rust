@@ -527,11 +527,12 @@ fn scan_string_literal(chars: &[char]) -> Result<(String, usize)> {
     Ok((s, n))
 }
 
-/// Whether `token` is the (non-reserved) identifier `DATABASE`,
-/// case-insensitively — used to disambiguate `CREATE TABLE` from
-/// `CREATE DATABASE` with one token of lookahead.
+/// Whether `token` is the (non-reserved) identifier `DATABASE` or its
+/// MySQL-standard synonym `SCHEMA`, case-insensitively — used to disambiguate
+/// `CREATE TABLE` from `CREATE DATABASE`/`CREATE SCHEMA` with one token of
+/// lookahead. (JDBC drivers — and so DBeaver — emit `CREATE SCHEMA`.)
 fn is_database_ident(token: &Token) -> bool {
-    matches!(token, Token::Ident(s) if s.eq_ignore_ascii_case("DATABASE"))
+    matches!(token, Token::Ident(s) if s.eq_ignore_ascii_case("DATABASE") || s.eq_ignore_ascii_case("SCHEMA"))
 }
 
 // ---------- Parser ----------
@@ -587,6 +588,17 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word) => Ok(()),
             other => Err(Error::Parse(format!(
                 "expected '{word}', found {}",
+                describe(other)
+            ))),
+        }
+    }
+
+    /// Consume `DATABASE` or its synonym `SCHEMA` (see [`is_database_ident`]).
+    fn expect_database_or_schema(&mut self) -> Result<()> {
+        match self.advance() {
+            Some(t) if is_database_ident(t) => Ok(()),
+            other => Err(Error::Parse(format!(
+                "expected 'DATABASE' or 'SCHEMA', found {}",
                 describe(other)
             ))),
         }
@@ -688,12 +700,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `CREATE DATABASE [IF NOT EXISTS] <name> [[DEFAULT] CHARACTER SET [=] x]
-    /// [[DEFAULT] COLLATE [=] y]` — the charset/collate clause is parsed only
-    /// to be discarded (this server has exactly one charset/collation).
+    /// `CREATE {DATABASE | SCHEMA} [IF NOT EXISTS] <name>
+    /// [[DEFAULT] CHARACTER SET [=] x] [[DEFAULT] COLLATE [=] y]` — the
+    /// charset/collate clause is parsed only to be discarded (this server has
+    /// exactly one charset/collation). `SCHEMA` is a true MySQL synonym for
+    /// `DATABASE` here (unlike standard SQL, where they differ) — JDBC drivers
+    /// (and so DBeaver) emit `CREATE SCHEMA`.
     fn parse_create_database(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
-        self.expect_ident_ci("DATABASE")?;
+        self.expect_database_or_schema()?;
         let if_not_exists = self.eat_if_not_exists()?;
         let name = self.expect_ident()?;
         self.consume_to_statement_end();
@@ -704,10 +719,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `DROP DATABASE [IF EXISTS] <name>`.
+    /// `DROP {DATABASE | SCHEMA} [IF EXISTS] <name>`.
     fn parse_drop_database(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
-        self.expect_ident_ci("DATABASE")?;
+        self.expect_database_or_schema()?;
         let if_exists = self.eat_if_exists()?;
         let name = self.expect_ident()?;
         self.eat_semicolon_and_ensure_end()?;
@@ -1681,6 +1696,35 @@ mod tests {
         // Case-insensitive, and CREATE TABLE is unaffected by the lookahead.
         assert!(parse("create database mydb").is_ok());
         assert!(parse("CREATE TABLE t (a INT)").is_ok());
+    }
+
+    /// `SCHEMA` is a true MySQL synonym for `DATABASE` (unlike standard SQL).
+    /// JDBC drivers — and so DBeaver's "Create Database" action — emit
+    /// `CREATE SCHEMA`, not `CREATE DATABASE`; this is a regression test for
+    /// exactly that failure (`expected TABLE, found 'SCHEMA'`).
+    #[test]
+    fn schema_is_a_synonym_for_database() {
+        assert_eq!(
+            parse("CREATE SCHEMA mydb").unwrap(),
+            Statement::CreateDatabase {
+                name: "mydb".to_string(),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            parse("CREATE SCHEMA IF NOT EXISTS mydb").unwrap(),
+            Statement::CreateDatabase {
+                name: "mydb".to_string(),
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            parse("DROP SCHEMA IF EXISTS mydb").unwrap(),
+            Statement::DropDatabase {
+                name: "mydb".to_string(),
+                if_exists: true,
+            }
+        );
     }
 
     #[test]

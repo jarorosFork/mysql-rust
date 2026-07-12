@@ -342,14 +342,14 @@ impl Connection {
     async fn handle_query(&mut self, sql: &str) -> Result<()> {
         let statements = match parser::parse_many(sql) {
             Ok(statements) => statements,
-            Err(e) => return self.send_result(Err(e), false, false).await,
+            Err(e) => return self.send_result(Err(e), false, false, Some(sql)).await,
         };
 
         if statements.len() > 1 && self.client_capabilities & CLIENT_MULTI_STATEMENTS == 0 {
             let err = Error::Parse(
                 "multiple statements in one query require CLIENT_MULTI_STATEMENTS".to_string(),
             );
-            return self.send_result(Err(err), false, false).await;
+            return self.send_result(Err(err), false, false, Some(sql)).await;
         }
 
         let total = statements.len();
@@ -359,7 +359,8 @@ impl Connection {
             // "More results follow" only if this one succeeded and another
             // remains — an error ends the batch.
             let more_results = !failed && i + 1 < total;
-            self.send_result(outcome, false, more_results).await?;
+            self.send_result(outcome, false, more_results, Some(sql))
+                .await?;
             if failed {
                 break;
             }
@@ -371,13 +372,16 @@ impl Connection {
     /// transaction control — no columns), a result set (`SELECT`, in text or
     /// binary form per `binary`), or an ERR packet on failure. `more_results`
     /// sets `SERVER_MORE_RESULTS_EXISTS` in the status flags so the client
-    /// reads a following result set (multi-statement). A query-level error is
-    /// reported to the client without dropping the connection.
+    /// reads a following result set (multi-statement). `sql` is the original
+    /// query text, included in the debug log on failure (`None` from the
+    /// prepared-statement path, which doesn't retain it). A query-level error
+    /// is reported to the client without dropping the connection.
     async fn send_result(
         &mut self,
         outcome: Result<QueryResult>,
         binary: bool,
         more_results: bool,
+        sql: Option<&str>,
     ) -> Result<()> {
         let status_flags = if more_results {
             SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS
@@ -419,14 +423,26 @@ impl Connection {
             }
             Err(e) => {
                 self.observability.metrics.error();
-                self.observability.logger.log(
-                    LogLevel::Debug,
-                    "query_error",
-                    &[
-                        ("connection_id", &self.connection_id.to_string()),
-                        ("error", &e.to_string()),
-                    ],
-                );
+                // Truncate defensively: a client can send an arbitrarily long
+                // query, and this is a log line, not a buffer we need to
+                // preserve exactly.
+                const MAX_LOGGED_SQL: usize = 500;
+                let truncated_sql = sql.map(|s| match s.char_indices().nth(MAX_LOGGED_SQL) {
+                    Some((byte_idx, _)) => format!("{}…", &s[..byte_idx]),
+                    None => s.to_string(),
+                });
+                let mut fields = vec![
+                    ("connection_id", self.connection_id.to_string()),
+                    ("error", e.to_string()),
+                ];
+                if let Some(sql) = &truncated_sql {
+                    fields.push(("sql", sql.clone()));
+                }
+                let field_refs: Vec<(&str, &str)> =
+                    fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                self.observability
+                    .logger
+                    .log(LogLevel::Debug, "query_error", &field_refs);
                 self.write_packet(&ErrPacket::from_error(&e).to_packet(self.sequence_id)?)
                     .await?;
                 self.sequence_id = self.sequence_id.wrapping_add(1);
@@ -566,7 +582,7 @@ impl Connection {
 
         // Prepared statements execute one at a time — never part of a
         // multi-statement batch — so there are never more results to follow.
-        self.send_result(outcome, true, false).await
+        self.send_result(outcome, true, false, None).await
     }
 
     /// `COM_STMT_CLOSE`: deallocate the statement. No response, per protocol.
