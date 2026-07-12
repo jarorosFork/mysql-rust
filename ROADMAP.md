@@ -406,6 +406,37 @@ rest stays a known, explicit gap rather than an unstated one.
 
 ---
 
+## Phase 12 — Durability & performance hardening
+
+An audit (2026-07-12, at commit `5ae6c0e`) measured the codebase against
+database-engineering best practices for durability and performance. Full
+findings, severities, code evidence, and the phased task list — crash-test
+harness and benchmark baseline first, then WAL correctness (fsync policy,
+atomic commit records, CRC + torn-tail recovery, true write-ahead
+ordering), then a group-commit writer thread, then query-path performance
+(scan predicate pushdown, single-buffer responses, `TCP_NODELAY`) — live in
+**[PERFORMANCE_DURABILITY_PLAN.md](PERFORMANCE_DURABILITY_PLAN.md)**. Work
+its checkboxes in order (PD-0 → PD-4) under the same loop protocol as this
+file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
+"survives a graceful restart" to "survives a crash".
+
+- [ ] PD-0 — Measurement first: crash-safety harness + benchmark baseline.
+- [ ] PD-1 — Durability core: CRC framing, torn-tail recovery, WAL
+      ordering, atomic commit records, fsync policy + directory fsync.
+- [ ] PD-2 — Write-path architecture: dedicated log-writer thread with
+      group commit.
+- [ ] PD-3 — Query-path performance: `TCP_NODELAY`, single-buffer
+      responses, scan predicate pushdown, `Arc<TableSchema>`.
+- [ ] PD-4 — Operational hardening: streaming replay, checkpoint/
+      compaction, volatile-mode warning, idle-connection reaping, sort-path
+      and buffer hygiene.
+- [ ] **Acceptance:** every checkbox in
+      [PERFORMANCE_DURABILITY_PLAN.md](PERFORMANCE_DURABILITY_PLAN.md) is
+      checked, the crash harness passes un-`#[ignore]`d in CI, and the
+      benchmark table there records before/after numbers.
+
+---
+
 ## Async runtime note
 
 The skeleton is deliberately dependency-free and blocking. Introduce `tokio`
