@@ -1,0 +1,107 @@
+name: Release
+
+# Builds a release-mode (cargo build --release) Linux binary bundle and
+# attaches it to a GitHub Release. Runs natively on a stock ubuntu-latest
+# runner — no cross-compilation, no Docker, no emulation — matching CI's
+# own "a stock Ubuntu runner with a Rust toolchain is sufficient" approach
+# and the same reasoning: this avoids the fragility of cross-compiling from
+# a developer's own machine (a different CPU architecture runs under slow
+# emulation locally; a different OS needs a cross-linker that may not even
+# be installed) by building where the target platform is the host platform.
+#
+# Triggers on publishing a GitHub Release (the normal flow: `gh release
+# create` or the web UI creates the release, which fires this) or manually
+# via workflow_dispatch against an existing tag (e.g. to backfill an
+# artifact onto a release that predates this workflow).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and upload the Linux bundle for"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-bundle:
+    name: Build Linux release bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-release-
+
+      - name: Build release binary
+        run: cargo build --release --locked --verbose
+
+      # Not a substitute for the real test suite (already gated by CI on
+      # every push) — just confirms this specific release artifact starts,
+      # actually accepts a TCP connection, and shuts down cleanly on
+      # SIGTERM, the same three things verified by hand before the v0.1.0
+      # macOS bundle was uploaded.
+      - name: Smoke-test the binary
+        run: |
+          MYSQLRUST_LISTEN_ADDR=127.0.0.1:33061 MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret \
+            ./target/release/mysql-rust &
+          PID=$!
+          sleep 1
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "binary exited unexpectedly during smoke test" >&2
+            exit 1
+          fi
+          if ! timeout 2 bash -c 'echo > /dev/tcp/127.0.0.1/33061' 2>/dev/null; then
+            echo "server did not accept a TCP connection" >&2
+            kill -9 "$PID" 2>/dev/null || true
+            exit 1
+          fi
+          kill -TERM "$PID"
+          wait "$PID"
+
+      - name: Package bundle
+        id: package
+        run: |
+          TAG="${{ inputs.tag || github.event.release.tag_name }}"
+          BUNDLE="mysql-rust-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir "$BUNDLE"
+          cp target/release/mysql-rust "$BUNDLE/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$BUNDLE/"
+          tar -czf "${BUNDLE}.tar.gz" "$BUNDLE"
+          sha256sum "${BUNDLE}.tar.gz" > "${BUNDLE}.tar.gz.sha256"
+          echo "bundle=${BUNDLE}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.event.release.tag_name }}"
+          gh release upload "$TAG" \
+            "${{ steps.package.outputs.bundle }}" \
+            "${{ steps.package.outputs.bundle }}.sha256" \
+            --clobber \
+            --repo "${{ github.repository }}"
