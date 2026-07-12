@@ -566,6 +566,98 @@ async fn real_driver_group_by_and_aggregates() {
 }
 
 #[tokio::test]
+async fn real_driver_join() {
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    conn.query_drop("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR)")
+        .await
+        .expect("CREATE TABLE customers");
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, total DECIMAL(10,2))",
+    )
+    .await
+    .expect("CREATE TABLE orders");
+    conn.query_drop("INSERT INTO customers VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Alan')")
+        .await
+        .expect("INSERT customers");
+    // Alan (3) deliberately has no orders — the row an INNER JOIN must drop
+    // and a LEFT JOIN must keep, NULL-padded.
+    conn.query_drop("INSERT INTO orders VALUES (100, 1, 9.99), (101, 1, 5.00), (102, 2, 20.00)")
+        .await
+        .expect("INSERT orders");
+
+    // INNER JOIN with table aliases and qualified column references.
+    let inner: Vec<(String, String)> = conn
+        .query(
+            "SELECT c.name, o.total FROM customers c JOIN orders o \
+             ON c.id = o.customer_id ORDER BY o.id",
+        )
+        .await
+        .expect("INNER JOIN");
+    assert_eq!(
+        inner,
+        vec![
+            ("Ada".to_string(), "9.99".to_string()),
+            ("Ada".to_string(), "5.00".to_string()),
+            ("Grace".to_string(), "20.00".to_string()),
+        ]
+    );
+
+    // LEFT JOIN keeps Alan, with NULL order columns.
+    let left: Vec<(String, Option<String>)> = conn
+        .query(
+            "SELECT c.name, o.total FROM customers c LEFT JOIN orders o \
+             ON c.id = o.customer_id ORDER BY c.id, o.id",
+        )
+        .await
+        .expect("LEFT JOIN");
+    assert_eq!(
+        left,
+        vec![
+            ("Ada".to_string(), Some("9.99".to_string())),
+            ("Ada".to_string(), Some("5.00".to_string())),
+            ("Grace".to_string(), Some("20.00".to_string())),
+            ("Alan".to_string(), None),
+        ]
+    );
+
+    // WHERE filters the joined result, and GROUP BY/aggregates work over it
+    // too — a report a real dashboard would generate.
+    let report: Vec<(String, i64, String)> = conn
+        .query(
+            "SELECT c.name, COUNT(*), SUM(o.total) FROM customers c JOIN orders o \
+             ON c.id = o.customer_id GROUP BY c.name ORDER BY c.name",
+        )
+        .await
+        .expect("GROUP BY over a JOIN");
+    assert_eq!(
+        report,
+        vec![
+            ("Ada".to_string(), 2, "14.99".to_string()),
+            ("Grace".to_string(), 1, "20.00".to_string()),
+        ]
+    );
+
+    // An unqualified column that exists on both sides is a clean ERR
+    // ("ambiguous"), not a silent guess.
+    let ambiguous = conn
+        .query_drop("SELECT id FROM customers c JOIN orders o ON c.id = o.customer_id")
+        .await;
+    assert!(ambiguous.is_err());
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
+#[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`
     // produces — built through the same `from_env` code path, but with an

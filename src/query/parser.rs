@@ -24,13 +24,18 @@ pub enum Statement {
     },
     Select {
         projection: Vec<SelectItem>,
-        from: Option<String>,
-        selection: Option<Condition>,
-        /// `GROUP BY` column names. A non-empty list, or any aggregate
+        from: Option<FromClause>,
+        /// Boxed: `Condition` is the largest field here by a wide margin
+        /// (it embeds an `Expr`), and `Statement` is passed and matched on
+        /// by value throughout — boxing keeps every other, far more common
+        /// `Statement` variant (`Insert`, `CreateTable`, ...) from paying
+        /// for `Select`'s worst case on the stack.
+        selection: Option<Box<Condition>>,
+        /// `GROUP BY` column references. A non-empty list, or any aggregate
         /// function (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) in `projection`, puts
         /// the query on the aggregate execution path — see
         /// `Executor::execute_select_aggregate`.
-        group_by: Vec<String>,
+        group_by: Vec<ColumnRef>,
         order_by: Vec<OrderByItem>,
         limit: Option<u64>,
         offset: Option<u64>,
@@ -108,6 +113,71 @@ pub enum SelectItem {
     Expr(Expr, Option<String>),
 }
 
+/// A column reference, optionally qualified by the table name or `AS` alias
+/// it came from (`t.col` / `alias.col`). The qualifier only matters once a
+/// query names more than one table (a `JOIN`); an unqualified reference must
+/// be unambiguous among whatever tables are in scope — see
+/// `Executor`'s `Scope::resolve`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnRef {
+    pub table: Option<String>,
+    pub column: String,
+}
+
+impl From<&str> for ColumnRef {
+    /// An unqualified reference — a convenience for building queries and
+    /// tests without a `JOIN` in play.
+    fn from(column: &str) -> Self {
+        ColumnRef {
+            table: None,
+            column: column.to_string(),
+        }
+    }
+}
+
+/// One table named in a `FROM`/`JOIN`, with its optional `AS` alias.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+impl TableRef {
+    /// The name a column reference qualifies itself with: the alias if one
+    /// was given, else the table's own name (`FROM orders o` -> `o.total`;
+    /// `FROM orders` -> `orders.total`) — matching standard SQL.
+    pub fn qualifier(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+}
+
+/// One `JOIN` clause: the table being joined in, and the single
+/// column-to-column equality its `ON` compares. This engine's `WHERE` has
+/// never supported AND/OR-chaining a predicate (see [`Condition`]), so
+/// restricting `ON` to one equality is the same established simplification,
+/// not a new one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: TableRef,
+    pub left: ColumnRef,
+    pub right: ColumnRef,
+}
+
+/// A `SELECT`'s `FROM`: one base table, plus zero or more `JOIN`s chained
+/// onto it in the order they appear.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromClause {
+    pub table: TableRef,
+    pub joins: Vec<JoinClause>,
+}
+
 /// A literal or column reference.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -119,7 +189,7 @@ pub enum Expr {
     String(String),
     Null,
     SystemVariable(String),
-    Column(String),
+    Column(ColumnRef),
     /// A function call such as `DATABASE()` or `VERSION()`. Arguments are
     /// captured but only a small set of no-argument informational functions is
     /// evaluated (see the executor); unknown functions yield `NULL`.
@@ -141,7 +211,7 @@ impl Expr {
             Expr::String(s) => Some(s.clone()),
             Expr::Null => None,
             Expr::SystemVariable(name) => Some(format!("@@{name}")),
-            Expr::Column(name) => Some(name.clone()),
+            Expr::Column(col_ref) => Some(col_ref.column.clone()),
             Expr::Function(name, _) => Some(format!("{name}()")),
             Expr::Placeholder(i) => Some(format!("?{i}")),
         }
@@ -160,16 +230,16 @@ pub enum CompareOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Condition {
-    pub column: String,
+    pub column: ColumnRef,
     pub op: CompareOp,
     pub value: Expr,
 }
 
-/// One `ORDER BY` key: a column name (this server doesn't support ordering
-/// by a positional index or an arbitrary expression) and direction.
+/// One `ORDER BY` key: a column reference (this server doesn't support
+/// ordering by a positional index or an arbitrary expression) and direction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderByItem {
-    pub column: String,
+    pub column: ColumnRef,
     pub descending: bool,
 }
 
@@ -229,6 +299,11 @@ enum Keyword {
     By,
     Limit,
     Group,
+    Join,
+    Left,
+    On,
+    Inner,
+    Outer,
 }
 
 fn keyword_text(kw: Keyword) -> String {
@@ -262,6 +337,11 @@ fn keyword_from_ident(s: &str) -> Option<Keyword> {
         "LIMIT" => Some(Keyword::Limit),
         "GROUP" => Some(Keyword::Group),
         "DROP" => Some(Keyword::Drop),
+        "JOIN" => Some(Keyword::Join),
+        "LEFT" => Some(Keyword::Left),
+        "ON" => Some(Keyword::On),
+        "INNER" => Some(Keyword::Inner),
+        "OUTER" => Some(Keyword::Outer),
         _ => None,
     }
 }
@@ -1286,22 +1366,14 @@ impl<'a> Parser<'a> {
 
         let (from, selection) = if let Some(Token::Keyword(Keyword::From)) = self.peek() {
             self.pos += 1;
-            let table = self.expect_qualified_ident()?;
-            // An optional table alias (`FROM t alias` / `FROM t AS alias`) is
-            // parsed and discarded: this server doesn't support qualifying a
-            // column reference by table/alias (`alias.col`), only by name, so
-            // there's nowhere for it to be used yet — but accepting it means a
-            // query that includes one (common in generated SQL, e.g. from
-            // `information_schema` introspection) parses instead of failing
-            // at this token.
-            self.parse_optional_alias()?;
+            let from = self.parse_from_clause()?;
             let selection = if let Some(Token::Keyword(Keyword::Where)) = self.peek() {
                 self.pos += 1;
-                Some(self.parse_condition()?)
+                Some(Box::new(self.parse_condition()?))
             } else {
                 None
             };
-            (Some(table), selection)
+            (Some(from), selection)
         } else {
             (None, None)
         };
@@ -1322,8 +1394,62 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `<table> [[AS] alias] [{[INNER] JOIN | LEFT [OUTER] JOIN} <table>
+    /// [[AS] alias] ON <col> = <col>]*`. `INNER`/`LEFT`/`OUTER`/`JOIN`/`ON`
+    /// are reserved keywords (matching real MySQL), so none of them can be
+    /// mistaken for a bare table alias immediately after a table name —
+    /// e.g. `FROM t INNER JOIN u` can't misparse `INNER` as `t`'s alias.
+    fn parse_from_clause(&mut self) -> Result<FromClause> {
+        let table = self.parse_table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            let join_type = if matches!(self.peek(), Some(Token::Keyword(Keyword::Join))) {
+                self.pos += 1;
+                JoinType::Inner
+            } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Inner))) {
+                self.pos += 1;
+                self.expect_keyword(Keyword::Join)?;
+                JoinType::Inner
+            } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Left))) {
+                self.pos += 1;
+                if matches!(self.peek(), Some(Token::Keyword(Keyword::Outer))) {
+                    self.pos += 1;
+                }
+                self.expect_keyword(Keyword::Join)?;
+                JoinType::Left
+            } else {
+                break;
+            };
+
+            let join_table = self.parse_table_ref()?;
+            self.expect_keyword(Keyword::On)?;
+            let left = self.parse_column_ref()?;
+            self.expect_punct(&Token::Eq)?;
+            let right = self.parse_column_ref()?;
+            joins.push(JoinClause {
+                join_type,
+                table: join_table,
+                left,
+                right,
+            });
+        }
+        Ok(FromClause { table, joins })
+    }
+
+    /// `<table> [[AS] alias]` — a table name (schema-qualified names are
+    /// accepted; only the final segment is kept, see
+    /// [`expect_qualified_ident`]) with an optional alias, used by both the
+    /// base `FROM` table and each `JOIN`ed one.
+    ///
+    /// [`expect_qualified_ident`]: Parser::expect_qualified_ident
+    fn parse_table_ref(&mut self) -> Result<TableRef> {
+        let name = self.expect_qualified_ident()?;
+        let alias = self.parse_optional_alias()?;
+        Ok(TableRef { name, alias })
+    }
+
     /// An optional `GROUP BY col [, col ...]`.
-    fn parse_optional_group_by(&mut self) -> Result<Vec<String>> {
+    fn parse_optional_group_by(&mut self) -> Result<Vec<ColumnRef>> {
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Group))) {
             return Ok(Vec::new());
         }
@@ -1332,7 +1458,7 @@ impl<'a> Parser<'a> {
 
         let mut columns = Vec::new();
         loop {
-            columns.push(self.expect_ident()?);
+            columns.push(self.parse_column_ref()?);
             match self.peek() {
                 Some(Token::Comma) => self.pos += 1,
                 _ => break,
@@ -1351,7 +1477,7 @@ impl<'a> Parser<'a> {
 
         let mut items = Vec::new();
         loop {
-            let column = self.expect_ident()?;
+            let column = self.parse_column_ref()?;
             let descending = if self.peek_is_ident_ci("DESC") {
                 self.pos += 1;
                 true
@@ -1403,8 +1529,37 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A column reference: a plain identifier, optionally followed by
+    /// `.column` to qualify it by a table name or alias (`t.col`).
+    fn parse_column_ref(&mut self) -> Result<ColumnRef> {
+        let first = self.expect_ident()?;
+        self.finish_column_ref(first)
+    }
+
+    /// Given an identifier already consumed, check for a `.column` suffix
+    /// and build the resulting [`ColumnRef`] — shared by [`parse_column_ref`]
+    /// and `parse_expr`'s bare-identifier case, which both accept the same
+    /// `name` / `qualifier.name` shape.
+    ///
+    /// [`parse_column_ref`]: Parser::parse_column_ref
+    fn finish_column_ref(&mut self, first: String) -> Result<ColumnRef> {
+        if matches!(self.peek(), Some(Token::Dot)) {
+            self.pos += 1;
+            let column = self.expect_ident()?;
+            Ok(ColumnRef {
+                table: Some(first),
+                column,
+            })
+        } else {
+            Ok(ColumnRef {
+                table: None,
+                column: first,
+            })
+        }
+    }
+
     fn parse_condition(&mut self) -> Result<Condition> {
-        let column = self.expect_ident()?;
+        let column = self.parse_column_ref()?;
         let op = match self.advance() {
             Some(Token::Eq) => CompareOp::Eq,
             Some(Token::NotEq) => CompareOp::NotEq,
@@ -1444,7 +1599,7 @@ impl<'a> Parser<'a> {
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.parse_function_call(name)
                 } else {
-                    Ok(Expr::Column(name))
+                    Ok(Expr::Column(self.finish_column_ref(name)?))
                 }
             }
             Some(Token::Placeholder) if allow_placeholders => {
@@ -1595,10 +1750,14 @@ pub fn bind_parameters(statement: Statement, params: &[Expr]) -> Result<Statemen
                 .collect::<Result<Vec<SelectItem>>>()?,
             from,
             selection: match selection {
-                Some(cond) => Some(Condition {
-                    value: bind_expr(cond.value, params)?,
-                    ..cond
-                }),
+                Some(cond) => {
+                    let Condition { column, op, value } = *cond;
+                    Some(Box::new(Condition {
+                        column,
+                        op,
+                        value: bind_expr(value, params)?,
+                    }))
+                }
                 None => None,
             },
             // GROUP BY/ORDER BY/LIMIT/OFFSET carry no placeholders (plain
@@ -2189,7 +2348,13 @@ mod tests {
             stmt,
             Statement::Select {
                 projection: vec![SelectItem::Wildcard],
-                from: Some("TABLES".to_string()),
+                from: Some(FromClause {
+                    table: TableRef {
+                        name: "TABLES".to_string(),
+                        alias: None,
+                    },
+                    joins: Vec::new(),
+                }),
                 selection: None,
                 group_by: Vec::new(),
                 order_by: Vec::new(),
@@ -2201,10 +2366,22 @@ mod tests {
 
     #[test]
     fn select_from_table_with_bare_and_as_alias() {
-        assert!(parse("SELECT * FROM t alias").is_ok());
-        assert!(parse("SELECT * FROM t AS alias").is_ok());
-        // The alias is parsed and discarded, but WHERE afterward still works.
-        assert!(parse("SELECT * FROM t alias WHERE a = 1").is_ok());
+        for sql in ["SELECT * FROM t alias", "SELECT * FROM t AS alias"] {
+            let stmt = parse(sql).unwrap();
+            match stmt {
+                Statement::Select {
+                    from:
+                        Some(FromClause {
+                            table: TableRef { alias, .. },
+                            ..
+                        }),
+                    ..
+                } => assert_eq!(alias, Some("alias".to_string())),
+                other => panic!("expected Select, got {other:?}"),
+            }
+        }
+        // The alias is captured and usable to qualify a column afterward.
+        assert!(parse("SELECT * FROM t alias WHERE alias.a = 1").is_ok());
     }
 
     #[test]
@@ -2214,7 +2391,13 @@ mod tests {
             stmt,
             Statement::Select {
                 projection: vec![SelectItem::Wildcard],
-                from: Some("t".to_string()),
+                from: Some(FromClause {
+                    table: TableRef {
+                        name: "t".to_string(),
+                        alias: None,
+                    },
+                    joins: Vec::new(),
+                }),
                 selection: None,
                 group_by: Vec::new(),
                 order_by: Vec::new(),
@@ -2231,15 +2414,21 @@ mod tests {
             stmt,
             Statement::Select {
                 projection: vec![
-                    SelectItem::Expr(Expr::Column("a".to_string()), None),
-                    SelectItem::Expr(Expr::Column("b".to_string()), None),
+                    SelectItem::Expr(Expr::Column("a".into()), None),
+                    SelectItem::Expr(Expr::Column("b".into()), None),
                 ],
-                from: Some("t".to_string()),
-                selection: Some(Condition {
-                    column: "a".to_string(),
+                from: Some(FromClause {
+                    table: TableRef {
+                        name: "t".to_string(),
+                        alias: None,
+                    },
+                    joins: Vec::new(),
+                }),
+                selection: Some(Box::new(Condition {
+                    column: "a".into(),
                     op: CompareOp::Eq,
                     value: Expr::Integer(1),
-                }),
+                })),
                 group_by: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
@@ -2281,7 +2470,7 @@ mod tests {
                 assert_eq!(
                     order_by,
                     vec![OrderByItem {
-                        column: "name".to_string(),
+                        column: "name".into(),
                         descending: false,
                     }]
                 );
@@ -2299,11 +2488,11 @@ mod tests {
                     order_by,
                     vec![
                         OrderByItem {
-                            column: "a".to_string(),
+                            column: "a".into(),
                             descending: false,
                         },
                         OrderByItem {
-                            column: "b".to_string(),
+                            column: "b".into(),
                             descending: true,
                         },
                     ]
@@ -2383,7 +2572,7 @@ mod tests {
         let stmt = parse("SELECT category FROM t GROUP BY category").unwrap();
         match stmt {
             Statement::Select { group_by, .. } => {
-                assert_eq!(group_by, vec!["category".to_string()]);
+                assert_eq!(group_by, vec!["category".into()]);
             }
             other => panic!("expected Select, got {other:?}"),
         }
@@ -2391,7 +2580,7 @@ mod tests {
         let stmt = parse("SELECT a, b FROM t GROUP BY a, b").unwrap();
         match stmt {
             Statement::Select { group_by, .. } => {
-                assert_eq!(group_by, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(group_by, vec!["a".into(), "b".into()]);
             }
             other => panic!("expected Select, got {other:?}"),
         }
@@ -2423,7 +2612,7 @@ mod tests {
                     .iter()
                     .map(|item| match item {
                         SelectItem::Expr(Expr::Function(name, args), _) => {
-                            assert_eq!(args, &vec![Expr::Column("price".to_string())]);
+                            assert_eq!(args, &vec![Expr::Column("price".into())]);
                             name.as_str()
                         }
                         other => panic!("expected a function call, got {other:?}"),
@@ -2449,13 +2638,191 @@ mod tests {
                 limit,
                 ..
             } => {
-                assert_eq!(group_by, vec!["category".to_string()]);
+                assert_eq!(group_by, vec!["category".into()]);
                 assert_eq!(order_by.len(), 1);
-                assert_eq!(order_by[0].column, "total");
+                assert_eq!(order_by[0].column, "total".into());
                 assert_eq!(limit, Some(5));
             }
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    // ---- JOIN ----
+
+    #[test]
+    fn inner_join_with_and_without_the_inner_keyword() {
+        for sql in [
+            "SELECT * FROM a JOIN b ON a.id = b.a_id",
+            "SELECT * FROM a INNER JOIN b ON a.id = b.a_id",
+        ] {
+            let stmt = parse(sql).unwrap_or_else(|e| panic!("parse({sql:?}) failed: {e}"));
+            match stmt {
+                Statement::Select {
+                    from: Some(FromClause { table, joins }),
+                    ..
+                } => {
+                    assert_eq!(
+                        table,
+                        TableRef {
+                            name: "a".to_string(),
+                            alias: None
+                        }
+                    );
+                    assert_eq!(
+                        joins,
+                        vec![JoinClause {
+                            join_type: JoinType::Inner,
+                            table: TableRef {
+                                name: "b".to_string(),
+                                alias: None,
+                            },
+                            left: ColumnRef {
+                                table: Some("a".to_string()),
+                                column: "id".to_string(),
+                            },
+                            right: ColumnRef {
+                                table: Some("b".to_string()),
+                                column: "a_id".to_string(),
+                            },
+                        }]
+                    );
+                }
+                other => panic!("expected Select, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn left_join_with_and_without_outer() {
+        for sql in [
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id",
+            "SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.a_id",
+        ] {
+            let stmt = parse(sql).unwrap_or_else(|e| panic!("parse({sql:?}) failed: {e}"));
+            match stmt {
+                Statement::Select {
+                    from: Some(FromClause { joins, .. }),
+                    ..
+                } => {
+                    assert_eq!(joins.len(), 1);
+                    assert_eq!(joins[0].join_type, JoinType::Left);
+                }
+                other => panic!("expected Select, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn join_with_table_aliases_on_both_sides() {
+        let stmt =
+            parse("SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id")
+                .unwrap();
+        match stmt {
+            Statement::Select {
+                from: Some(FromClause { table, joins }),
+                projection,
+                ..
+            } => {
+                assert_eq!(table.alias, Some("o".to_string()));
+                assert_eq!(joins[0].table.name, "customers");
+                assert_eq!(joins[0].table.alias, Some("c".to_string()));
+                assert_eq!(
+                    projection,
+                    vec![
+                        SelectItem::Expr(
+                            Expr::Column(ColumnRef {
+                                table: Some("o".to_string()),
+                                column: "id".to_string(),
+                            }),
+                            None
+                        ),
+                        SelectItem::Expr(
+                            Expr::Column(ColumnRef {
+                                table: Some("c".to_string()),
+                                column: "name".to_string(),
+                            }),
+                            None
+                        ),
+                    ]
+                );
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chained_joins_across_three_tables() {
+        let stmt =
+            parse("SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id").unwrap();
+        match stmt {
+            Statement::Select {
+                from: Some(FromClause { joins, .. }),
+                ..
+            } => {
+                assert_eq!(joins.len(), 2);
+                assert_eq!(joins[0].join_type, JoinType::Inner);
+                assert_eq!(joins[0].table.name, "b");
+                assert_eq!(joins[1].join_type, JoinType::Left);
+                assert_eq!(joins[1].table.name, "c");
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_on_side_can_be_written_in_either_order() {
+        assert!(parse("SELECT * FROM a JOIN b ON b.a_id = a.id").is_ok());
+    }
+
+    #[test]
+    fn join_where_and_group_by_and_order_by_together() {
+        let stmt = parse(
+            "SELECT a.x, COUNT(*) FROM a JOIN b ON a.id = b.a_id \
+             WHERE a.x > 1 GROUP BY a.x ORDER BY a.x LIMIT 3",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select {
+                from: Some(FromClause { joins, .. }),
+                selection: Some(cond),
+                group_by,
+                order_by,
+                limit,
+                ..
+            } => {
+                assert_eq!(joins.len(), 1);
+                assert_eq!(
+                    cond.column,
+                    ColumnRef {
+                        table: Some("a".to_string()),
+                        column: "x".to_string()
+                    }
+                );
+                assert_eq!(
+                    group_by,
+                    vec![ColumnRef {
+                        table: Some("a".to_string()),
+                        column: "x".to_string()
+                    }]
+                );
+                assert_eq!(order_by.len(), 1);
+                assert_eq!(limit, Some(3));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_requires_on() {
+        assert!(parse("SELECT * FROM a JOIN b").is_err());
+    }
+
+    #[test]
+    fn a_column_or_table_literally_named_join_left_on_inner_outer_is_now_reserved() {
+        // These words are reserved keywords (matching real MySQL), so using
+        // one as a bare identifier is a parse error — a documented, narrow
+        // compatibility cost of adding JOIN support.
+        assert!(parse("SELECT * FROM t WHERE join = 1").is_err());
     }
 
     #[test]

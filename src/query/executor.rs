@@ -4,7 +4,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::query::parser::{
-    ColumnDef, CompareOp, Condition, Expr, OrderByItem, SelectItem, ShowStatement, Statement,
+    ColumnDef, ColumnRef, CompareOp, Condition, Expr, FromClause, JoinType, OrderByItem,
+    SelectItem, ShowStatement, Statement,
 };
 use crate::storage::{format_decimal, ColumnSchema, ColumnType, Storage, TableSchema, Value};
 use crate::{Error, Result};
@@ -325,31 +326,106 @@ impl<'a> Executor<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn execute_select(
         &self,
         projection: Vec<SelectItem>,
-        from: Option<String>,
-        selection: Option<Condition>,
-        group_by: &[String],
+        from: Option<FromClause>,
+        selection: Option<Box<Condition>>,
+        group_by: &[ColumnRef],
         order_by: &[OrderByItem],
         limit: Option<u64>,
         offset: Option<u64>,
     ) -> Result<QueryResult> {
         match from {
             None => self.execute_select_without_table(projection, limit, offset),
-            Some(table) => {
+            Some(from_clause) => {
+                let (scope, rows) = self.resolve_from(&from_clause, &selection)?;
                 if is_aggregate_query(&projection, group_by) {
-                    self.execute_select_aggregate(
-                        &table, projection, selection, group_by, order_by, limit, offset,
-                    )
+                    execute_aggregate(&scope, rows, &projection, group_by, order_by, limit, offset)
                 } else {
-                    self.execute_select_from_table(
-                        &table, projection, selection, order_by, limit, offset,
-                    )
+                    execute_projected(&scope, rows, &projection, order_by, limit, offset)
                 }
             }
         }
+    }
+
+    /// Resolve a `FROM` clause (one table, or several joined) into a column
+    /// [`Scope`] and its `WHERE`-filtered rows. A single, unjoined table
+    /// keeps the indexed `WHERE pk = literal` fast path (see
+    /// `Storage::lookup_by_primary_key`, used inside `scan_and_filter`); a
+    /// `JOIN`ed query has no equivalent index once rows are combined, so its
+    /// `WHERE` is a plain linear filter applied after the join (see
+    /// `apply_where`).
+    fn resolve_from(
+        &self,
+        from: &FromClause,
+        selection: &Option<Box<Condition>>,
+    ) -> Result<(Scope, Vec<Vec<Value>>)> {
+        if from.joins.is_empty() {
+            let schema = self.storage.table_schema(&from.table.name)?;
+            let qualifier = from.table.qualifier();
+            let scope = Scope::single(qualifier, &schema.columns);
+            let rows = self.scan_and_filter(&from.table.name, qualifier, &schema, selection)?;
+            Ok((scope, rows))
+        } else {
+            let (scope, rows) = self.resolve_joins(from)?;
+            let rows = apply_where(rows, &scope, selection)?;
+            Ok((scope, rows))
+        }
+    }
+
+    /// Evaluate a `FROM` clause's `JOIN`s into a combined [`Scope`] and its
+    /// (not yet `WHERE`-filtered) rows, via a sequence of hash joins — each
+    /// subsequent table is joined onto the rows accumulated so far. `ON` is
+    /// restricted to one column-to-column equality (this engine's `WHERE`/
+    /// `ON` have never supported AND/OR-chaining a predicate — see
+    /// [`Condition`]); `NULL` never matches on either side, matching SQL's
+    /// three-valued logic (the same rule `compare_values` already applies to
+    /// `WHERE`). `ON`'s two sides aren't fixed to "old table" / "new table"
+    /// by syntax position (`ON a.x = b.y` is exactly as valid as
+    /// `ON b.y = a.x`), so both orders are tried.
+    fn resolve_joins(&self, from: &FromClause) -> Result<(Scope, Vec<Vec<Value>>)> {
+        let base_schema = self.storage.table_schema(&from.table.name)?;
+        let mut scope = Scope::single(from.table.qualifier(), &base_schema.columns);
+        let mut rows = self.storage.scan(&from.table.name)?;
+
+        for join in &from.joins {
+            let join_schema = self.storage.table_schema(&join.table.name)?;
+            let join_qualifier = join.table.qualifier();
+            let new_table_scope = Scope::single(join_qualifier, &join_schema.columns);
+
+            let (accumulated_idx, new_idx) = match (
+                scope.try_resolve(&join.left),
+                new_table_scope.try_resolve(&join.right),
+            ) {
+                (Some(l), Some(r)) => (l, r),
+                _ => match (
+                    scope.try_resolve(&join.right),
+                    new_table_scope.try_resolve(&join.left),
+                ) {
+                    (Some(l), Some(r)) => (l, r),
+                    _ => {
+                        return Err(Error::Execution(format!(
+                            "JOIN ... ON must compare a column already in scope with a column of '{join_qualifier}'"
+                        )))
+                    }
+                },
+            };
+
+            let new_rows = self.storage.scan(&join.table.name)?;
+            let right_width = join_schema.columns.len();
+            rows = hash_join(
+                rows,
+                accumulated_idx,
+                new_rows,
+                new_idx,
+                right_width,
+                join.join_type,
+            );
+            scope.push_table(join_qualifier, &join_schema.columns);
+        }
+
+        Ok((scope, rows))
     }
 
     /// `SELECT <expr-list>` with no `FROM` — literals, `NULL`, and system
@@ -387,7 +463,11 @@ impl<'a> Executor<'a> {
                     (format!("{name}()"), self.evaluate_function(&name, &args))
                 }
                 // A bare column with no FROM clause is an error, as in MySQL.
-                Expr::Column(name) => {
+                Expr::Column(col_ref) => {
+                    let name = match &col_ref.table {
+                        Some(t) => format!("{t}.{}", col_ref.column),
+                        None => col_ref.column.clone(),
+                    };
                     return Err(Error::Execution(format!(
                         "Unknown column '{name}' in 'field list'"
                     )));
@@ -499,91 +579,27 @@ impl<'a> Executor<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn execute_select_from_table(
-        &self,
-        table: &str,
-        projection: Vec<SelectItem>,
-        selection: Option<Condition>,
-        order_by: &[OrderByItem],
-        limit: Option<u64>,
-        offset: Option<u64>,
-    ) -> Result<QueryResult> {
-        let schema = self.storage.table_schema(table)?;
-        let selected_indices = resolve_projection(&schema.columns, &projection)?;
-        let mut matching_rows = self.scan_and_filter(table, &schema, &selection)?;
-
-        // Sort before projecting: ORDER BY may name a column that isn't in
-        // the SELECT list, so this needs the full (pre-projection) row.
-        if !order_by.is_empty() {
-            let sort_keys = order_by
-                .iter()
-                .map(|item| {
-                    Ok((
-                        column_index(&schema.columns, &item.column)?,
-                        item.descending,
-                    ))
-                })
-                .collect::<Result<Vec<(usize, bool)>>>()?;
-            matching_rows.sort_by(|a, b| {
-                for &(idx, descending) in &sort_keys {
-                    let ordering = value_ordering(&a[idx], &b[idx]);
-                    let ordering = if descending {
-                        ordering.reverse()
-                    } else {
-                        ordering
-                    };
-                    if ordering != Ordering::Equal {
-                        return ordering;
-                    }
-                }
-                Ordering::Equal
-            });
-        }
-
-        // OFFSET then LIMIT, applied after ordering/filtering — matching
-        // real MySQL's evaluation order.
-        let paged_rows: Vec<Vec<Value>> = matching_rows
-            .into_iter()
-            .skip(offset.unwrap_or(0) as usize)
-            .take(limit.unwrap_or(u64::MAX) as usize)
-            .collect();
-
-        let columns = selected_indices
-            .iter()
-            .map(|&i| schema.columns[i].clone())
-            .collect();
-        let rows = paged_rows
-            .into_iter()
-            .map(|row| selected_indices.iter().map(|&i| row[i].clone()).collect())
-            .collect();
-
-        Ok(QueryResult {
-            columns,
-            rows,
-            rows_affected: 0,
-        })
-    }
-
     /// Scan `table` and apply an optional `WHERE` filter, returning full
-    /// (pre-projection) matching rows. Shared by the plain and aggregate
-    /// `SELECT` paths. Uses the indexed primary-key lookup for `col = value`
-    /// on the primary key; a full scan otherwise.
+    /// (pre-projection) matching rows. The no-`JOIN` `SELECT` path (see
+    /// `resolve_from`). Uses the indexed primary-key lookup for
+    /// `col = value` on the primary key; a full scan otherwise.
     fn scan_and_filter(
         &self,
         table: &str,
+        qualifier: &str,
         schema: &TableSchema,
-        selection: &Option<Condition>,
+        selection: &Option<Box<Condition>>,
     ) -> Result<Vec<Vec<Value>>> {
         match selection {
             None => self.storage.scan(table),
             Some(cond) => {
-                let col_idx = column_index(&schema.columns, &cond.column)?;
+                let col_idx =
+                    resolve_single_table_column(&schema.columns, qualifier, &cond.column)?;
                 let column_type = schema.columns[col_idx].column_type;
-                let expected = coerce(&cond.value, column_type, &cond.column)?;
+                let expected = coerce(&cond.value, column_type, &cond.column.column)?;
 
                 let is_pk_equality = cond.op == CompareOp::Eq
-                    && schema.primary_key.as_deref() == Some(cond.column.as_str());
+                    && schema.primary_key.as_deref() == Some(schema.columns[col_idx].name.as_str());
                 if is_pk_equality {
                     Ok(self
                         .storage
@@ -601,177 +617,412 @@ impl<'a> Executor<'a> {
             }
         }
     }
+}
 
-    /// `SELECT` with `GROUP BY` and/or an aggregate function
-    /// (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) in the projection. Groups the
-    /// `WHERE`-filtered rows by `group_by`'s columns' values — or, if
-    /// `group_by` is empty, treats the whole filtered set as one group, so
-    /// e.g. `SELECT COUNT(*) FROM t` always returns exactly one row, even
-    /// for an empty table (zero *groups* only happens with an explicit,
-    /// non-empty `GROUP BY` and zero matching rows). Every bare column in
-    /// the projection must be one of `group_by`'s columns — standard SQL;
-    /// MySQL's own `ONLY_FULL_GROUP_BY` default enforces the same rule.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_select_aggregate(
-        &self,
-        table: &str,
-        projection: Vec<SelectItem>,
-        selection: Option<Condition>,
-        group_by: &[String],
-        order_by: &[OrderByItem],
-        limit: Option<u64>,
-        offset: Option<u64>,
-    ) -> Result<QueryResult> {
-        let schema = self.storage.table_schema(table)?;
-        let group_by_indices = group_by
-            .iter()
-            .map(|name| column_index(&schema.columns, name))
-            .collect::<Result<Vec<usize>>>()?;
+/// The columns visible while resolving a name in a `SELECT`'s `WHERE`/
+/// `GROUP BY`/`ORDER BY`/projection — either one table's own schema, or
+/// several tables' schemas concatenated by a `JOIN`, each column tagged with
+/// the qualifier (table name, or its `AS` alias) it can be addressed by. A
+/// qualified reference (`t.col`) must match both; an unqualified one must be
+/// unambiguous among every table in scope — matching MySQL's own "Column
+/// 'x' in field list is ambiguous" rule.
+struct Scope {
+    qualifiers: Vec<String>,
+    columns: Vec<ColumnSchema>,
+}
 
-        if projection
-            .iter()
-            .any(|item| matches!(item, SelectItem::Wildcard))
-        {
-            return Err(Error::Unsupported("'*' in a GROUP BY / aggregate query"));
+impl Scope {
+    fn single(qualifier: &str, columns: &[ColumnSchema]) -> Self {
+        Scope {
+            qualifiers: vec![qualifier.to_string(); columns.len()],
+            columns: columns.to_vec(),
         }
+    }
 
-        // Resolve each projection item once (not once per group), and build
-        // the output column schema right away — independent of any group's
-        // actual data, so a zero-group result (e.g. GROUP BY on an empty
-        // table) still reports the right columns, just no rows.
-        let mut resolved = Vec::with_capacity(projection.len());
-        let mut output_columns = Vec::with_capacity(projection.len());
-        for item in &projection {
-            let SelectItem::Expr(expr, alias) = item else {
-                unreachable!("wildcard already rejected above");
-            };
-            let (item_plan, default_name, column_type) = match expr {
-                Expr::Column(name) => {
-                    let pos = group_by.iter().position(|g| g == name).ok_or_else(|| {
-                        Error::Execution(format!(
-                            "Column '{name}' must appear in GROUP BY or be used inside an aggregate function"
-                        ))
-                    })?;
-                    let column_type = schema.columns[group_by_indices[pos]].column_type;
-                    (
-                        ResolvedAggregateItem::GroupColumn(pos),
-                        name.clone(),
-                        column_type,
-                    )
-                }
-                Expr::Function(name, args) if is_aggregate_function_name(name) => {
-                    let arg_col = resolve_aggregate_arg(args, &schema)?;
-                    let column_type = aggregate_result_type(name, arg_col.map(|(_, t)| t))?;
-                    let default_name = match arg_col {
-                        None => format!("{name}(*)"),
-                        Some((idx, _)) => format!("{name}({})", schema.columns[idx].name),
-                    };
-                    (
-                        ResolvedAggregateItem::Aggregate(name.clone(), arg_col),
-                        default_name,
-                        column_type,
-                    )
-                }
-                _ => {
-                    return Err(Error::Execution(
-                        "only columns and aggregate functions are allowed in a GROUP BY / aggregate SELECT list"
-                            .to_string(),
-                    ))
-                }
-            };
-            resolved.push(item_plan);
-            output_columns.push(ColumnSchema {
-                name: alias.clone().unwrap_or(default_name),
-                column_type,
-                nullable: true,
-                auto_increment: false,
-            });
-        }
+    /// Extend the scope with another table's columns — used to add each
+    /// `JOIN`ed table onto the accumulated scope, in `FROM`/`JOIN` order
+    /// (matching how rows are concatenated by `hash_join`).
+    fn push_table(&mut self, qualifier: &str, columns: &[ColumnSchema]) {
+        self.qualifiers
+            .extend(std::iter::repeat_n(qualifier.to_string(), columns.len()));
+        self.columns.extend_from_slice(columns);
+    }
 
-        let matching_rows = self.scan_and_filter(table, &schema, &selection)?;
-
-        let mut groups: HashMap<Vec<Value>, Vec<Vec<Value>>> = HashMap::new();
-        if group_by_indices.is_empty() {
-            groups.insert(Vec::new(), matching_rows);
-        } else {
-            for row in matching_rows {
-                let key: Vec<Value> = group_by_indices.iter().map(|&i| row[i].clone()).collect();
-                groups.entry(key).or_default().push(row);
+    /// Resolve without producing an error message: `None` for both "not
+    /// found" and "ambiguous" — used where only a yes/no answer is needed
+    /// (see `Executor::resolve_joins`'s ON-side detection). [`resolve`]
+    /// builds on this to also report *why* a reference failed.
+    ///
+    /// [`resolve`]: Scope::resolve
+    fn try_resolve(&self, col_ref: &ColumnRef) -> Option<usize> {
+        match &col_ref.table {
+            Some(q) => self
+                .qualifiers
+                .iter()
+                .zip(self.columns.iter())
+                .position(|(cq, c)| cq == q && c.name == col_ref.column),
+            None => {
+                let mut matches = self
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.name == col_ref.column);
+                let first = matches.next()?;
+                if matches.next().is_some() {
+                    None
+                } else {
+                    Some(first.0)
+                }
             }
         }
+    }
 
-        // Deterministic group order (by key) so results are stable even
-        // before any ORDER BY is applied.
-        let mut keys: Vec<Vec<Value>> = groups.keys().cloned().collect();
-        keys.sort_by(|a, b| {
-            a.iter()
-                .zip(b.iter())
-                .map(|(av, bv)| value_ordering(av, bv))
+    fn resolve(&self, col_ref: &ColumnRef) -> Result<usize> {
+        self.try_resolve(col_ref)
+            .ok_or_else(|| match &col_ref.table {
+                Some(q) => Error::Execution(format!("Unknown column '{q}.{}'", col_ref.column)),
+                None => {
+                    let ambiguous = self
+                        .columns
+                        .iter()
+                        .filter(|c| c.name == col_ref.column)
+                        .count()
+                        > 1;
+                    if ambiguous {
+                        Error::Execution(format!(
+                            "Column '{}' in field list is ambiguous",
+                            col_ref.column
+                        ))
+                    } else {
+                        Error::Execution(format!("Unknown column '{}'", col_ref.column))
+                    }
+                }
+            })
+    }
+}
+
+/// Resolve a (possibly qualified) column reference against a single table's
+/// own schema — the no-`JOIN` `SELECT` path. A qualifier, if present, must
+/// equal the table's own name or its `FROM ... AS` alias (`qualifier`); an
+/// unqualified reference always just names one of the table's columns, same
+/// as before `JOIN` existed.
+fn resolve_single_table_column(
+    columns: &[ColumnSchema],
+    qualifier: &str,
+    col_ref: &ColumnRef,
+) -> Result<usize> {
+    if let Some(q) = &col_ref.table {
+        if q != qualifier {
+            return Err(Error::Execution(format!(
+                "Unknown column '{q}.{}'",
+                col_ref.column
+            )));
+        }
+    }
+    column_index(columns, &col_ref.column)
+}
+
+/// Join `right_rows` onto `left_rows` by equality between
+/// `left_rows[..][left_idx]` and `right_rows[..][right_idx]`, implemented as
+/// a hash join: index the newly-joined table's rows by their `ON`-column
+/// value, then probe once per accumulated row. `NULL` is never a join key on
+/// either side (`NULL = NULL` is never true in SQL), matching
+/// `compare_values`'s existing `WHERE`-clause rule. A `LEFT` join keeps
+/// every accumulated row even with no match, padding the new table's
+/// columns with `NULL`; an `INNER` join drops it.
+fn hash_join(
+    left_rows: Vec<Vec<Value>>,
+    left_idx: usize,
+    right_rows: Vec<Vec<Value>>,
+    right_idx: usize,
+    right_width: usize,
+    join_type: JoinType,
+) -> Vec<Vec<Value>> {
+    let mut index: HashMap<Value, Vec<usize>> = HashMap::new();
+    for (i, row) in right_rows.iter().enumerate() {
+        if row[right_idx] == Value::Null {
+            continue;
+        }
+        index.entry(row[right_idx].clone()).or_default().push(i);
+    }
+
+    let mut output = Vec::with_capacity(left_rows.len());
+    for mut left_row in left_rows {
+        let key = left_row[left_idx].clone();
+        let match_indices = if key == Value::Null {
+            None
+        } else {
+            index.get(&key)
+        };
+        match match_indices {
+            Some(indices) => {
+                for &i in indices {
+                    let mut combined = left_row.clone();
+                    combined.extend(right_rows[i].iter().cloned());
+                    output.push(combined);
+                }
+            }
+            None if join_type == JoinType::Left => {
+                left_row.extend(std::iter::repeat_n(Value::Null, right_width));
+                output.push(left_row);
+            }
+            None => {}
+        }
+    }
+    output
+}
+
+/// Apply an already-resolved `WHERE` filter to already-materialized rows —
+/// the `JOIN` path's counterpart to `Executor::scan_and_filter`'s non-primary-key
+/// branch (a `JOIN`ed result has no index to speed up an equality lookup).
+fn apply_where(
+    rows: Vec<Vec<Value>>,
+    scope: &Scope,
+    selection: &Option<Box<Condition>>,
+) -> Result<Vec<Vec<Value>>> {
+    let Some(cond) = selection else {
+        return Ok(rows);
+    };
+    let idx = scope.resolve(&cond.column)?;
+    let column_type = scope.columns[idx].column_type;
+    let expected = coerce(&cond.value, column_type, &cond.column.column)?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| compare_values(&row[idx], cond.op, &expected))
+        .collect())
+}
+
+/// The non-aggregate tail of a `SELECT ... FROM ...`: resolve the
+/// projection against `scope`, sort (if `ORDER BY`), then paginate. Shared
+/// by the single-table and `JOIN`ed paths — by this point both have already
+/// produced a [`Scope`] and its `WHERE`-filtered rows, and there's nothing
+/// left that differs between them.
+fn execute_projected(
+    scope: &Scope,
+    mut rows: Vec<Vec<Value>>,
+    projection: &[SelectItem],
+    order_by: &[OrderByItem],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<QueryResult> {
+    let selected_indices = resolve_projection(scope, projection)?;
+
+    // Sort before projecting: ORDER BY may name a column that isn't in the
+    // SELECT list, so this needs the full (pre-projection) row.
+    if !order_by.is_empty() {
+        let sort_keys = order_by
+            .iter()
+            .map(|item| Ok((scope.resolve(&item.column)?, item.descending)))
+            .collect::<Result<Vec<(usize, bool)>>>()?;
+        rows.sort_by(|a, b| {
+            for &(idx, descending) in &sort_keys {
+                let ordering = value_ordering(&a[idx], &b[idx]);
+                let ordering = if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            Ordering::Equal
+        });
+    }
+
+    // OFFSET then LIMIT, applied after ordering/filtering — matching real
+    // MySQL's evaluation order.
+    let paged_rows: Vec<Vec<Value>> = rows
+        .into_iter()
+        .skip(offset.unwrap_or(0) as usize)
+        .take(limit.unwrap_or(u64::MAX) as usize)
+        .collect();
+
+    let columns = selected_indices
+        .iter()
+        .map(|&i| scope.columns[i].clone())
+        .collect();
+    let rows = paged_rows
+        .into_iter()
+        .map(|row| selected_indices.iter().map(|&i| row[i].clone()).collect())
+        .collect();
+
+    Ok(QueryResult {
+        columns,
+        rows,
+        rows_affected: 0,
+    })
+}
+
+/// `SELECT` with `GROUP BY` and/or an aggregate function
+/// (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) in the projection: the aggregate tail of
+/// a `SELECT ... FROM ...`, mirroring [`execute_projected`] — shared by the
+/// single-table and `JOIN`ed paths once both have produced a [`Scope`] and
+/// its `WHERE`-filtered rows. Groups the rows by `group_by`'s columns'
+/// values — or, if `group_by` is empty, treats the whole filtered set as one
+/// group, so e.g. `SELECT COUNT(*) FROM t` always returns exactly one row,
+/// even for an empty table (zero *groups* only happens with an explicit,
+/// non-empty `GROUP BY` and zero matching rows). Every bare column in the
+/// projection must be one of `group_by`'s columns — standard SQL; MySQL's
+/// own `ONLY_FULL_GROUP_BY` default enforces the same rule.
+#[allow(clippy::too_many_arguments)]
+fn execute_aggregate(
+    scope: &Scope,
+    matching_rows: Vec<Vec<Value>>,
+    projection: &[SelectItem],
+    group_by: &[ColumnRef],
+    order_by: &[OrderByItem],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<QueryResult> {
+    let group_by_indices = group_by
+        .iter()
+        .map(|col_ref| scope.resolve(col_ref))
+        .collect::<Result<Vec<usize>>>()?;
+
+    if projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard))
+    {
+        return Err(Error::Unsupported("'*' in a GROUP BY / aggregate query"));
+    }
+
+    // Resolve each projection item once (not once per group), and build the
+    // output column schema right away — independent of any group's actual
+    // data, so a zero-group result (e.g. GROUP BY on an empty table) still
+    // reports the right columns, just no rows.
+    let mut resolved = Vec::with_capacity(projection.len());
+    let mut output_columns = Vec::with_capacity(projection.len());
+    for item in projection {
+        let SelectItem::Expr(expr, alias) = item else {
+            unreachable!("wildcard already rejected above");
+        };
+        let (item_plan, default_name, column_type) = match expr {
+            Expr::Column(col_ref) => {
+                let idx = scope.resolve(col_ref)?;
+                let pos = group_by_indices.iter().position(|&gi| gi == idx).ok_or_else(|| {
+                    Error::Execution(format!(
+                        "Column '{}' must appear in GROUP BY or be used inside an aggregate function",
+                        col_ref.column
+                    ))
+                })?;
+                (
+                    ResolvedAggregateItem::GroupColumn(pos),
+                    scope.columns[idx].name.clone(),
+                    scope.columns[idx].column_type,
+                )
+            }
+            Expr::Function(name, args) if is_aggregate_function_name(name) => {
+                let arg_col = resolve_aggregate_arg(args, scope)?;
+                let column_type = aggregate_result_type(name, arg_col.map(|(_, t)| t))?;
+                let default_name = match arg_col {
+                    None => format!("{name}(*)"),
+                    Some((idx, _)) => format!("{name}({})", scope.columns[idx].name),
+                };
+                (
+                    ResolvedAggregateItem::Aggregate(name.clone(), arg_col),
+                    default_name,
+                    column_type,
+                )
+            }
+            _ => {
+                return Err(Error::Execution(
+                    "only columns and aggregate functions are allowed in a GROUP BY / aggregate SELECT list"
+                        .to_string(),
+                ))
+            }
+        };
+        resolved.push(item_plan);
+        output_columns.push(ColumnSchema {
+            name: alias.clone().unwrap_or(default_name),
+            column_type,
+            nullable: true,
+            auto_increment: false,
+        });
+    }
+
+    let mut groups: HashMap<Vec<Value>, Vec<Vec<Value>>> = HashMap::new();
+    if group_by_indices.is_empty() {
+        groups.insert(Vec::new(), matching_rows);
+    } else {
+        for row in matching_rows {
+            let key: Vec<Value> = group_by_indices.iter().map(|&i| row[i].clone()).collect();
+            groups.entry(key).or_default().push(row);
+        }
+    }
+
+    // Deterministic group order (by key) so results are stable even before
+    // any ORDER BY is applied.
+    let mut keys: Vec<Vec<Value>> = groups.keys().cloned().collect();
+    keys.sort_by(|a, b| {
+        a.iter()
+            .zip(b.iter())
+            .map(|(av, bv)| value_ordering(av, bv))
+            .find(|ord| *ord != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let mut output_rows = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let group_rows = &groups[key];
+        let mut row = Vec::with_capacity(resolved.len());
+        for item_plan in &resolved {
+            let value = match item_plan {
+                ResolvedAggregateItem::GroupColumn(pos) => key[*pos].clone(),
+                ResolvedAggregateItem::Aggregate(name, arg_col) => {
+                    evaluate_aggregate(name, *arg_col, group_rows)?
+                }
+            };
+            row.push(value);
+        }
+        output_rows.push(row);
+    }
+
+    // ORDER BY resolves against the OUTPUT columns (by name/alias), not the
+    // source table(s) — an aggregate query's ORDER BY commonly names an
+    // aggregate's own alias (`ORDER BY total DESC`), which may not even
+    // exist as a column anywhere. The output has no qualifiers of its own,
+    // so only the bare column name is meaningful here.
+    if !order_by.is_empty() {
+        let sort_keys = order_by
+            .iter()
+            .map(|item| {
+                let idx = output_columns
+                    .iter()
+                    .position(|c| c.name == item.column.column)
+                    .ok_or_else(|| {
+                        Error::Execution(format!("Unknown column '{}'", item.column.column))
+                    })?;
+                Ok((idx, item.descending))
+            })
+            .collect::<Result<Vec<(usize, bool)>>>()?;
+        output_rows.sort_by(|a, b| {
+            sort_keys
+                .iter()
+                .map(|&(idx, descending)| {
+                    let ord = value_ordering(&a[idx], &b[idx]);
+                    if descending {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                })
                 .find(|ord| *ord != Ordering::Equal)
                 .unwrap_or(Ordering::Equal)
         });
-
-        let mut output_rows = Vec::with_capacity(keys.len());
-        for key in &keys {
-            let group_rows = &groups[key];
-            let mut row = Vec::with_capacity(resolved.len());
-            for item_plan in &resolved {
-                let value = match item_plan {
-                    ResolvedAggregateItem::GroupColumn(pos) => key[*pos].clone(),
-                    ResolvedAggregateItem::Aggregate(name, arg_col) => {
-                        evaluate_aggregate(name, *arg_col, group_rows)?
-                    }
-                };
-                row.push(value);
-            }
-            output_rows.push(row);
-        }
-
-        // ORDER BY resolves against the OUTPUT columns (by name/alias), not
-        // the source table — an aggregate query's ORDER BY commonly names an
-        // aggregate's own alias (`ORDER BY total DESC`), which may not even
-        // exist as a column in the table.
-        if !order_by.is_empty() {
-            let sort_keys = order_by
-                .iter()
-                .map(|item| {
-                    let idx = output_columns
-                        .iter()
-                        .position(|c| c.name == item.column)
-                        .ok_or_else(|| {
-                            Error::Execution(format!("Unknown column '{}'", item.column))
-                        })?;
-                    Ok((idx, item.descending))
-                })
-                .collect::<Result<Vec<(usize, bool)>>>()?;
-            output_rows.sort_by(|a, b| {
-                sort_keys
-                    .iter()
-                    .map(|&(idx, descending)| {
-                        let ord = value_ordering(&a[idx], &b[idx]);
-                        if descending {
-                            ord.reverse()
-                        } else {
-                            ord
-                        }
-                    })
-                    .find(|ord| *ord != Ordering::Equal)
-                    .unwrap_or(Ordering::Equal)
-            });
-        }
-
-        let paged_rows: Vec<Vec<Value>> = output_rows
-            .into_iter()
-            .skip(offset.unwrap_or(0) as usize)
-            .take(limit.unwrap_or(u64::MAX) as usize)
-            .collect();
-
-        Ok(QueryResult {
-            columns: output_columns,
-            rows: paged_rows,
-            rows_affected: 0,
-        })
     }
+
+    let paged_rows: Vec<Vec<Value>> = output_rows
+        .into_iter()
+        .skip(offset.unwrap_or(0) as usize)
+        .take(limit.unwrap_or(u64::MAX) as usize)
+        .collect();
+
+    Ok(QueryResult {
+        columns: output_columns,
+        rows: paged_rows,
+        rows_affected: 0,
+    })
 }
 
 /// A projection item's meaning once resolved against `GROUP BY` and the
@@ -794,7 +1045,7 @@ fn is_aggregate_function_name(name: &str) -> bool {
 
 /// Whether a `SELECT` needs the aggregate execution path: a non-empty
 /// `GROUP BY`, or any aggregate function call in the projection.
-fn is_aggregate_query(projection: &[SelectItem], group_by: &[String]) -> bool {
+fn is_aggregate_query(projection: &[SelectItem], group_by: &[ColumnRef]) -> bool {
     !group_by.is_empty()
         || projection.iter().any(|item| {
             matches!(item, SelectItem::Expr(Expr::Function(name, _), _) if is_aggregate_function_name(name))
@@ -807,15 +1058,12 @@ fn is_aggregate_query(projection: &[SelectItem], group_by: &[String]) -> bool {
 /// nested call, more than one argument) is `Unsupported` — this engine has
 /// no arithmetic operators, so an aggregate can only ever operate directly
 /// on a stored column.
-fn resolve_aggregate_arg(
-    args: &[Expr],
-    schema: &TableSchema,
-) -> Result<Option<(usize, ColumnType)>> {
+fn resolve_aggregate_arg(args: &[Expr], scope: &Scope) -> Result<Option<(usize, ColumnType)>> {
     match args {
         [] => Ok(None),
-        [Expr::Column(name)] => {
-            let idx = column_index(&schema.columns, name)?;
-            Ok(Some((idx, schema.columns[idx].column_type)))
+        [Expr::Column(col_ref)] => {
+            let idx = scope.resolve(col_ref)?;
+            Ok(Some((idx, scope.columns[idx].column_type)))
         }
         _ => Err(Error::Unsupported(
             "aggregate functions only support a single column argument (or none, for COUNT(*))",
@@ -825,7 +1073,7 @@ fn resolve_aggregate_arg(
 
 /// The result type of an aggregate function, given its argument's column
 /// type (`None` for `COUNT(*)`) — used to build the output column schema
-/// independent of any actual group's data (see `execute_select_aggregate`).
+/// independent of any actual group's data (see `execute_aggregate`).
 fn aggregate_result_type(name: &str, arg_type: Option<ColumnType>) -> Result<ColumnType> {
     match name.to_ascii_uppercase().as_str() {
         "COUNT" => Ok(ColumnType::Int),
@@ -979,12 +1227,9 @@ fn evaluate_aggregate(
     }
 }
 
-fn resolve_projection(
-    table_columns: &[ColumnSchema],
-    projection: &[SelectItem],
-) -> Result<Vec<usize>> {
+fn resolve_projection(scope: &Scope, projection: &[SelectItem]) -> Result<Vec<usize>> {
     if let [SelectItem::Wildcard] = projection {
-        return Ok((0..table_columns.len()).collect());
+        return Ok((0..scope.columns.len()).collect());
     }
 
     let mut indices = Vec::with_capacity(projection.len());
@@ -995,9 +1240,7 @@ fn resolve_projection(
                     "'*' cannot be combined with other selected columns".to_string(),
                 ));
             }
-            SelectItem::Expr(Expr::Column(name), _) => {
-                indices.push(column_index(table_columns, name)?)
-            }
+            SelectItem::Expr(Expr::Column(col_ref), _) => indices.push(scope.resolve(col_ref)?),
             SelectItem::Expr(_, _) => {
                 return Err(Error::Unsupported(
                     "literal expressions in a SELECT list alongside a FROM clause",
@@ -2131,6 +2374,264 @@ mod tests {
             run(&storage, "SELECT COUNT(a, b) FROM t"),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    // ---- JOIN (Phase 11) ----
+
+    /// `customers`: Ada(1), Grace(2), Alan(3) — Alan has no orders, so he's
+    /// the row a `LEFT JOIN` must keep (NULL-padded) and an `INNER JOIN`
+    /// must drop. `orders`: two for Ada (100, 101), one for Grace (102) —
+    /// Ada's two rows exercise one-to-many fan-out. Both tables have an
+    /// `id` column, deliberately, so an unqualified `SELECT id` is
+    /// ambiguous once they're joined.
+    fn seed_orders_and_customers(storage: &InMemoryStorage) {
+        run(
+            storage,
+            "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR)",
+        )
+        .expect("create customers");
+        run(
+            storage,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, total DECIMAL(10,2))",
+        )
+        .expect("create orders");
+        for (id, name) in [(1, "Ada"), (2, "Grace"), (3, "Alan")] {
+            run(
+                storage,
+                &format!("INSERT INTO customers VALUES ({id}, '{name}')"),
+            )
+            .expect("insert customer");
+        }
+        for (id, customer_id, total) in [(100, 1, "9.99"), (101, 1, "5.00"), (102, 2, "20.00")] {
+            run(
+                storage,
+                &format!("INSERT INTO orders VALUES ({id}, {customer_id}, {total})"),
+            )
+            .expect("insert order");
+        }
+    }
+
+    #[test]
+    fn inner_join_returns_only_matching_rows() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        let result = run(
+            &storage,
+            "SELECT c.name, o.total FROM customers c JOIN orders o \
+             ON c.id = o.customer_id ORDER BY o.id",
+        )
+        .expect("select");
+        assert_eq!(result.column_names(), vec!["name", "total"]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![vc("Ada"), Value::Decimal(999, 2)],
+                vec![vc("Ada"), Value::Decimal(500, 2)],
+                vec![vc("Grace"), Value::Decimal(2000, 2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn left_join_pads_unmatched_rows_with_null() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        let result = run(
+            &storage,
+            "SELECT c.name, o.total FROM customers c LEFT JOIN orders o \
+             ON c.id = o.customer_id ORDER BY c.id, o.id",
+        )
+        .expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![vc("Ada"), Value::Decimal(999, 2)],
+                vec![vc("Ada"), Value::Decimal(500, 2)],
+                vec![vc("Grace"), Value::Decimal(2000, 2)],
+                vec![vc("Alan"), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn join_where_filters_after_the_join() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        let result = run(
+            &storage,
+            "SELECT c.name FROM customers c JOIN orders o \
+             ON c.id = o.customer_id WHERE o.total > 6.00",
+        )
+        .expect("select");
+        assert_eq!(result.rows, vec![vec![vc("Ada")], vec![vc("Grace")]]);
+    }
+
+    #[test]
+    fn join_unqualified_column_resolves_when_unambiguous() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        // No alias given, so each table's own name is its qualifier; `name`/
+        // `total`/`customer_id` each exist on only one side, so referencing
+        // them unqualified is fine even though `id` alone would be ambiguous.
+        let result = run(
+            &storage,
+            "SELECT name, total FROM customers JOIN orders \
+             ON customers.id = orders.customer_id WHERE customer_id = 1 ORDER BY total",
+        )
+        .expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![vc("Ada"), Value::Decimal(500, 2)],
+                vec![vc("Ada"), Value::Decimal(999, 2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn join_unqualified_ambiguous_column_is_an_error() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        assert!(matches!(
+            run(
+                &storage,
+                "SELECT id FROM customers c JOIN orders o ON c.id = o.customer_id"
+            ),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn join_on_referencing_an_unknown_column_is_a_clear_error() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        assert!(matches!(
+            run(
+                &storage,
+                "SELECT * FROM customers c JOIN orders o ON c.nonexistent = o.customer_id"
+            ),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn join_wildcard_projects_columns_from_every_table_in_order() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        let result = run(
+            &storage,
+            "SELECT * FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.id = 100",
+        )
+        .expect("select");
+        // Both tables have an `id` column — a wildcard still reports both,
+        // unqualified, in FROM order, same as real MySQL's wire output.
+        assert_eq!(
+            result.column_names(),
+            vec!["id", "name", "id", "customer_id", "total"]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                int(1),
+                vc("Ada"),
+                int(100),
+                int(1),
+                Value::Decimal(999, 2)
+            ]]
+        );
+    }
+
+    #[test]
+    fn group_by_over_a_join() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        let result = run(
+            &storage,
+            "SELECT c.name, COUNT(*), SUM(o.total) FROM customers c JOIN orders o \
+             ON c.id = o.customer_id GROUP BY c.name ORDER BY c.name",
+        )
+        .expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![vc("Ada"), int(2), Value::Decimal(1499, 2)],
+                vec![vc("Grace"), int(1), Value::Decimal(2000, 2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn chained_join_across_three_tables() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE a (id INT PRIMARY KEY, label VARCHAR)",
+        )
+        .expect("create a");
+        run(
+            &storage,
+            "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, label VARCHAR)",
+        )
+        .expect("create b");
+        run(
+            &storage,
+            "CREATE TABLE c (id INT PRIMARY KEY, b_id INT, label VARCHAR)",
+        )
+        .expect("create c");
+        run(&storage, "INSERT INTO a VALUES (1, 'a1')").expect("insert a");
+        run(&storage, "INSERT INTO b VALUES (10, 1, 'b1')").expect("insert b");
+        run(&storage, "INSERT INTO c VALUES (100, 10, 'c1')").expect("insert c");
+
+        let result = run(
+            &storage,
+            "SELECT a.label, b.label, c.label FROM a \
+             JOIN b ON a.id = b.a_id \
+             JOIN c ON b.id = c.b_id",
+        )
+        .expect("select");
+        assert_eq!(result.rows, vec![vec![vc("a1"), vc("b1"), vc("c1")]]);
+    }
+
+    #[test]
+    fn null_join_key_never_matches_even_for_inner_join() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE a (id INT PRIMARY KEY, x INT)").expect("create a");
+        run(&storage, "CREATE TABLE b (id INT PRIMARY KEY, x INT)").expect("create b");
+        run(&storage, "INSERT INTO a VALUES (1, NULL)").expect("insert a");
+        run(&storage, "INSERT INTO b VALUES (1, NULL)").expect("insert b");
+        let result = run(&storage, "SELECT * FROM a JOIN b ON a.x = b.x").expect("select");
+        assert_eq!(result.rows, Vec::<Vec<Value>>::new());
+    }
+
+    #[test]
+    fn join_on_condition_works_with_either_side_order() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        let a = run(
+            &storage,
+            "SELECT COUNT(*) FROM customers c JOIN orders o ON c.id = o.customer_id",
+        )
+        .expect("select a");
+        let b = run(
+            &storage,
+            "SELECT COUNT(*) FROM customers c JOIN orders o ON o.customer_id = c.id",
+        )
+        .expect("select b");
+        assert_eq!(a.rows, b.rows);
+        assert_eq!(a.rows, vec![vec![int(3)]]);
+    }
+
+    #[test]
+    fn join_with_order_by_and_limit() {
+        let storage = InMemoryStorage::new();
+        seed_orders_and_customers(&storage);
+        let result = run(
+            &storage,
+            "SELECT o.id FROM customers c JOIN orders o \
+             ON c.id = o.customer_id ORDER BY o.total DESC LIMIT 1",
+        )
+        .expect("select");
+        assert_eq!(result.rows, vec![vec![int(102)]]);
     }
 
     #[test]

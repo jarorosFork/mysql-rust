@@ -191,6 +191,40 @@ const ENTRIES: &[Entry] = &[
         name: "MIN and MAX",
         sql: "SELECT MIN(amount), MAX(amount) FROM sales",
     },
+    // ---- Phase 11: JOIN (INNER / LEFT) ----
+    Entry {
+        name: "create and seed customers/orders for JOIN queries \
+               (Alan deliberately has no orders)",
+        sql: "CREATE TABLE join_customers (id INT PRIMARY KEY, name VARCHAR)",
+    },
+    Entry {
+        name: "create the orders side of the JOIN",
+        sql: "CREATE TABLE join_orders (id INT PRIMARY KEY, customer_id INT, total DECIMAL(10,2))",
+    },
+    Entry {
+        name: "seed customers",
+        sql: "INSERT INTO join_customers VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Alan')",
+    },
+    Entry {
+        name: "seed orders (Ada has two, Grace has one, Alan has none)",
+        sql: "INSERT INTO join_orders VALUES (100, 1, 9.99), (101, 1, 5.00), (102, 2, 20.00)",
+    },
+    Entry {
+        name: "INNER JOIN with table aliases and qualified columns",
+        sql: "SELECT c.name, o.total FROM join_customers c JOIN join_orders o \
+              ON c.id = o.customer_id ORDER BY o.id",
+    },
+    Entry {
+        name: "LEFT JOIN keeps Alan, with NULL order columns",
+        sql: "SELECT c.name, o.total FROM join_customers c LEFT JOIN join_orders o \
+              ON c.id = o.customer_id ORDER BY c.id, o.id",
+    },
+    Entry {
+        name: "GROUP BY over a JOIN: per-customer order count and total",
+        sql: "SELECT c.name, COUNT(*), SUM(o.total) FROM join_customers c \
+              JOIN join_orders o ON c.id = o.customer_id \
+              GROUP BY c.name ORDER BY c.name",
+    },
     Entry {
         name: "drop schema (cleanup)",
         sql: "DROP SCHEMA IF EXISTS shop_alt",

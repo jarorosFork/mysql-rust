@@ -360,9 +360,46 @@ rest stays a known, explicit gap rather than an unstated one.
       with `WHERE`+`GROUP BY`+`ORDER BY` on an alias together) + 8 new e2e
       app entries (`cargo run --example e2e`, 34/34 passing). 376 tests total
       (was 352). fmt + clippy `-D warnings` clean.)_
-- [ ] `JOIN` (`INNER`, `LEFT`) — includes qualified column references
+- [x] `JOIN` (`INNER`, `LEFT`) — includes qualified column references
       (`table.column`/`alias.column`), deferred until now since they only
       matter once more than one table is in play.
+      _(New `FromClause { table: TableRef, joins: Vec<JoinClause> }` replaces
+      the old bare table-name `from: Option<String>`; `TableRef` now actually
+      *keeps* its `AS` alias (previously parsed and discarded) since it's
+      needed as a qualifier. `ON` is restricted to one column-to-column
+      equality — the same simplification this engine's `WHERE` already made
+      (no AND/OR chaining anywhere) — but chained multi-table joins
+      (`a JOIN b ON... JOIN c ON...`) work, and `ON`'s two sides aren't
+      fixed to "old table"/"new table" by position (`ON a.x=b.y` and
+      `ON b.y=a.x` both work). New `Executor::Scope` unifies column-name
+      resolution for the single-table and joined paths alike (qualified
+      `t.col` must match a real qualifier; unqualified `col` must be
+      unambiguous — MySQL's own "Column 'x' in field list is ambiguous"
+      rule, replicated exactly) — this let the existing GROUP BY/ORDER BY/
+      projection logic move to two free functions (`execute_projected`,
+      `execute_aggregate`) shared verbatim by both paths, rather than
+      duplicated. Joins execute as a hash join (`hash_join`): the newly
+      joined table is indexed by its `ON`-column value once, then every
+      accumulated row probes it — not a naive nested-loop scan. `NULL` is
+      never a join key on either side (`NULL = NULL` is never true),
+      matching `WHERE`'s existing three-valued logic; a `LEFT` join keeps
+      an unmatched row with the new table's columns padded `NULL`, an
+      `INNER` join drops it. The single-table `WHERE pk = literal` indexed
+      fast path (Phase 5) is fully preserved and untouched — only a
+      `JOIN`ed query's `WHERE` is a plain linear filter, since a join has no
+      equivalent index once rows are combined. `INNER`/`LEFT`/`OUTER`/
+      `JOIN`/`ON` are now reserved keywords, matching real MySQL, so none
+      can be mistaken for a bare table alias (`FROM t INNER JOIN u` can't
+      misparse `INNER` as `t`'s alias) — a narrow, documented compatibility
+      cost. `Statement::Select`'s `selection` field is now `Option<Box
+      <Condition>>` (clippy's `large_enum_variant`, since `Condition` now
+      embeds a `ColumnRef` and grew): boxing just that one field was enough,
+      so `from`/`group_by`/`order_by` stayed unboxed. Proof: 21 new tests
+      (8 parser + 12 executor, incl. one-to-many fan-out, NULL-key,
+      ambiguous-column, unknown-ON-column, 3-table chained join, GROUP BY
+      over a join, either-order ON + 1 real-driver conformance test) + 7 new
+      e2e app entries (`cargo run --example e2e`, 41/41 passing). 397 tests
+      total (was 376). fmt + clippy `-D warnings` clean.)_
 - [ ] `ALTER TABLE` (`ADD`/`DROP`/`MODIFY COLUMN`, add/drop a constraint).
 - [ ] **Acceptance:** each item above has passing unit tests and a real-driver
       conformance test; fmt/clippy/full suite green throughout.
