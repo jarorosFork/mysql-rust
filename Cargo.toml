@@ -43,3 +43,13 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 [[example]]
 name = "e2e"
 path = "e2e/main.rs"
+
+# Performance baseline (PERFORMANCE_DURABILITY_PLAN.md, phase PD-0).
+# `harness = false` means this is a plain `fn main()`, not libtest's
+# `#[bench]` harness (which needs nightly) — no new dependency: see the
+# file's own doc comment for why this doesn't reach for `criterion`.
+# `cargo bench` builds it in the release profile automatically.
+[[bench]]
+name = "mysql_bench"
+path = "benches/mysql_bench.rs"
+harness = false

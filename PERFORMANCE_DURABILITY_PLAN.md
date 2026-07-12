@@ -487,30 +487,58 @@ Suggested placement: **Phase 12** in ROADMAP.md, after Phase 11's
 PRODUCTION_READINESS.md §4, whose current wording ("data persists across a
 full server restart") only covers *graceful* restarts.
 
-### Phase PD-0 — Measurement first (prerequisite for everything below)
+### Phase PD-0 — Measurement first (prerequisite for everything below) — ✅ done 2026-07-12
 
-- [ ] **Crash-safety harness** (`tests/crash.rs` + a small helper binary):
-      spawn the real server binary as a child process with a data dir, run
-      acknowledged writes against it via `mysql_async`, `SIGKILL` it at
-      randomized points (including mid-`COMMIT` of a large transaction and
-      mid-multi-row-INSERT), restart, and assert: (a) the server **starts**
-      (will fail until D4), (b) every write acked before the kill is
-      present (will fail for OS-crash simulation until D1 — process-kill
-      level passes today), (c) **no partial transaction/statement is ever
-      visible** (will fail until D2). Add a torn-tail injector: truncate
-      the log at every byte offset within the final record and assert
-      recovery; corrupt a *middle* record and assert a clean refusal.
-      _Acceptance: harness runs in CI; its currently-failing assertions are
-      `#[ignore]`d with a pointer to the D-task that will un-ignore them —
-      each D-task's own acceptance is un-ignoring its assertion._
-- [ ] **Benchmark baseline** (`benches/` with criterion for micro +
-      an e2e-style driver benchmark binary for macro): point-SELECT via PK,
-      full-scan WHERE SELECT at 10k/100k rows, 1k-row result-set fetch,
-      single-row autocommit INSERT (volatile + persistent), 200-concurrent
-      commit throughput, JOIN + GROUP BY report query. Record numbers in
-      this file under a "Baseline" heading.
-      _Acceptance: one command runs the suite and prints a comparable
-      table; baseline committed._
+- [x] **Crash-safety harness** (`tests/crash.rs`): spawns the real compiled
+      `mysql-rust` binary as its own OS process (`env!("CARGO_BIN_EXE_...")`,
+      not the in-process `TestServer` every other integration test uses —
+      that would kill the test binary too) against a temp data dir, drives
+      it with the real `mysql_async` driver, `SIGKILL`s it (`Child::kill`)
+      at a swept range of delays after firing a large multi-row `INSERT` or
+      a multi-statement `COMMIT` (without waiting for the ack — `tokio::
+      time::timeout` races the query against the delay, then kills
+      unconditionally), restarts against the same dir, and asserts the row
+      count is `0` or `N`, never in between. Two more tests manipulate the
+      on-disk log file directly (byte-exact truncation/corruption, no
+      subprocess needed) to check torn-tail recovery and mid-file-damage
+      refusal. Deviated from the plan's original sketch in one way: no
+      separate "helper binary" was needed — the real `mysql-rust` binary
+      built by `cargo build` already reads `MYSQLRUST_*` env vars
+      (`Config::from_env`), so spawning it directly with a redirected
+      `MYSQLRUST_DATA_DIR`/`MYSQLRUST_LISTEN_ADDR` was sufficient.
+      **Verified the harness is real, not a rubber stamp**: run with
+      `--ignored`, all three currently fail with concrete evidence —
+      17/1000 rows survived a killed multi-row INSERT, 361/500 survived a
+      killed COMMIT, and a 30-byte truncation produces `"corrupt data
+      file: truncated u32"` instead of recovering. 2 non-ignored tests
+      (process-crash-persists-acknowledged-write; mid-file-corruption-with-
+      valid-data-after-it-is-still-refused) pass today and guard against
+      regressing what's already correct.
+      _Acceptance met: harness runs in CI (2 pass, 3 correctly `#[ignore]`d
+      with a reason naming the D-task that un-ignores them); confirmed via
+      `cargo test --test crash -- --ignored` that each ignored assertion
+      currently fails for the documented reason, not by accident._
+- [x] **Benchmark baseline** (`benches/mysql_bench.rs`, `cargo bench`):
+      point-SELECT via PK, full-scan WHERE SELECT at 20k rows, 1k-row
+      result-set fetch, single-row autocommit INSERT (volatile +
+      persistent), 200-concurrent BEGIN+INSERT+COMMIT throughput, JOIN +
+      GROUP BY report query. **Deviated from the plan's original wording**
+      ("criterion for micro"): used a hand-rolled ~50-line timer/percentile
+      harness instead (`[[bench]] harness = false`, no nightly needed) —
+      criterion's dependency tree (`plotters`/`clap`/`rayon`/`serde`/
+      `regex`/...) is disproportionate to "time N iterations and print a
+      table," and this project adds a dependency only when std genuinely
+      can't do the job (every existing dependency in Cargo.toml carries
+      that same written justification). Same boot-a-real-`Server`-in-
+      process-then-drive-it-with-`mysql_async` pattern as `e2e/main.rs`,
+      timed instead of pass/fail-checked.
+      _Acceptance met: `cargo bench` runs the whole suite and prints both a
+      terminal table and a ready-to-paste markdown table; baseline recorded
+      below. The numbers already confirm finding P1 empirically before any
+      fix: the full-scan WHERE SELECT (1.89ms median, ~200 of 20,000 rows
+      matching) is ~25x slower than the point SELECT (73.6µs median)
+      despite returning a similar row count, exactly because `scan()`
+      clones all 20,000 rows before the WHERE filter drops most of them._
 
 ### Phase PD-1 — Durability core (fixes D1–D5, D7)
 
@@ -614,13 +642,28 @@ green.
 
 ---
 
-## Baseline (fill in when PD-0 lands)
+## Baseline
 
-| Benchmark | Baseline | After PD-2 | After PD-3 |
-|-----------|----------|------------|------------|
-| point SELECT (PK) p50/p99 | _tbd_ | | |
-| full-scan WHERE, 100k rows | _tbd_ | | |
-| 1k-row fetch | _tbd_ | | |
-| autocommit INSERT (persistent, sync=always) | _tbd_ | | |
-| 200-concurrent commits, total wall | _tbd_ | | |
-| JOIN + GROUP BY report | _tbd_ | | |
+Recorded 2026-07-12 at commit `8a27711` + this plan's PD-0 work, via
+`cargo bench` (`benches/mysql_bench.rs`), release profile, on the machine
+this session ran on. n = iteration count per scenario. Re-run and append a
+column after each of PD-2/PD-3 lands — same command, same machine if
+possible, so the columns are actually comparable.
+
+| Benchmark | n | min | median | mean | p99 | max | After PD-2 | After PD-3 |
+|---|---|---|---|---|---|---|---|---|
+| point SELECT (PK), 20,000 rows | 2000 | 61.0µs | 73.6µs | 83.3µs | 273.9µs | 300.3µs | | |
+| full-scan WHERE SELECT, 20,000 rows (~1% selectivity) | 200 | 1.78ms | 1.89ms | 1.90ms | 2.09ms | 2.09ms | | |
+| fetch 1,000-row result set | 200 | 3.95ms | 4.21ms | 4.38ms | 5.43ms | 5.53ms | | |
+| single-row autocommit INSERT, volatile (in-memory) | 2000 | 32.3µs | 39.2µs | 40.8µs | 57.2µs | 67.4µs | | |
+| single-row autocommit INSERT, persistent (pre-PD-1: `flush()` is a no-op) | 2000 | 33.2µs | 44.7µs | 45.4µs | 61.9µs | 100.4µs | | |
+| 200 concurrent BEGIN+INSERT+COMMIT, total wall per burst | 5 | 45.99ms | 46.90ms | 46.84ms | 47.44ms | 47.44ms | | |
+| JOIN + GROUP BY report, 500 customers / 2,500 orders | 100 | 786.7µs | 809.1µs | 812.4µs | 928.9µs | 928.9µs | | |
+
+**Reading the baseline:** the full-scan/point-SELECT gap (~25x for a
+similarly-sized result) is P1 made visible — confirms the fix is worth
+doing, not just theoretically sound. The persistent-vs-volatile INSERT gap
+is small today (no fsync yet); expect it to grow substantially once D1
+adds `sync_data()` per commit, and expect PD-2's group commit to claw most
+of that back under concurrency (watch the 200-concurrent-commits row
+specifically — it's the one PD-2 is scored against).

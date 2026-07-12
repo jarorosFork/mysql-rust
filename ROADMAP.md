@@ -420,7 +420,25 @@ its checkboxes in order (PD-0 → PD-4) under the same loop protocol as this
 file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
 "survives a graceful restart" to "survives a crash".
 
-- [ ] PD-0 — Measurement first: crash-safety harness + benchmark baseline.
+- [x] PD-0 — Measurement first: crash-safety harness + benchmark baseline.
+      _(`tests/crash.rs` spawns the real compiled binary as its own OS
+      process — the only way to `SIGKILL` it like a real crash without
+      killing the test binary too — sweeps kill timing across a large
+      multi-row INSERT and a multi-row COMMIT, and separately fuzzes
+      byte-exact log truncation/corruption. Confirmed the harness is real:
+      run with `--ignored`, its 3 ignored assertions currently fail with
+      concrete evidence (17/1000 and 361/500 rows survived a killed
+      statement; a torn tail refuses to start) — each is un-ignored, not
+      rewritten, by the D-task named in its `#[ignore = "..."]` reason.
+      `benches/mysql_bench.rs` (`cargo bench`, hand-rolled — not criterion,
+      see the file's own doc comment for why) covers point-SELECT,
+      full-scan WHERE, 1k-row fetch, volatile/persistent INSERT,
+      200-concurrent commits, and a JOIN+GROUP BY report; baseline numbers
+      recorded in PERFORMANCE_DURABILITY_PLAN.md's Baseline section and
+      already empirically confirm finding P1 — a full-scan WHERE is ~25x
+      slower than a point SELECT returning a similar row count. 2 new
+      non-ignored tests pass today as regression guards. 399 tests total
+      (was 397). fmt + clippy `-D warnings` clean.)_
 - [ ] PD-1 — Durability core: CRC framing, torn-tail recovery, WAL
       ordering, atomic commit records, fsync policy + directory fsync.
 - [ ] PD-2 — Write-path architecture: dedicated log-writer thread with
