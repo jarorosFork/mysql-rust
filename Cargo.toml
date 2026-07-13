@@ -1,8 +1,8 @@
 [package]
 name = "mysql-rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A MySQL-compatible database server written in Rust (early-stage skeleton)"
+description = "A from-scratch, MySQL-compatible database server written in Rust"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
