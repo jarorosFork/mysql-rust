@@ -1076,10 +1076,50 @@ green.
       app (41/41, including its own `CREATE`/`DROP DATABASE` + `SHOW
       DATABASES` entries) and `tests/crash.rs`'s 6-test suite both green;
       fmt + clippy `-D warnings` clean.)_
-- [ ] **Idle-connection reaping (P9)**: enforce `wait_timeout` on
+- [x] **Idle-connection reaping (P9)**: enforce `wait_timeout` on
       command-loop reads and a short handshake timeout.
       _Acceptance: integration test — idle client is disconnected after
       the (test-shortened) timeout and its permit is released._
+      _(✅ New `Config::wait_timeout` (default 8h, `MYSQLRUST_WAIT_TIMEOUT_
+      SECS`) and `Config::connect_timeout` (default 10s,
+      `MYSQLRUST_CONNECT_TIMEOUT_SECS`), both `Duration`. `Connection::
+      run_command_loop`'s packet read is now `tokio::time::timeout(self.
+      wait_timeout, self.read_packet())`; on elapse it's treated as a
+      *clean* close (`Ok(())`, logged as a distinct `idle_connection_
+      reaped` event), not a protocol error — a client that goes idle for
+      hours is routine, not an anomaly, unlike a handshake that never
+      completes. New `read_packet_before_connect_timeout` wraps the two
+      handshake/auth-phase reads (`read_handshake_packet`, and the
+      auth-switch response read in `authenticate`) with `connect_timeout`
+      instead; there, an elapsed timeout *is* an error (`Error::Protocol`,
+      propagated up through `handle()`), matching the slow-loris framing
+      the finding itself uses. Either way, closing the socket is exactly
+      how real MySQL produces the client-visible "MySQL server has gone
+      away" — there's no special packet to send, since a client that's
+      actually gone can't be told anything. Also fixes the finding's other
+      half, the "lie in the advertised variable": `SystemVariables::new`
+      now takes `wait_timeout` as a real parameter instead of a hardcoded
+      constant, so `@@wait_timeout`/`@@interactive_timeout` report the
+      *actual* enforced value, not a disconnected compatibility number.
+      Proof: new `tests/idle_timeout.rs` (4 tests, real sockets against a
+      test-shortened 150ms `wait_timeout`/`connect_timeout`) — an idle
+      client observes the connection close (`idle_client_is_disconnected_
+      after_wait_timeout`); an active one sending commands faster than the
+      timeout survives well past what would otherwise be its deadline
+      (`active_client_survives_past_what_would_otherwise_be_the_wait_
+      timeout`, proving the timeout resets per-command rather than capping
+      connection lifetime); with `max_connections: 1`, the idle
+      connection's permit is released and a waiting second connection gets
+      in (`idle_connections_permit_is_released_after_wait_timeout`,
+      mirroring `concurrency.rs`'s existing disconnect-releases-a-permit
+      test but triggered by the timeout instead of an explicit quit); and
+      a client that reads the server's greeting but never sends a
+      handshake response is disconnected once `connect_timeout` elapses
+      (`stalled_handshake_client_is_disconnected_after_connect_timeout`).
+      All 4 run 5x in a row with zero flakes. 456 tests total (was 446);
+      e2e app (41/41) still green (its connections finish in milliseconds,
+      nowhere near either default timeout); fmt + clippy `-D warnings`
+      clean.)_
 - [ ] **Sort-path fixes (P7)**: allocation-free comparison fallback;
       top-N heap for ORDER BY + small LIMIT (benchmark-gated).
 - [ ] **Buffer shrink policy (P8)**; **release profile (P10)** with

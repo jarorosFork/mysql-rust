@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -96,6 +97,14 @@ pub struct Connection {
     /// Reject any packet whose declared payload exceeds this many bytes,
     /// before buffering it (see `Config::max_allowed_packet`).
     max_allowed_packet: usize,
+    /// How long a command-loop packet read may block before the connection
+    /// is closed as idle (PERFORMANCE_DURABILITY_PLAN.md P9; see
+    /// `Config::wait_timeout`) — the same value reported for
+    /// `@@wait_timeout`/`@@interactive_timeout`.
+    wait_timeout: Duration,
+    /// How long a handshake/authentication-phase packet read may block
+    /// before the connection is closed (see `Config::connect_timeout`).
+    connect_timeout: Duration,
     /// Shared logging + metrics (see `observability`).
     observability: Arc<Observability>,
 }
@@ -115,6 +124,7 @@ impl Connection {
             system_variables: SystemVariables::new(
                 config.server_version.clone(),
                 config.max_allowed_packet as u64,
+                config.wait_timeout.as_secs(),
             ),
             connection_id,
             sequence_id: 0,
@@ -129,6 +139,8 @@ impl Connection {
             prepared: HashMap::new(),
             next_statement_id: 1,
             max_allowed_packet: config.max_allowed_packet,
+            wait_timeout: config.wait_timeout,
+            connect_timeout: config.connect_timeout,
             observability,
         }
     }
@@ -178,7 +190,7 @@ impl Connection {
     /// Read one handshake-phase packet and advance the sequence id, verifying
     /// it matches the expected next id.
     async fn read_handshake_packet(&mut self) -> Result<Packet> {
-        let packet = self.read_packet().await?;
+        let packet = self.read_packet_before_connect_timeout().await?;
         if packet.sequence_id != self.sequence_id {
             return Err(Error::Protocol(format!(
                 "expected sequence id {}, got {}",
@@ -255,7 +267,7 @@ impl Connection {
                 .await?;
             self.sequence_id = self.sequence_id.wrapping_add(1);
 
-            let switch_response = self.read_packet().await?;
+            let switch_response = self.read_packet_before_connect_timeout().await?;
             if switch_response.sequence_id != self.sequence_id {
                 return Err(Error::Protocol(format!(
                     "expected sequence id {}, got {}",
@@ -303,7 +315,33 @@ impl Connection {
     /// is its own packet sequence, starting back at 0.
     async fn run_command_loop(&mut self) -> Result<()> {
         loop {
-            let packet = self.read_packet().await?;
+            // Enforce `wait_timeout` (PERFORMANCE_DURABILITY_PLAN.md P9):
+            // unlike a handshake/auth-phase timeout (a stalled client that
+            // never properly connected -- an anomaly), a client that simply
+            // goes idle between commands is normal, expected behavior, so an
+            // elapsed wait_timeout is treated as a clean close (`Ok(())`,
+            // logged distinctly), not a protocol error. Closing the socket
+            // here is exactly how real MySQL produces the client-visible
+            // "MySQL server has gone away": there is no special packet to
+            // send, since a client that's actually gone can't be told
+            // anything.
+            let packet = match tokio::time::timeout(self.wait_timeout, self.read_packet()).await {
+                Ok(read_result) => read_result?,
+                Err(_) => {
+                    self.observability.logger.log(
+                        LogLevel::Info,
+                        "idle_connection_reaped",
+                        &[
+                            ("connection_id", &self.connection_id.to_string()),
+                            (
+                                "wait_timeout_secs",
+                                &self.wait_timeout.as_secs().to_string(),
+                            ),
+                        ],
+                    );
+                    return Ok(());
+                }
+            };
             if packet.sequence_id != 0 {
                 return Err(Error::Protocol(format!(
                     "expected a fresh command sequence starting at 0, got {}",
@@ -687,6 +725,23 @@ impl Connection {
         // until flushed (a no-op cost for plain TCP).
         self.stream.flush().await?;
         Ok(())
+    }
+
+    /// Read one packet, failing if `connect_timeout` elapses first — used
+    /// for every handshake/authentication-phase read (PERFORMANCE_
+    /// DURABILITY_PLAN.md P9). Unlike the command loop's `wait_timeout`, an
+    /// elapsed connect timeout *is* treated as an error: a client that never
+    /// finishes connecting within a bounded time is exactly the slow-loris
+    /// pattern this guards against, not routine idleness.
+    async fn read_packet_before_connect_timeout(&mut self) -> Result<Packet> {
+        tokio::time::timeout(self.connect_timeout, self.read_packet())
+            .await
+            .map_err(|_| {
+                Error::Protocol(format!(
+                    "connection timed out after {}s during handshake/authentication",
+                    self.connect_timeout.as_secs()
+                ))
+            })?
     }
 
     async fn read_packet(&mut self) -> Result<Packet> {

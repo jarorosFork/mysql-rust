@@ -33,11 +33,6 @@ impl QueryResult {
     }
 }
 
-/// MySQL's default `wait_timeout` (8 hours, in seconds) — reported to clients
-/// that read `@@wait_timeout` on connect. This server doesn't actually reap
-/// idle connections yet, so this is a compatibility value, not an enforced one.
-const DEFAULT_WAIT_TIMEOUT: u64 = 28_800;
-
 /// Server system variables surfaced to `SELECT @@...`. Built from [`Config`]
 /// (see `server::connection`); covers the handful a standard driver reads on
 /// connect (`@@max_allowed_packet`, `@@wait_timeout`) plus the version string.
@@ -51,13 +46,16 @@ pub struct SystemVariables {
 }
 
 impl SystemVariables {
-    /// Build from the configured version string and `max_allowed_packet`,
-    /// defaulting `wait_timeout` to MySQL's 8-hour default.
-    pub fn new(version: impl Into<String>, max_allowed_packet: u64) -> Self {
+    /// Build from the configured version string, `max_allowed_packet`, and
+    /// `wait_timeout` (seconds) — the *same* value `Connection` actually
+    /// enforces (PERFORMANCE_DURABILITY_PLAN.md P9), so `@@wait_timeout`/
+    /// `@@interactive_timeout` are no longer a compatibility number
+    /// disconnected from real server behavior.
+    pub fn new(version: impl Into<String>, max_allowed_packet: u64, wait_timeout: u64) -> Self {
         SystemVariables {
             version: version.into(),
             max_allowed_packet,
-            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+            wait_timeout,
         }
     }
 }
@@ -1575,7 +1573,7 @@ mod tests {
     use crate::storage::InMemoryStorage;
 
     fn test_vars() -> SystemVariables {
-        SystemVariables::new("8.0.0-mysql-rust-test", 64 * 1024 * 1024)
+        SystemVariables::new("8.0.0-mysql-rust-test", 64 * 1024 * 1024, 28_800)
     }
 
     /// Drive a future to completion on a throwaway current-thread runtime.

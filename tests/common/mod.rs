@@ -15,6 +15,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -82,6 +83,16 @@ impl TestClient {
             return n;
         }
         self.stream.read(out).expect("read from server")
+    }
+
+    /// Bound how long a subsequent blocking read may take — so a test
+    /// waiting for the server to close an idle connection (e.g. P9's
+    /// `wait_timeout`/`connect_timeout` reaping) fails fast with a clear
+    /// panic instead of hanging forever if the server never closes it.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) {
+        self.stream
+            .set_read_timeout(timeout)
+            .expect("set_read_timeout");
     }
 }
 

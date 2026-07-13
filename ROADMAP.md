@@ -570,7 +570,32 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       (previously undocumented). 446 tests total (was 443); e2e app (41/41,
       exercising `CREATE`/`DROP DATABASE` + `SHOW DATABASES`) and
       `tests/crash.rs`'s 6-test suite still green; fmt + clippy
-      `-D warnings` clean. Remaining: idle-connection reaping (P9),
+      `-D warnings` clean.
+      **Idle-connection reaping** (P9) done 2026-07-13: new `Config::
+      wait_timeout`/`connect_timeout` (`Duration`s, env `MYSQLRUST_WAIT_
+      TIMEOUT_SECS`/`MYSQLRUST_CONNECT_TIMEOUT_SECS`, defaults 8h/10s
+      matching MySQL's own). The command loop's packet read is
+      `tokio::time::timeout`-wrapped with `wait_timeout`; on elapse it's a
+      clean close (not a protocol error — idleness is routine, unlike a
+      stalled handshake), logged as a distinct `idle_connection_reaped`
+      event, releasing the connection's permit exactly as a normal
+      disconnect would. Handshake/auth-phase reads get `connect_timeout`
+      instead, via a new `read_packet_before_connect_timeout` helper, and
+      *do* error on elapse (a slow-loris client never finishing its
+      handshake is the anomaly this specifically guards against).
+      `SystemVariables::new` now takes the real `wait_timeout` instead of a
+      hardcoded constant, so `@@wait_timeout`/`@@interactive_timeout` stop
+      being a lie disconnected from actual server behavior — fixing both
+      halves of the P9 finding, not just the enforcement half. New
+      `tests/idle_timeout.rs` (4 tests, real sockets, a test-shortened
+      150ms timeout): idle client observes the close; an active client
+      sending commands faster than the timeout survives well past what
+      would otherwise be its deadline (proving per-command reset, not a
+      hard lifetime cap); a `max_connections: 1` idle connection's permit
+      frees up for a waiting second connection; a stalled-handshake client
+      is disconnected via `connect_timeout`. All 4 run 5x clean, no
+      flakes. 456 tests total (was 446); e2e app (41/41) still green; fmt +
+      clippy `-D warnings` clean. Remaining:
       sort-path/buffer/release-profile hygiene (P7/P8/P10).)_
 - [ ] **Acceptance:** every checkbox in
       [PERFORMANCE_DURABILITY_PLAN.md](PERFORMANCE_DURABILITY_PLAN.md) is

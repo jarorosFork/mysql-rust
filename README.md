@@ -53,6 +53,8 @@ against the server in `tests/conformance.rs`.
 | `MYSQLRUST_SYNC_POLICY` | `always` | `always` (`fdatasync` every log append) or `never` (rely on the OS page cache). Only meaningful when `MYSQLRUST_DATA_DIR` is set. |
 | `MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES` | `16777216` (16 MiB) | Log size at which startup rewrites it as a compact snapshot instead of replaying it as-is. Only meaningful when `MYSQLRUST_DATA_DIR` is set. |
 | `MYSQLRUST_LOG_LEVEL` | `info` | Minimum severity for structured stderr logs (`debug`/`info`/`warn`/`error`). |
+| `MYSQLRUST_WAIT_TIMEOUT_SECS` | `28800` (8h) | Seconds an idle connection is kept open before the server closes it — enforced, not just reported as `@@wait_timeout`. |
+| `MYSQLRUST_CONNECT_TIMEOUT_SECS` | `10` | Seconds a connection may spend on handshake/authentication before the server closes it. |
 
 `Config::from_env()` builds this configuration (the injectable
 `Config::from_env_with` makes it unit-testable); the `Config` struct below is
@@ -74,6 +76,8 @@ fields as needed.
 | `checkpoint_threshold_bytes` | 16 MiB | Log size at which startup rewrites it as a compact snapshot instead of replaying it as-is. Only meaningful when `data_dir` is set. |
 | `max_connections` | `0` (unlimited) | Cap on concurrent clients; extras get `ER_CON_COUNT_ERROR`. |
 | `max_allowed_packet` | 64 MiB | Largest accepted packet payload; larger is rejected on the header before buffering. |
+| `wait_timeout` | 8 hours | How long an idle, authenticated connection may go without a command before the server closes it (and releases its connection permit) — also the value reported for `@@wait_timeout`/`@@interactive_timeout`. |
+| `connect_timeout` | 10 seconds | How long a connection may spend on handshake/authentication before the server closes it. |
 | `log_level` | `Info` | Minimum severity for structured stderr logs (`Debug`/`Info`/`Warn`/`Error`). |
 | `tls` | `None` | `Some(TlsConfig)` enables TLS: the server advertises `CLIENT_SSL` and upgrades connections that request it. Build with `TlsConfig::from_der(cert_chain, key)`. |
 

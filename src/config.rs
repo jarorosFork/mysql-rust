@@ -3,6 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
@@ -114,6 +115,18 @@ pub struct Config {
     /// buffered, bounding how much memory one client can force the server to
     /// allocate. Defaults to 64 MiB, matching MySQL 8.0's `max_allowed_packet`.
     pub max_allowed_packet: usize,
+    /// How long an established, authenticated connection may sit idle (no
+    /// command read) before the server closes it -- actually *enforced*
+    /// (PERFORMANCE_DURABILITY_PLAN.md P9), not just a number reported to
+    /// `@@wait_timeout`/`@@interactive_timeout`; the same value backs both.
+    /// Defaults to 8 hours, MySQL's own default.
+    pub wait_timeout: Duration,
+    /// How long a not-yet-authenticated connection may take to complete its
+    /// handshake and authentication before the server closes it, matching
+    /// MySQL's `connect_timeout`. Bounds a slow/stalled client at the one
+    /// stage that isn't covered by `wait_timeout` (PERFORMANCE_DURABILITY_
+    /// PLAN.md P9). Defaults to 10 seconds, MySQL's own default.
+    pub connect_timeout: Duration,
     /// Minimum severity for structured log lines emitted to stderr. Defaults
     /// to `Info`.
     pub log_level: LogLevel,
@@ -140,6 +153,8 @@ impl Default for Config {
             sync_policy: SyncPolicy::default(),
             checkpoint_threshold_bytes: 16 * 1024 * 1024,
             max_allowed_packet: 64 * 1024 * 1024,
+            wait_timeout: Duration::from_secs(28_800),
+            connect_timeout: Duration::from_secs(10),
             log_level: LogLevel::Info,
             tls: None,
             default_auth_plugin: AuthPlugin::CachingSha2Password,
@@ -219,6 +234,12 @@ impl Config {
     ///   Query-level errors (e.g. a client sending SQL this server can't parse)
     ///   log at `debug`, so set this to see exactly what a client is sending
     ///   when something behaves unexpectedly.
+    /// - `MYSQLRUST_WAIT_TIMEOUT_SECS` — seconds an idle connection is kept
+    ///   open before the server closes it (default 28800, MySQL's own 8-hour
+    ///   default).
+    /// - `MYSQLRUST_CONNECT_TIMEOUT_SECS` — seconds a connection may spend on
+    ///   handshake/authentication before the server closes it (default 10,
+    ///   MySQL's own default).
     ///
     /// Returns [`Error::Config`] on an unparseable address, an unknown plugin,
     /// or an unrecognized log level.
@@ -273,6 +294,24 @@ impl Config {
                      'debug', 'info', 'warn', or 'error'"
                 ))
             })?;
+        }
+
+        if let Some(secs) = get("MYSQLRUST_WAIT_TIMEOUT_SECS").filter(|t| !t.is_empty()) {
+            let secs: u64 = secs.parse().map_err(|e| {
+                Error::Config(format!(
+                    "MYSQLRUST_WAIT_TIMEOUT_SECS '{secs}' is not a valid unsigned integer ({e})"
+                ))
+            })?;
+            config.wait_timeout = Duration::from_secs(secs);
+        }
+
+        if let Some(secs) = get("MYSQLRUST_CONNECT_TIMEOUT_SECS").filter(|t| !t.is_empty()) {
+            let secs: u64 = secs.parse().map_err(|e| {
+                Error::Config(format!(
+                    "MYSQLRUST_CONNECT_TIMEOUT_SECS '{secs}' is not a valid unsigned integer ({e})"
+                ))
+            })?;
+            config.connect_timeout = Duration::from_secs(secs);
         }
 
         if let Some(username) = get("MYSQLRUST_USER").filter(|u| !u.is_empty()) {
@@ -440,6 +479,46 @@ mod tests {
             "not-a-number",
         )]))
         .expect_err("should reject");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn wait_timeout_defaults_to_8_hours() {
+        let config = Config::from_env_with(env(&[])).expect("parse");
+        assert_eq!(config.wait_timeout, Duration::from_secs(28_800));
+    }
+
+    #[test]
+    fn wait_timeout_is_parsed() {
+        let config =
+            Config::from_env_with(env(&[("MYSQLRUST_WAIT_TIMEOUT_SECS", "5")])).expect("parse");
+        assert_eq!(config.wait_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn non_numeric_wait_timeout_is_a_config_error() {
+        let err = Config::from_env_with(env(&[("MYSQLRUST_WAIT_TIMEOUT_SECS", "not-a-number")]))
+            .expect_err("should reject");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn connect_timeout_defaults_to_10_seconds() {
+        let config = Config::from_env_with(env(&[])).expect("parse");
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn connect_timeout_is_parsed() {
+        let config =
+            Config::from_env_with(env(&[("MYSQLRUST_CONNECT_TIMEOUT_SECS", "2")])).expect("parse");
+        assert_eq!(config.connect_timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn non_numeric_connect_timeout_is_a_config_error() {
+        let err = Config::from_env_with(env(&[("MYSQLRUST_CONNECT_TIMEOUT_SECS", "not-a-number")]))
+            .expect_err("should reject");
         assert!(matches!(err, Error::Config(_)));
     }
 }
