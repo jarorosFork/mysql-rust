@@ -946,8 +946,37 @@ green.
 
 ### Phase PD-4 — Operational durability & hygiene (fixes D6, D8, P7–P10)
 
-- [ ] **Streaming replay (D6 step 1)**: `BufReader`-based incremental
+- [x] **Streaming replay (D6 step 1)**: `BufReader`-based incremental
       replay; startup memory O(live data).
+      _(✅ Done 2026-07-13. `Log::open` no longer calls `std::fs::read`
+      (whole file into one `Vec<u8>`); it now `stat`s the file for its
+      total length (one syscall, not a read) and streams through it with a
+      `BufReader`, decoding one record at a time — each record's payload is
+      its own short-lived `Vec<u8>`, freed once `decode_entry` consumes it,
+      so peak replay memory is O(one record) instead of O(the whole file,
+      twice over: raw bytes + built tables). The torn-tail-vs-corruption
+      classification (does this record's claimed end land exactly at the
+      file's physical length?) is preserved exactly — now checked via `u64`
+      arithmetic against a `stat`-provided length instead of a slice-bounds
+      check against a preloaded buffer — and guards against a corrupted
+      length field ever triggering an oversized allocation attempt by
+      checking `payload_end <= file_len` *before* allocating the payload
+      buffer, not just before reading it. New required helper
+      `read_one_record`/`read_exact_or_eof` replace the old `read_record`/
+      `RecordRead` (removed, not kept alongside — nothing else used them).
+      Every existing torn-tail/mid-file-corruption test (the byte-exact
+      truncation sweep included) passes completely unchanged, proving the
+      observable recovery behavior didn't shift at all; one new test
+      (`streaming_replay_handles_many_records_in_order`, 5,000 records)
+      proves the streaming loop itself is correct at a scale the old
+      handful-of-records tests wouldn't have caught an off-by-one at. New
+      `restart_replay_time` benchmark (boots a fresh server against an
+      already-persisted 50,000-row data directory, times to first
+      successful query) gives a real number to score D6 step 2's
+      checkpoint/compaction work against later: **23.46ms median**. 436
+      tests total (was 435); `tests/crash.rs`'s 5-test crash-safety suite
+      and the e2e app (41/41) both still green; fmt + clippy `-D warnings`
+      clean.)_
 - [ ] **Checkpoint/compaction (D6 step 2)**: snapshot to `data.log.new` →
       fsync → atomic rename → dir fsync; triggered at startup-complete
       and/or a size threshold; replay prefers the snapshot.

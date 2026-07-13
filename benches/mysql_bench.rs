@@ -51,6 +51,7 @@ async fn run_all() -> Vec<Stats> {
         concurrent_inserts_across_many_tables().await,
         read_latency_under_write_load().await,
         join_group_by_report().await,
+        restart_replay_time().await,
     ]
 }
 
@@ -408,6 +409,48 @@ async fn join_group_by_report() -> Stats {
     }
     stats(
         &format!("JOIN+GROUP BY report, {CUSTOMERS} customers/{ORDERS} orders"),
+        samples,
+    )
+}
+
+/// PERFORMANCE_DURABILITY_PLAN.md D6: measures exactly what streaming
+/// replay (step 1) and, later, checkpoint/compaction (step 2) are scored
+/// against — the time from a fresh server process starting against an
+/// *already-persisted* data directory to it actually answering a query
+/// that needs the replayed data. `Server::serve` calls
+/// `InMemoryStorage::open_in_dir` (which replays the whole log)
+/// synchronously before its accept loop ever starts, so a client's first
+/// real query — not just the TCP-level `connect()`, which the OS can
+/// satisfy from the listen backlog before the server has even called
+/// `accept()` — is what actually waits out replay.
+async fn restart_replay_time() -> Stats {
+    const ROWS: usize = 50_000;
+    const ITERS: usize = 5;
+
+    let dir = temp_data_dir("restart-replay");
+    {
+        let addr = start_server(Some(dir.path()), SyncPolicy::Never).await;
+        let mut conn = connect(addr).await;
+        conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
+            .await
+            .expect("create table");
+        seed_id_name_rows(&mut conn, ROWS).await;
+    } // `conn`/the spawned server task are dropped; the log file remains.
+
+    let mut samples = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let start = Instant::now();
+        let addr = start_server(Some(dir.path()), SyncPolicy::Never).await;
+        let mut conn = connect(addr).await;
+        let rows: Vec<(i64,)> = conn
+            .query("SELECT id FROM t")
+            .await
+            .expect("query after restart");
+        assert_eq!(rows.len(), ROWS, "replay must have restored every row");
+        samples.push(start.elapsed());
+    }
+    stats(
+        &format!("server restart + replay, {ROWS} persisted rows"),
         samples,
     )
 }

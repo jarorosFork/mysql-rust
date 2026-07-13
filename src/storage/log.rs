@@ -17,7 +17,10 @@
 //! Each record on disk is `[len: u32 LE][crc: u32 LE][payload: len bytes]`,
 //! where `crc` is a CRC-32 over `len`'s own four bytes *and* the payload
 //! together — covering the length field itself, not just the payload, is
-//! what makes the recovery below safe (see [`read_record`]).
+//! what makes the recovery below safe (see [`read_one_record`]). Replay
+//! streams through the file record by record (PERFORMANCE_DURABILITY_PLAN.md
+//! D6 step 1) rather than loading it whole, so startup memory is bounded by
+//! one record at a time, not by the file's total size.
 //!
 //! [`Log::open`] replays records front to back. A crash can only ever cut
 //! off the *end* of a file (the OS writes bytes in order), so any problem
@@ -362,51 +365,92 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
     }
 }
 
-/// The outcome of trying to read one record starting at a given position —
-/// see the module doc comment for the reasoning behind each case.
-enum RecordRead<'a> {
-    /// A complete, checksum-verified record.
-    Ok { payload: &'a [u8], next_pos: usize },
+/// The outcome of trying to read one record from a stream at a known
+/// position — see the module doc comment for the reasoning behind each
+/// case. Unlike slicing into a fully-buffered file, this owns a
+/// short-lived payload `Vec<u8>` per record (freed once decoded), so
+/// replay never holds more than one record's worth of payload in memory
+/// at a time (PERFORMANCE_DURABILITY_PLAN.md D6 step 1).
+enum StreamRecordRead {
+    /// A complete, checksum-verified, decoded record.
+    Ok { entry: Entry, next_pos: u64 },
     /// Nothing decodable follows: an incomplete header, a header whose
     /// claimed length runs past the end of the file, or a checksum
-    /// mismatch on what is (per `next_valid_after` below) the last record
-    /// in the file. Every one of these is what an interrupted write looks
-    /// like — recoverable by discarding from here on.
+    /// mismatch on what is the last record in the file. Every one of these
+    /// is what an interrupted write looks like — recoverable by discarding
+    /// from here on. (A checksum mismatch with more data still following —
+    /// not explainable by a crash — is reported as an `Err` directly by
+    /// [`read_one_record`] rather than a third variant here, since it's
+    /// not a recoverable outcome the caller has a choice about.)
     TornTail,
-    /// A checksum mismatch with more (structured-looking) data still
-    /// following — not explainable by a crash, since a torn write can only
-    /// ever damage the tail. Not recoverable.
-    Corrupt,
 }
 
-/// Try to read one record at `pos`. `file_len` is `bytes.len()`, passed
-/// separately so this needs only the current record's own bytes rather
-/// than the whole file — a checksum mismatch is only a torn tail if this
-/// record's claimed end is the physical end of the file.
-fn read_record(bytes: &[u8], pos: usize, file_len: usize) -> RecordRead<'_> {
-    let Some(header) = bytes.get(pos..pos.saturating_add(8)) else {
-        return RecordRead::TornTail;
-    };
+/// Read `buf.len()` bytes, or report that EOF was hit first (a torn read,
+/// exactly what an interrupted write leaves behind). `read_exact`'s own
+/// error doesn't say how many bytes it managed before EOF — irrelevant
+/// here, since any EOF partway through a record means "recover as torn
+/// tail" regardless of exactly where it happened.
+fn read_exact_or_eof(reader: &mut impl std::io::Read, buf: &mut [u8]) -> Result<bool> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
+/// Try to read and decode one record at `pos` from a streaming reader.
+/// `file_len` (the file's total size, known upfront via a single `stat`
+/// rather than a full read) is what lets a checksum failure be classified
+/// as a torn tail (positioned at the physical end of the file) rather than
+/// mid-file corruption — the same distinction the previous fully-buffered
+/// implementation made, just checked via arithmetic against a known length
+/// instead of a slice bounds check.
+fn read_one_record(
+    reader: &mut impl std::io::Read,
+    pos: u64,
+    file_len: u64,
+) -> Result<StreamRecordRead> {
+    let mut header = [0u8; 8];
+    if !read_exact_or_eof(reader, &mut header)? {
+        return Ok(StreamRecordRead::TornTail);
+    }
     let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     let crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    let payload_start = pos + 8;
-    let Some(payload_end) = payload_start.checked_add(len as usize) else {
-        return RecordRead::TornTail;
+
+    // The header's claimed length running past the physical end of the
+    // file is exactly what a crash mid-write of the length prefix looks
+    // like — checked against the already-known file size *before*
+    // allocating a payload buffer, so a torn or corrupted length can never
+    // itself trigger an oversized allocation attempt.
+    let Some(payload_end) = pos
+        .checked_add(8)
+        .and_then(|after_header| after_header.checked_add(u64::from(len)))
+    else {
+        return Ok(StreamRecordRead::TornTail);
     };
-    let Some(payload) = bytes.get(payload_start..payload_end) else {
-        return RecordRead::TornTail;
-    };
-    if record_crc(len, payload) != crc {
+    if payload_end > file_len {
+        return Ok(StreamRecordRead::TornTail);
+    }
+
+    let mut payload = vec![0u8; len as usize];
+    if !read_exact_or_eof(reader, &mut payload)? {
+        return Ok(StreamRecordRead::TornTail);
+    }
+
+    if record_crc(len, &payload) != crc {
         return if payload_end == file_len {
-            RecordRead::TornTail
+            Ok(StreamRecordRead::TornTail)
         } else {
-            RecordRead::Corrupt
+            Err(corrupt(
+                "checksum mismatch with valid data still following it",
+            ))
         };
     }
-    RecordRead::Ok {
-        payload,
+
+    Ok(StreamRecordRead::Ok {
+        entry: decode_entry(&payload)?,
         next_pos: payload_end,
-    }
+    })
 }
 
 /// Force `path`'s parent directory entry to durable storage
@@ -452,37 +496,36 @@ impl Log {
         sync_policy: SyncPolicy,
         mut apply: impl FnMut(Entry),
     ) -> Result<Self> {
-        let existing = std::fs::read(path);
-        let is_new_file = matches!(&existing, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
-        match existing {
-            Ok(bytes) => {
-                let mut pos = 0;
-                while pos < bytes.len() {
-                    match read_record(&bytes, pos, bytes.len()) {
-                        RecordRead::Ok { payload, next_pos } => {
-                            apply(decode_entry(payload)?);
-                            pos = next_pos;
-                        }
-                        RecordRead::TornTail => break,
-                        RecordRead::Corrupt => {
-                            return Err(corrupt(
-                                "checksum mismatch with valid data still following it",
-                            ));
-                        }
-                    }
-                }
-                if pos < bytes.len() {
-                    // A torn tail was discarded above: truncate it away on
-                    // disk too, so the next append lands right after the
-                    // last good record rather than after orphaned garbage
-                    // (which would make this crash's torn tail look like
-                    // mid-file corruption after the *next* one).
-                    let file = OpenOptions::new().write(true).open(path)?;
-                    file.set_len(pos as u64)?;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let existing_len = match std::fs::metadata(path) {
+            Ok(meta) => Some(meta.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(Error::Io(e)),
+        };
+        let is_new_file = existing_len.is_none();
+
+        if let Some(file_len) = existing_len {
+            // Streaming replay (PERFORMANCE_DURABILITY_PLAN.md D6 step 1):
+            // `BufReader` reads in bounded chunks regardless of file size,
+            // and each record's payload is freed once decoded — startup
+            // memory is O(one record), not O(the entire history), unlike
+            // the `std::fs::read`-the-whole-file approach this replaces.
+            let mut reader = std::io::BufReader::new(File::open(path)?);
+            let mut pos: u64 = 0;
+            while let StreamRecordRead::Ok { entry, next_pos } =
+                read_one_record(&mut reader, pos, file_len)?
+            {
+                apply(entry);
+                pos = next_pos;
+            }
+            if pos < file_len {
+                // A torn tail was discarded above: truncate it away on
+                // disk too, so the next append lands right after the
+                // last good record rather than after orphaned garbage
+                // (which would make this crash's torn tail look like
+                // mid-file corruption after the *next* one).
+                let file = OpenOptions::new().write(true).open(path)?;
+                file.set_len(pos)?;
+            }
         }
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -714,6 +757,55 @@ mod tests {
         let _log = Log::open(&path, SyncPolicy::Never, |_| seen += 1).unwrap();
         assert_eq!(seen, 0);
         assert!(path.exists());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// PERFORMANCE_DURABILITY_PLAN.md D6 step 1: replay now streams through
+    /// the file with a `BufReader` instead of loading it whole via
+    /// `std::fs::read`. The byte-exact torn-tail/corruption tests elsewhere
+    /// in this module already prove the recovery semantics didn't change at
+    /// the boundary cases; this proves the streaming loop itself is correct
+    /// across many records in order (not just the 1-3 record cases those
+    /// tests use), which is exactly the scale the old whole-file-read
+    /// approach handled trivially but a streaming rewrite could get wrong
+    /// (an off-by-one in `pos`/`next_pos`, e.g., would only show up after
+    /// more than a couple of records).
+    #[test]
+    fn streaming_replay_handles_many_records_in_order() {
+        let path = temp_path("many-records");
+        const N: i64 = 5_000;
+
+        {
+            let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
+            log.append_create_table(
+                "t",
+                &[ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: ColumnType::Int,
+                    nullable: false,
+                    auto_increment: false,
+                }],
+                Some("id"),
+            )
+            .unwrap();
+            for i in 0..N {
+                log.append_insert_row("t", &[Value::Int(i)]).unwrap();
+            }
+        }
+
+        let mut replayed_ids = Vec::with_capacity(N as usize);
+        let _log = Log::open(&path, SyncPolicy::Never, |entry| {
+            if let Entry::InsertRow { row, .. } = entry {
+                if let Value::Int(id) = row[0] {
+                    replayed_ids.push(id);
+                }
+            }
+        })
+        .unwrap();
+
+        assert_eq!(replayed_ids.len(), N as usize);
+        assert_eq!(replayed_ids, (0..N).collect::<Vec<_>>());
 
         std::fs::remove_file(&path).ok();
     }
