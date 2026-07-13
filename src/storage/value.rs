@@ -5,6 +5,8 @@
 //! it, not a distinct storage type), `DECIMAL` (exact fixed-point, not a
 //! float — see `Value::Decimal`), and `DATE`.
 
+use crate::{Error, Result};
+
 /// A typed, storage-level value. `Null` is a distinct value from any other
 /// variant, matching SQL's `NULL`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -61,6 +63,104 @@ pub fn format_decimal(unscaled: i64, scale: u8) -> String {
     };
     let (int_part, frac_part) = digits.split_at(digits.len() - scale);
     format!("{}{int_part}.{frac_part}", if negative { "-" } else { "" })
+}
+
+/// Convert a fixed-point value from `from_scale` to `to_scale` (widening
+/// multiplies; narrowing rounds half-away-from-zero), with checked
+/// arithmetic throughout so an absurd scale/magnitude combination is a clean
+/// `Error::Execution`, never an overflow panic.
+pub fn rescale_decimal(
+    unscaled: i64,
+    from_scale: u8,
+    to_scale: u8,
+    column_name: &str,
+) -> Result<i64> {
+    let out_of_range = || {
+        Error::Execution(format!(
+            "decimal value out of range for column '{column_name}'"
+        ))
+    };
+    if to_scale >= from_scale {
+        let factor = 10i64
+            .checked_pow(u32::from(to_scale - from_scale))
+            .ok_or_else(out_of_range)?;
+        unscaled.checked_mul(factor).ok_or_else(out_of_range)
+    } else {
+        let divisor = 10u64
+            .checked_pow(u32::from(from_scale - to_scale))
+            .ok_or_else(out_of_range)?;
+        let magnitude = unscaled.unsigned_abs();
+        let rounded = (magnitude + divisor / 2) / divisor;
+        let rounded = i64::try_from(rounded).map_err(|_| out_of_range())?;
+        Ok(if unscaled < 0 { -rounded } else { rounded })
+    }
+}
+
+/// Parse a numeric string like `"123.45"`, `"-5"`, or `".5"` into
+/// `(unscaled, scale)` at the scale as written (not yet rescaled to any
+/// column). Used when a decimal value arrives as text (a quoted SQL string
+/// literal, or a prepared-statement string parameter).
+pub fn parse_decimal_literal(s: &str, column_name: &str) -> Result<(i64, u8)> {
+    let invalid = || {
+        Error::Execution(format!(
+            "Incorrect decimal value: '{s}' for column '{column_name}'"
+        ))
+    };
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (rest, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(invalid());
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    if frac_part.len() > u8::MAX as usize {
+        return Err(invalid());
+    }
+    let magnitude: i64 = format!("{int_part}{frac_part}")
+        .parse()
+        .map_err(|_| invalid())?;
+    Ok((
+        if negative { -magnitude } else { magnitude },
+        frac_part.len() as u8,
+    ))
+}
+
+/// Validate a `'YYYY-MM-DD'` date literal: exactly that shape, month `01`-`12`,
+/// day `01`-`31`. No calendar-correctness check beyond that (e.g. `2024-02-30`
+/// is accepted) — this server does no date arithmetic that would need it
+/// (see ROADMAP.md Phase 11's cut list), so it isn't worth the complexity.
+pub fn parse_date_literal(s: &str, column_name: &str) -> Result<String> {
+    let invalid = || {
+        Error::Execution(format!(
+            "Incorrect date value: '{s}' for column '{column_name}'"
+        ))
+    };
+    let bytes = s.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return Err(invalid());
+    }
+    let digits = |range: std::ops::Range<usize>| -> Result<u32> {
+        s.get(range)
+            .filter(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|part| part.parse::<u32>().ok())
+            .ok_or_else(invalid)
+    };
+    let _year = digits(0..4)?; // any 4-digit year is accepted; no range limit
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(invalid());
+    }
+    Ok(s.to_string())
 }
 
 /// A column's declared type.

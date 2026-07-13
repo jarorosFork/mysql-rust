@@ -658,6 +658,94 @@ async fn real_driver_join() {
 }
 
 #[tokio::test]
+async fn real_driver_alter_table() {
+    let config = Config {
+        users: vec![UserCredential::with_caching_sha2_password(
+            "alice", "s3cret",
+        )],
+        log_level: LogLevel::Error,
+        ..Config::default()
+    };
+    let server = TestServer::start(config);
+    let mut conn = connect(&server, "alice", "s3cret").await;
+
+    conn.query_drop("CREATE TABLE customers (id INT, name VARCHAR)")
+        .await
+        .expect("CREATE TABLE customers");
+    conn.query_drop("INSERT INTO customers VALUES (1, 'Ada'), (2, 'Grace')")
+        .await
+        .expect("INSERT customers");
+
+    // ADD COLUMN: existing rows read back NULL for it.
+    conn.query_drop("ALTER TABLE customers ADD COLUMN email VARCHAR")
+        .await
+        .expect("ADD COLUMN");
+    let with_email: Vec<(String, Option<String>)> = conn
+        .query("SELECT name, email FROM customers ORDER BY name")
+        .await
+        .expect("SELECT after ADD COLUMN");
+    assert_eq!(
+        with_email,
+        vec![("Ada".to_string(), None), ("Grace".to_string(), None),]
+    );
+    conn.query_drop("INSERT INTO customers VALUES (3, 'Alan', 'alan@example.com')")
+        .await
+        .expect("INSERT using the new column");
+
+    // ADD PRIMARY KEY on an existing column: now enforced.
+    conn.query_drop("ALTER TABLE customers ADD PRIMARY KEY (id)")
+        .await
+        .expect("ADD PRIMARY KEY");
+    let duplicate_id = conn
+        .query_drop("INSERT INTO customers VALUES (1, 'Duplicate', NULL)")
+        .await;
+    assert!(
+        duplicate_id.is_err(),
+        "primary key added via ALTER TABLE should reject a duplicate id"
+    );
+
+    // MODIFY COLUMN: widen an INT to VARCHAR in place.
+    conn.query_drop("ALTER TABLE customers MODIFY COLUMN id VARCHAR")
+        .await
+        .expect("MODIFY COLUMN");
+    let ids: Vec<String> = conn
+        .query("SELECT id FROM customers ORDER BY id")
+        .await
+        .expect("SELECT after MODIFY COLUMN");
+    assert_eq!(ids, vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+
+    // DROP COLUMN: gone from a subsequent SELECT *.
+    conn.query_drop("ALTER TABLE customers DROP COLUMN email")
+        .await
+        .expect("DROP COLUMN");
+    let remaining_columns: Vec<(String, String)> = conn
+        .query("SELECT id, name FROM customers ORDER BY id")
+        .await
+        .expect("SELECT after DROP COLUMN");
+    assert_eq!(
+        remaining_columns,
+        vec![
+            ("1".to_string(), "Ada".to_string()),
+            ("2".to_string(), "Grace".to_string()),
+            ("3".to_string(), "Alan".to_string()),
+        ]
+    );
+    let select_star_no_longer_has_email = conn.query_drop("SELECT email FROM customers").await;
+    assert!(select_star_no_longer_has_email.is_err());
+
+    // DROP PRIMARY KEY: no longer enforced.
+    conn.query_drop("ALTER TABLE customers DROP PRIMARY KEY")
+        .await
+        .expect("DROP PRIMARY KEY");
+    conn.query_drop("INSERT INTO customers VALUES ('1', 'Also Ada')")
+        .await
+        .expect("duplicate id now accepted, no primary key left");
+
+    conn.disconnect().await.expect("clean disconnect");
+    drop(server);
+}
+
+#[tokio::test]
 async fn real_driver_connects_with_env_configured_account() {
     // Exactly what `MYSQLRUST_USER=alice MYSQLRUST_PASSWORD=s3cret cargo run`
     // produces — built through the same `from_env` code path, but with an

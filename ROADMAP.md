@@ -400,8 +400,92 @@ rest stays a known, explicit gap rather than an unstated one.
       over a join, either-order ON + 1 real-driver conformance test) + 7 new
       e2e app entries (`cargo run --example e2e`, 41/41 passing). 397 tests
       total (was 376). fmt + clippy `-D warnings` clean.)_
-- [ ] `ALTER TABLE` (`ADD`/`DROP`/`MODIFY COLUMN`, add/drop a constraint).
-- [ ] **Acceptance:** each item above has passing unit tests and a real-driver
+- [x] `ALTER TABLE` (`ADD`/`DROP`/`MODIFY COLUMN`, add/drop a constraint).
+      _(New `Keyword::Alter` + `Statement::AlterTable { table, action }`;
+      `AlterAction` models exactly one action per statement (`AddColumn`/
+      `DropColumn`/`ModifyColumn`/`AddPrimaryKey`/`DropPrimaryKey`) — real
+      MySQL's comma-separated multi-action form isn't supported, a
+      deliberate scope cut (most generated DDL, especially from GUI tools,
+      issues one change at a time anyway), as is plain `DROP TABLE` (not
+      part of this item's own wording). `ADD`/`MODIFY`/`COLUMN` stay
+      non-reserved (`peek_is_ident_ci`), matching how `UNIQUE`/`INDEX`/
+      `FOREIGN` already work for `CREATE TABLE`; only `ALTER` itself needed
+      to become a real keyword for the top-level statement dispatch.
+      `ADD [CONSTRAINT [name]] PRIMARY KEY (col)` is the modelled
+      "constraint" action (the only constraint type this engine has); a
+      composite key is rejected the same way `CREATE TABLE`'s own
+      table-level `PRIMARY KEY (...)` already is, and `ADD CONSTRAINT`
+      naming anything other than `PRIMARY KEY` is a clear `Unsupported`
+      error, not a silent mis-parse.
+
+      New `storage::SchemaChange` enum (one `Storage::alter_table` trait
+      method taking it, rather than five separate methods — keeps the
+      trait surface, and every implementor's, incl. `Transaction`'s
+      one-line auto-commits-immediately passthrough, small) carries the
+      *validated* form (`ColumnSchema`, not the parser's raw `ColumnDef`) —
+      the same layering `create_table` already uses. New `compute_altered_
+      table` (in `storage::engine`) rebuilds a table from scratch on every
+      change: a fresh schema, then every existing row extended/shrunk/
+      retyped via `Table::new` + `push_trusted`, so the primary-key index
+      and `AUTO_INCREMENT` counter come out right for free — the same
+      machinery that already rebuilds a table from a batch of rows on
+      replay and at checkpoint time. `retype_value` (mirroring `query::
+      executor::coerce`'s match shape, but converting an already-stored
+      `Value` instead of a freshly parsed literal) reuses `rescale_decimal`/
+      `parse_decimal_literal`/`parse_date_literal`, moved from `query::
+      executor` to `storage::value` (alongside the existing `format_decimal`)
+      specifically so `storage::engine` could call them without inverting
+      the crate's `query`-depends-on-`storage` layering.
+
+      Deliberate, documented limits matching this engine's existing
+      no-`DEFAULT`-support posture (`CREATE TABLE`'s own `DEFAULT <expr>`
+      is parsed and discarded, never modelled): `ADD COLUMN ... NOT NULL`
+      or `ADD COLUMN ... PRIMARY KEY` is rejected on a table that already
+      has rows (no way to backfill a value); dropping the primary-key
+      column drops the key itself rather than erroring; `MODIFY COLUMN`
+      never changes `PRIMARY KEY` status (rejected at the executor layer,
+      before ever reaching storage) — `ADD`/`DROP PRIMARY KEY` are the only
+      way to change that, keeping "what makes a column the key" one
+      unambiguous code path; `AUTO_INCREMENT` still requires being the
+      primary key everywhere (`MODIFY COLUMN` can toggle it only on the
+      column that already is the key).
+
+      New `TAG_ALTER_TABLE` log record (tag 6) with sub-tags per
+      `SchemaChange` variant; `write_column_schema`/`read_column_schema`
+      factored out of the existing `CreateTable` encode/decode so the two
+      record types can't drift apart on the column wire format.
+      `checkpoint_if_worthwhile` needed **no changes at all** — it already
+      re-derives its snapshot from live `Table` state, so once replay
+      correctly mutates that state, compaction just sees whatever the
+      table currently looks like, the same way it already absorbs any
+      number of past `INSERT`s into one batched record. Replay of an
+      `AlterTable` entry tolerates `compute_altered_table` failing (skips
+      that record) rather than panicking: the same benign log-before-
+      memory race `create_table`/`create_database` already document (a
+      "loser" can get durably logged even though it never actually won
+      live) applies here too, and skipping a change that no longer
+      validates exactly reproduces what genuinely happened, rather than
+      crashing over a record that was never a real change to begin with.
+
+      Proof: 10 new parser tests (every action form, `COLUMN`-keyword-
+      optional both ways, composite-key and bad-constraint rejection,
+      schema-qualified names); 1 new log round-trip test (all 5
+      `SchemaChange` variants); 26 new executor tests (every action's
+      happy path plus every rejection: duplicate/unknown column, NOT
+      NULL/PRIMARY KEY on a non-empty table, un-convertible `MODIFY`
+      values, NOT NULL violated by an existing NULL, PRIMARY KEY status
+      touched via `MODIFY`, `AUTO_INCREMENT` without the key, duplicate/
+      NULL values under `ADD PRIMARY KEY`, dropping the last column,
+      dropping/adding a primary key with `AUTO_INCREMENT` interaction); 1
+      new storage-level persistence test (schema *and* data changes survive
+      a restart, including the added primary key still being enforced); 1
+      new real-driver conformance test (`real_driver_alter_table`,
+      exercising every action against the actual `mysql_async` driver); 10
+      new e2e app entries (`cargo run --example e2e`, now 51/51 passing).
+      499 tests total (was 460 before this item -- 412 unit incl. the
+      relocated/new value-conversion tests, 87 integration); fmt + clippy
+      `-D warnings` clean throughout.)_
+- [x] **Acceptance:** each item above has passing unit tests and a real-driver
       conformance test; fmt/clippy/full suite green throughout.
 
 ---

@@ -66,6 +66,40 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    /// `ALTER TABLE <name> <action>`.
+    AlterTable {
+        table: String,
+        action: AlterAction,
+    },
+}
+
+/// One `ALTER TABLE` action. Real MySQL allows several comma-separated
+/// actions in one statement; this engine models exactly one per statement —
+/// most generated DDL (especially from GUI tools) issues one change at a
+/// time anyway, and the executor-level validation below gets meaningfully
+/// simpler without having to reason about several actions interacting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    /// `ADD [COLUMN] <column_def>` — may itself declare `PRIMARY KEY`/
+    /// `AUTO_INCREMENT`, exactly like a `CREATE TABLE` column (see
+    /// `Executor::execute_alter_table` for why that's only accepted on a
+    /// table with no existing rows).
+    AddColumn(ColumnDef),
+    /// `DROP [COLUMN] <name>`.
+    DropColumn(String),
+    /// `MODIFY [COLUMN] <column_def>` — redefines an existing column's
+    /// type/`NOT NULL`/`AUTO_INCREMENT` in place (same name, same position).
+    /// Never changes `PRIMARY KEY` status: a `column_def` that declares
+    /// `PRIMARY KEY` here is rejected by the executor, which points the
+    /// caller at `ADD`/`DROP PRIMARY KEY` instead — keeping "what makes a
+    /// column the primary key" a single, unambiguous code path.
+    ModifyColumn(ColumnDef),
+    /// `ADD [CONSTRAINT [name]] PRIMARY KEY (<column>)` on an *existing*
+    /// column (composite keys aren't supported — same restriction
+    /// `CREATE TABLE`'s table-level `PRIMARY KEY (...)` already has).
+    AddPrimaryKey(String),
+    /// `DROP PRIMARY KEY`.
+    DropPrimaryKey,
 }
 
 /// The recognized forms of `SHOW`. Anything not modelled here parses to
@@ -275,6 +309,7 @@ enum Token {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Keyword {
     Create,
+    Alter,
     Table,
     Insert,
     Into,
@@ -313,6 +348,7 @@ fn keyword_text(kw: Keyword) -> String {
 fn keyword_from_ident(s: &str) -> Option<Keyword> {
     match s.to_ascii_uppercase().as_str() {
         "CREATE" => Some(Keyword::Create),
+        "ALTER" => Some(Keyword::Alter),
         "TABLE" => Some(Keyword::Table),
         "INSERT" => Some(Keyword::Insert),
         "INTO" => Some(Keyword::Into),
@@ -1083,6 +1119,7 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_database(),
+            Some(Token::Keyword(Keyword::Alter)) => self.parse_alter_table(),
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert(),
             Some(Token::Keyword(Keyword::Select)) => self.parse_select(),
             Some(Token::Keyword(Keyword::Begin)) => self.parse_begin(),
@@ -1097,7 +1134,7 @@ impl<'a> Parser<'a> {
             Some(Token::Keyword(Keyword::Use)) => self.parse_use(),
             Some(Token::Keyword(Keyword::Show)) => self.parse_show(),
             other => Err(Error::Parse(format!(
-                "expected CREATE, DROP, INSERT, SELECT, BEGIN, START, COMMIT, ROLLBACK, SET, USE, or SHOW, found {}",
+                "expected CREATE, ALTER, DROP, INSERT, SELECT, BEGIN, START, COMMIT, ROLLBACK, SET, USE, or SHOW, found {}",
                 describe(other)
             ))),
         }
@@ -1282,6 +1319,81 @@ impl<'a> Parser<'a> {
         self.consume_to_statement_end();
         self.eat_semicolon_and_ensure_end()?;
         Ok(Statement::CreateTable { table, columns })
+    }
+
+    /// `ALTER TABLE [db.]name <action>` — see [`AlterAction`] for the
+    /// supported actions and why this engine models only one per statement.
+    fn parse_alter_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
+        let table = self.expect_qualified_ident()?;
+
+        let action = if self.peek_is_ident_ci("ADD") {
+            self.pos += 1;
+            self.parse_alter_add_action()?
+        } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Drop))) {
+            self.pos += 1;
+            self.parse_alter_drop_action()?
+        } else if self.peek_is_ident_ci("MODIFY") {
+            self.pos += 1;
+            if self.peek_is_ident_ci("COLUMN") {
+                self.pos += 1;
+            }
+            AlterAction::ModifyColumn(self.parse_column_def()?)
+        } else {
+            return Err(Error::Parse(format!(
+                "expected ADD, DROP, or MODIFY after ALTER TABLE '{table}', found {}",
+                describe(self.peek())
+            )));
+        };
+
+        self.consume_to_statement_end();
+        self.eat_semicolon_and_ensure_end()?;
+        Ok(Statement::AlterTable { table, action })
+    }
+
+    /// After `ALTER TABLE t ADD`: either `[CONSTRAINT [name]] PRIMARY KEY
+    /// (col)` on an existing column, or a new column definition (with an
+    /// optional `COLUMN` keyword either way — both forms are valid real
+    /// MySQL syntax).
+    fn parse_alter_add_action(&mut self) -> Result<AlterAction> {
+        let named_constraint = self.peek_is_ident_ci("CONSTRAINT");
+        if named_constraint {
+            self.pos += 1;
+            self.eat_optional_name();
+        }
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Primary))) {
+            self.pos += 1;
+            self.expect_keyword(Keyword::Key)?;
+            let pk_columns = self.parse_parenthesized_column_list()?;
+            let [name] = pk_columns.as_slice() else {
+                return Err(Error::Unsupported("composite primary keys"));
+            };
+            return Ok(AlterAction::AddPrimaryKey(name.clone()));
+        }
+        if named_constraint {
+            return Err(Error::Unsupported(
+                "ALTER TABLE ADD CONSTRAINT other than PRIMARY KEY",
+            ));
+        }
+        if self.peek_is_ident_ci("COLUMN") {
+            self.pos += 1;
+        }
+        Ok(AlterAction::AddColumn(self.parse_column_def()?))
+    }
+
+    /// After `ALTER TABLE t DROP`: either `PRIMARY KEY`, or an existing
+    /// column's name (with an optional `COLUMN` keyword either way).
+    fn parse_alter_drop_action(&mut self) -> Result<AlterAction> {
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Primary))) {
+            self.pos += 1;
+            self.expect_keyword(Keyword::Key)?;
+            return Ok(AlterAction::DropPrimaryKey);
+        }
+        if self.peek_is_ident_ci("COLUMN") {
+            self.pos += 1;
+        }
+        Ok(AlterAction::DropColumn(self.expect_ident()?))
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -2975,6 +3087,143 @@ mod tests {
             Statement::DropDatabase {
                 name: "mydb".to_string(),
                 if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn alter_table_add_column_with_and_without_the_column_keyword() {
+        for sql in [
+            "ALTER TABLE t ADD COLUMN age INT",
+            "ALTER TABLE t ADD age INT",
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::AlterTable {
+                    table: "t".to_string(),
+                    action: AlterAction::AddColumn(ColumnDef {
+                        name: "age".to_string(),
+                        type_name: "INT".to_string(),
+                        is_primary_key: false,
+                        nullable: true,
+                        auto_increment: false,
+                    }),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn alter_table_add_column_carries_not_null_and_type_size() {
+        let stmt = parse("ALTER TABLE t ADD COLUMN name VARCHAR(255) NOT NULL").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::AlterTable {
+                table: "t".to_string(),
+                action: AlterAction::AddColumn(ColumnDef {
+                    name: "name".to_string(),
+                    type_name: "VARCHAR(255)".to_string(),
+                    is_primary_key: false,
+                    nullable: false,
+                    auto_increment: false,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn alter_table_drop_column_with_and_without_the_column_keyword() {
+        for sql in ["ALTER TABLE t DROP COLUMN age", "ALTER TABLE t DROP age"] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::AlterTable {
+                    table: "t".to_string(),
+                    action: AlterAction::DropColumn("age".to_string()),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn alter_table_modify_column_with_and_without_the_column_keyword() {
+        for sql in [
+            "ALTER TABLE t MODIFY COLUMN name VARCHAR",
+            "ALTER TABLE t MODIFY name VARCHAR",
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::AlterTable {
+                    table: "t".to_string(),
+                    action: AlterAction::ModifyColumn(ColumnDef {
+                        name: "name".to_string(),
+                        type_name: "VARCHAR".to_string(),
+                        is_primary_key: false,
+                        nullable: true,
+                        auto_increment: false,
+                    }),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn alter_table_add_primary_key_plain_and_named_constraint() {
+        for sql in [
+            "ALTER TABLE t ADD PRIMARY KEY (id)",
+            "ALTER TABLE t ADD CONSTRAINT pk_t PRIMARY KEY (id)",
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::AlterTable {
+                    table: "t".to_string(),
+                    action: AlterAction::AddPrimaryKey("id".to_string()),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn alter_table_add_composite_primary_key_is_unsupported() {
+        assert!(matches!(
+            parse("ALTER TABLE t ADD PRIMARY KEY (a, b)"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_named_constraint_other_than_primary_key_is_unsupported() {
+        assert!(matches!(
+            parse("ALTER TABLE t ADD CONSTRAINT uq UNIQUE (a)"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_drop_primary_key() {
+        assert_eq!(
+            parse("ALTER TABLE t DROP PRIMARY KEY").unwrap(),
+            Statement::AlterTable {
+                table: "t".to_string(),
+                action: AlterAction::DropPrimaryKey,
+            }
+        );
+    }
+
+    #[test]
+    fn alter_table_rejects_unknown_action() {
+        assert!(matches!(
+            parse("ALTER TABLE t RENAME COLUMN a TO b"),
+            Err(Error::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_schema_qualified_name_drops_the_qualifier() {
+        assert_eq!(
+            parse("ALTER TABLE mydb.t DROP COLUMN age").unwrap(),
+            Statement::AlterTable {
+                table: "t".to_string(),
+                action: AlterAction::DropColumn("age".to_string()),
             }
         );
     }

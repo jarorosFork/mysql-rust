@@ -11,7 +11,10 @@ pub mod value;
 
 pub use engine::InMemoryStorage;
 pub use transaction::Transaction;
-pub use value::{format_decimal, ColumnSchema, ColumnType, TableSchema, Value};
+pub use value::{
+    format_decimal, parse_date_literal, parse_decimal_literal, rescale_decimal, ColumnSchema,
+    ColumnType, TableSchema, Value,
+};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -29,6 +32,38 @@ use crate::Result;
 /// the handful of methods that actually need it.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// A single `ALTER TABLE` schema change, already fully resolved/validated at
+/// the type level (the `query::executor` layer translates the parser's
+/// `ColumnDef` into a `ColumnSchema` and cross-checks `PRIMARY KEY`/
+/// `AUTO_INCREMENT` before this ever reaches `Storage` — exactly how
+/// `create_table` already receives `Vec<ColumnSchema>`, not raw `ColumnDef`s).
+/// One method (`Storage::alter_table`) taking this enum, rather than five
+/// separate trait methods, keeps the trait surface — and every
+/// implementor's, incl. `Transaction`'s one-line passthrough — small.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaChange {
+    /// Add a new column. `is_primary_key` is carried separately from
+    /// `column` (rather than as a field on `ColumnSchema`, which has no such
+    /// field) since only `TableSchema` tracks which column, if any, is the
+    /// primary key.
+    AddColumn {
+        column: ColumnSchema,
+        is_primary_key: bool,
+    },
+    /// Remove an existing column by name.
+    DropColumn(String),
+    /// Redefine an existing column's type/nullability/`AUTO_INCREMENT` in
+    /// place (same name, same position) — never its primary-key status; see
+    /// [`crate::query::parser::AlterAction::ModifyColumn`]'s doc comment.
+    ModifyColumn(ColumnSchema),
+    /// Make an existing column the table's primary key.
+    AddPrimaryKey(String),
+    /// Remove the table's primary key (and, since this engine requires
+    /// `AUTO_INCREMENT` to be on the primary-key column, its
+    /// `AUTO_INCREMENT` too, if any).
+    DropPrimaryKey,
+}
+
 /// A pluggable storage backend. `&self` (not `&mut self`) so a single
 /// instance can eventually be shared across connections (Phase 6); engines
 /// use interior mutability. `Send + Sync`: a `Connection`'s per-task future
@@ -43,6 +78,14 @@ pub trait Storage: Send + Sync {
         columns: Vec<ColumnSchema>,
         primary_key: Option<String>,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Apply an `ALTER TABLE` schema change (see [`SchemaChange`]) to an
+    /// existing table: adjusts its schema and rewrites every existing row to
+    /// match (extending/shrinking/retyping as the change requires), or
+    /// returns a client-facing `Error::Execution`/`Error::Unsupported` if the
+    /// change is invalid for this table's current state (unknown column,
+    /// duplicate name, a value that can't convert to the new type, ...).
+    fn alter_table<'a>(&'a self, name: &'a str, change: SchemaChange) -> BoxFuture<'a, Result<()>>;
 
     /// Return the names of all tables.
     fn tables(&self) -> Result<Vec<String>>;

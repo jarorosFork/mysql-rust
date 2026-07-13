@@ -17,7 +17,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::storage::engine::InMemoryStorage;
 use crate::storage::value::{ColumnSchema, TableSchema, Value};
-use crate::storage::{BoxFuture, Storage};
+use crate::storage::{BoxFuture, SchemaChange, Storage};
 use crate::{Error, Result};
 
 /// An in-progress transaction. Logically owned by exactly one `Connection`,
@@ -108,6 +108,11 @@ impl Storage for Transaction {
         // real MySQL (CREATE TABLE implicitly commits any open transaction
         // first); we don't go quite that far, but we don't buffer it either.
         Box::pin(async move { self.storage.create_table(name, columns, primary_key).await })
+    }
+
+    fn alter_table<'a>(&'a self, name: &'a str, change: SchemaChange) -> BoxFuture<'a, Result<()>> {
+        // Same "auto-commits immediately" shape as `create_table` above.
+        Box::pin(async move { self.storage.alter_table(name, change).await })
     }
 
     fn tables(&self) -> Result<Vec<String>> {

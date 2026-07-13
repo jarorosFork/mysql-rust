@@ -225,6 +225,47 @@ const ENTRIES: &[Entry] = &[
               JOIN join_orders o ON c.id = o.customer_id \
               GROUP BY c.name ORDER BY c.name",
     },
+    // ---- Phase 11: ALTER TABLE ----
+    Entry {
+        name: "create and seed a table for ALTER TABLE",
+        sql: "CREATE TABLE alter_demo (id INT, name VARCHAR)",
+    },
+    Entry {
+        name: "seed two rows before any schema change",
+        sql: "INSERT INTO alter_demo VALUES (1, 'Ada'), (2, 'Grace')",
+    },
+    Entry {
+        name: "ALTER TABLE ADD COLUMN",
+        sql: "ALTER TABLE alter_demo ADD COLUMN email VARCHAR",
+    },
+    Entry {
+        name: "verify the new column reads back NULL for pre-existing rows",
+        sql: "SELECT name, email FROM alter_demo ORDER BY name",
+    },
+    Entry {
+        name: "ALTER TABLE ADD PRIMARY KEY on an existing column",
+        sql: "ALTER TABLE alter_demo ADD PRIMARY KEY (id)",
+    },
+    Entry {
+        name: "ALTER TABLE MODIFY COLUMN: widen an INT to VARCHAR in place",
+        sql: "ALTER TABLE alter_demo MODIFY COLUMN id VARCHAR",
+    },
+    Entry {
+        name: "verify the widened column reads back as text",
+        sql: "SELECT id FROM alter_demo ORDER BY id",
+    },
+    Entry {
+        name: "ALTER TABLE DROP COLUMN",
+        sql: "ALTER TABLE alter_demo DROP COLUMN email",
+    },
+    Entry {
+        name: "ALTER TABLE DROP PRIMARY KEY",
+        sql: "ALTER TABLE alter_demo DROP PRIMARY KEY",
+    },
+    Entry {
+        name: "duplicate id now accepted -- no primary key left",
+        sql: "INSERT INTO alter_demo VALUES ('1', 'Also Ada')",
+    },
     Entry {
         name: "drop schema (cleanup)",
         sql: "DROP SCHEMA IF EXISTS shop_alt",

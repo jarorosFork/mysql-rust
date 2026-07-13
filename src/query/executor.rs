@@ -4,10 +4,13 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::query::parser::{
-    ColumnDef, ColumnRef, CompareOp, Condition, Expr, FromClause, JoinType, OrderByItem,
-    SelectItem, ShowStatement, Statement,
+    AlterAction, ColumnDef, ColumnRef, CompareOp, Condition, Expr, FromClause, JoinType,
+    OrderByItem, SelectItem, ShowStatement, Statement,
 };
-use crate::storage::{format_decimal, ColumnSchema, ColumnType, Storage, TableSchema, Value};
+use crate::storage::{
+    format_decimal, parse_date_literal, parse_decimal_literal, rescale_decimal, ColumnSchema,
+    ColumnType, SchemaChange, Storage, TableSchema, Value,
+};
 use crate::{Error, Result};
 
 /// A single row in a result set: one typed value per column.
@@ -116,6 +119,9 @@ impl<'a> Executor<'a> {
             Statement::DropDatabase { name, if_exists } => {
                 self.storage.drop_database(&name, if_exists).await?;
                 Ok(QueryResult::default())
+            }
+            Statement::AlterTable { table, action } => {
+                self.execute_alter_table(&table, action).await
             }
         }
     }
@@ -230,36 +236,24 @@ impl<'a> Executor<'a> {
         let mut auto_increment_column = None;
         let mut schema_columns = Vec::with_capacity(columns.len());
         for col in columns {
-            let column_type = ColumnType::from_name(&col.type_name).ok_or_else(|| {
-                Error::Execution(format!(
-                    "Unknown column type '{}' for column '{}'",
-                    col.type_name, col.name
-                ))
-            })?;
-            if col.is_primary_key {
+            let (schema, is_primary_key) = column_def_to_schema(col)?;
+            if is_primary_key {
                 if primary_key.is_some() {
                     return Err(Error::Execution(
                         "multiple primary key columns are not supported".to_string(),
                     ));
                 }
-                primary_key = Some(col.name.clone());
+                primary_key = Some(schema.name.clone());
             }
-            if col.auto_increment {
+            if schema.auto_increment {
                 if auto_increment_column.is_some() {
                     return Err(Error::Unsupported(
                         "more than one AUTO_INCREMENT column per table",
                     ));
                 }
-                auto_increment_column = Some(col.name.clone());
+                auto_increment_column = Some(schema.name.clone());
             }
-            schema_columns.push(ColumnSchema {
-                name: col.name,
-                column_type,
-                // PRIMARY KEY implies NOT NULL, regardless of how the column
-                // was actually declared — matches standard SQL.
-                nullable: !col.is_primary_key && col.nullable,
-                auto_increment: col.auto_increment,
-            });
+            schema_columns.push(schema);
         }
 
         // This engine has exactly one index — the primary key — so an
@@ -276,6 +270,41 @@ impl<'a> Executor<'a> {
         self.storage
             .create_table(table, schema_columns, primary_key)
             .await?;
+        Ok(QueryResult::default())
+    }
+
+    /// `ALTER TABLE <table> <action>` — translate the parser's `AlterAction`
+    /// (raw `ColumnDef`s, bare names) into a validated `storage::
+    /// SchemaChange` and hand it to `Storage::alter_table`, which applies
+    /// it (or rejects it against the table's *current* schema/rows — an
+    /// unknown column, a value that can't convert to a new type, ...).
+    async fn execute_alter_table(&self, table: &str, action: AlterAction) -> Result<QueryResult> {
+        let change = match action {
+            AlterAction::AddColumn(col) => {
+                let (column, is_primary_key) = column_def_to_schema(col)?;
+                SchemaChange::AddColumn {
+                    column,
+                    is_primary_key,
+                }
+            }
+            AlterAction::DropColumn(name) => SchemaChange::DropColumn(name),
+            AlterAction::ModifyColumn(col) => {
+                // `MODIFY COLUMN` never changes PRIMARY KEY status (see
+                // `AlterAction::ModifyColumn`'s doc comment) — reject here,
+                // before this ever reaches storage, rather than silently
+                // ignoring what the client asked for.
+                if col.is_primary_key {
+                    return Err(Error::Unsupported(
+                        "ALTER TABLE MODIFY COLUMN cannot change PRIMARY KEY status; use ADD PRIMARY KEY / DROP PRIMARY KEY instead",
+                    ));
+                }
+                let (column, _) = column_def_to_schema(col)?;
+                SchemaChange::ModifyColumn(column)
+            }
+            AlterAction::AddPrimaryKey(name) => SchemaChange::AddPrimaryKey(name),
+            AlterAction::DropPrimaryKey => SchemaChange::DropPrimaryKey,
+        };
+        self.storage.alter_table(table, change).await?;
         Ok(QueryResult::default())
     }
 
@@ -1308,6 +1337,35 @@ fn reorder_exprs(
         .collect()
 }
 
+/// Translate one parsed `ColumnDef` into a `ColumnSchema`, applying the one
+/// column-level invariant that doesn't depend on anything else in a table
+/// definition: `PRIMARY KEY` implies `NOT NULL`, regardless of how the
+/// column was actually declared (matches standard SQL). The `bool` reports
+/// whether `col` declared `PRIMARY KEY`, since `ColumnSchema` itself has no
+/// such field — only `TableSchema` tracks which column, if any, is the key.
+///
+/// Shared by `CREATE TABLE` (looping over this once per column, then
+/// separately cross-checking multiple-`PRIMARY KEY`/multiple-
+/// `AUTO_INCREMENT` across the whole list) and `ALTER TABLE ADD`/`MODIFY
+/// COLUMN` (a single column, cross-checked against the table's *existing*
+/// schema instead — see `execute_alter_table`).
+fn column_def_to_schema(col: ColumnDef) -> Result<(ColumnSchema, bool)> {
+    let column_type = ColumnType::from_name(&col.type_name).ok_or_else(|| {
+        Error::Execution(format!(
+            "Unknown column type '{}' for column '{}'",
+            col.type_name, col.name
+        ))
+    })?;
+    let is_primary_key = col.is_primary_key;
+    let schema = ColumnSchema {
+        name: col.name,
+        column_type,
+        nullable: !is_primary_key && col.nullable,
+        auto_increment: col.auto_increment,
+    };
+    Ok((schema, is_primary_key))
+}
+
 /// Coerce a parsed literal into a typed storage [`Value`] for `column`,
 /// following MySQL's permissive-but-checked conversions: a numeric string
 /// into an INT column is parsed, an integer into a VARCHAR column is
@@ -1361,99 +1419,6 @@ fn coerce(expr: &Expr, column_type: ColumnType, column_name: &str) -> Result<Val
             "unbound '?' parameter reached the executor".to_string(),
         )),
     }
-}
-
-/// Convert a fixed-point value from `from_scale` to `to_scale` (widening
-/// multiplies; narrowing rounds half-away-from-zero), with checked
-/// arithmetic throughout so an absurd scale/magnitude combination is a clean
-/// `Error::Execution`, never an overflow panic.
-fn rescale_decimal(unscaled: i64, from_scale: u8, to_scale: u8, column_name: &str) -> Result<i64> {
-    let out_of_range = || {
-        Error::Execution(format!(
-            "decimal value out of range for column '{column_name}'"
-        ))
-    };
-    if to_scale >= from_scale {
-        let factor = 10i64
-            .checked_pow(u32::from(to_scale - from_scale))
-            .ok_or_else(out_of_range)?;
-        unscaled.checked_mul(factor).ok_or_else(out_of_range)
-    } else {
-        let divisor = 10u64
-            .checked_pow(u32::from(from_scale - to_scale))
-            .ok_or_else(out_of_range)?;
-        let magnitude = unscaled.unsigned_abs();
-        let rounded = (magnitude + divisor / 2) / divisor;
-        let rounded = i64::try_from(rounded).map_err(|_| out_of_range())?;
-        Ok(if unscaled < 0 { -rounded } else { rounded })
-    }
-}
-
-/// Parse a numeric string like `"123.45"`, `"-5"`, or `".5"` into
-/// `(unscaled, scale)` at the scale as written (not yet rescaled to any
-/// column). Used when a decimal value arrives as text (a quoted SQL string
-/// literal, or a prepared-statement string parameter).
-fn parse_decimal_literal(s: &str, column_name: &str) -> Result<(i64, u8)> {
-    let invalid = || {
-        Error::Execution(format!(
-            "Incorrect decimal value: '{s}' for column '{column_name}'"
-        ))
-    };
-    let (negative, rest) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s),
-    };
-    let (int_part, frac_part) = match rest.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (rest, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return Err(invalid());
-    }
-    if !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac_part.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(invalid());
-    }
-    if frac_part.len() > u8::MAX as usize {
-        return Err(invalid());
-    }
-    let magnitude: i64 = format!("{int_part}{frac_part}")
-        .parse()
-        .map_err(|_| invalid())?;
-    Ok((
-        if negative { -magnitude } else { magnitude },
-        frac_part.len() as u8,
-    ))
-}
-
-/// Validate a `'YYYY-MM-DD'` date literal: exactly that shape, month `01`-`12`,
-/// day `01`-`31`. No calendar-correctness check beyond that (e.g. `2024-02-30`
-/// is accepted) — this server does no date arithmetic that would need it
-/// (see ROADMAP.md Phase 11's cut list), so it isn't worth the complexity.
-fn parse_date_literal(s: &str, column_name: &str) -> Result<String> {
-    let invalid = || {
-        Error::Execution(format!(
-            "Incorrect date value: '{s}' for column '{column_name}'"
-        ))
-    };
-    let bytes = s.as_bytes();
-    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
-        return Err(invalid());
-    }
-    let digits = |range: std::ops::Range<usize>| -> Result<u32> {
-        s.get(range)
-            .filter(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|part| part.parse::<u32>().ok())
-            .ok_or_else(invalid)
-    };
-    let _year = digits(0..4)?; // any 4-digit year is accepted; no range limit
-    let month = digits(5..7)?;
-    let day = digits(8..10)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(invalid());
-    }
-    Ok(s.to_string())
 }
 
 /// Order `rows` by `sort_keys` (column index + descending flag, applied in
@@ -1825,6 +1790,332 @@ mod tests {
                 &storage,
                 "CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)"
             ),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    // ---- ALTER TABLE ----
+
+    #[test]
+    fn alter_table_add_column_on_an_empty_table() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "ALTER TABLE t ADD COLUMN b VARCHAR").expect("alter");
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.column_names(), vec!["a", "b"]);
+        assert_eq!(result.columns[1].column_type, ColumnType::Varchar);
+    }
+
+    #[test]
+    fn alter_table_add_column_backfills_null_for_existing_rows() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1)").expect("insert");
+        run(&storage, "ALTER TABLE t ADD COLUMN b VARCHAR").expect("alter");
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.rows, vec![vec![int(1), Value::Null]]);
+
+        // The new column is usable for further inserts too.
+        run(&storage, "INSERT INTO t VALUES (2, 'x')").expect("insert into altered table");
+        let result = run(&storage, "SELECT * FROM t ORDER BY a").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![vec![int(1), Value::Null], vec![int(2), vc("x")]]
+        );
+    }
+
+    #[test]
+    fn alter_table_add_column_not_null_is_rejected_when_the_table_has_rows() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1)").expect("insert");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t ADD COLUMN b INT NOT NULL"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_column_primary_key_is_rejected_when_the_table_has_rows() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1)").expect("insert");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t ADD COLUMN id INT PRIMARY KEY"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_column_primary_key_on_an_empty_table_succeeds() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "ALTER TABLE t ADD COLUMN id INT PRIMARY KEY").expect("alter");
+        run(&storage, "INSERT INTO t VALUES (1, 1)").expect("insert");
+        // The new column is now genuinely the primary key: a duplicate value
+        // is rejected exactly like any other PRIMARY KEY column.
+        assert!(matches!(
+            run(&storage, "INSERT INTO t VALUES (2, 1)"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_duplicate_name() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t ADD COLUMN a VARCHAR"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_drop_column_removes_it_from_schema_and_existing_rows() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT, b VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, 'x')").expect("insert");
+        run(&storage, "ALTER TABLE t DROP COLUMN b").expect("alter");
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.column_names(), vec!["a"]);
+        assert_eq!(result.rows, vec![vec![int(1)]]);
+    }
+
+    #[test]
+    fn alter_table_drop_column_rejects_the_last_remaining_column() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t DROP COLUMN a"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_drop_column_rejects_an_unknown_column() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t DROP COLUMN bogus"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_drop_column_that_is_the_primary_key_clears_it() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)",
+        )
+        .expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, 'a')").expect("insert");
+        run(&storage, "ALTER TABLE t DROP COLUMN id").expect("alter");
+        // No primary key left at all -- duplicate `name` values are no
+        // longer rejected.
+        run(&storage, "INSERT INTO t VALUES ('a')").expect("insert duplicate, no PK left");
+        run(&storage, "INSERT INTO t VALUES ('a')").expect("insert duplicate, no PK left");
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn alter_table_modify_column_widens_int_to_varchar() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (123)").expect("insert");
+        run(&storage, "ALTER TABLE t MODIFY COLUMN a VARCHAR").expect("alter");
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.columns[0].column_type, ColumnType::Varchar);
+        assert_eq!(result.rows, vec![vec![vc("123")]]);
+    }
+
+    #[test]
+    fn alter_table_modify_column_narrows_varchar_to_int_when_every_value_parses() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES ('123'), ('456')").expect("insert");
+        run(&storage, "ALTER TABLE t MODIFY COLUMN a INT").expect("alter");
+        let result = run(&storage, "SELECT * FROM t ORDER BY a").expect("select");
+        assert_eq!(result.columns[0].column_type, ColumnType::Int);
+        assert_eq!(result.rows, vec![vec![int(123)], vec![int(456)]]);
+    }
+
+    #[test]
+    fn alter_table_modify_column_rejects_a_value_that_cannot_convert() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES ('hello')").expect("insert");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t MODIFY COLUMN a INT"),
+            Err(Error::Execution(_))
+        ));
+        // Rejected atomically -- the column keeps its original type/values.
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.columns[0].column_type, ColumnType::Varchar);
+        assert_eq!(result.rows, vec![vec![vc("hello")]]);
+    }
+
+    #[test]
+    fn alter_table_modify_column_rejects_not_null_violated_by_an_existing_null() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (NULL)").expect("insert");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t MODIFY COLUMN a INT NOT NULL"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_modify_column_rejects_touching_primary_key_status() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT PRIMARY KEY, a INT)").expect("create");
+        // Declaring PRIMARY KEY via MODIFY is rejected, whether or not the
+        // column already is the key -- `ADD`/`DROP PRIMARY KEY` are the only
+        // supported way to change that status.
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t MODIFY COLUMN id INT PRIMARY KEY"),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t MODIFY COLUMN a INT PRIMARY KEY"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_modify_column_rejects_auto_increment_without_being_the_primary_key() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT PRIMARY KEY, a INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t MODIFY COLUMN a INT AUTO_INCREMENT"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_modify_column_can_toggle_auto_increment_on_the_primary_key() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (5)").expect("insert");
+        run(
+            &storage,
+            "ALTER TABLE t MODIFY COLUMN id INT AUTO_INCREMENT",
+        )
+        .expect("alter");
+        // Auto-assigned values continue from the largest value already
+        // present, exactly like a table created with AUTO_INCREMENT from
+        // the start.
+        run(&storage, "INSERT INTO t VALUES (NULL)").expect("insert with auto-assigned id");
+        let result = run(&storage, "SELECT * FROM t ORDER BY id").expect("select");
+        assert_eq!(result.rows, vec![vec![int(5)], vec![int(6)]]);
+    }
+
+    #[test]
+    fn alter_table_add_primary_key_on_an_existing_column() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT, name VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, 'a')").expect("insert");
+        run(&storage, "ALTER TABLE t ADD PRIMARY KEY (id)").expect("alter");
+        assert!(matches!(
+            run(&storage, "INSERT INTO t VALUES (1, 'b')"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_primary_key_rejects_duplicate_existing_values() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT, name VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, 'a'), (1, 'b')").expect("insert");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t ADD PRIMARY KEY (id)"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_primary_key_rejects_existing_null_values() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT, name VARCHAR)").expect("create");
+        run(&storage, "INSERT INTO t VALUES (NULL, 'a')").expect("insert");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t ADD PRIMARY KEY (id)"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_primary_key_rejects_when_one_already_exists() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT PRIMARY KEY, other INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t ADD PRIMARY KEY (other)"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_add_primary_key_rejects_an_unknown_column() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t ADD PRIMARY KEY (bogus)"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_drop_primary_key_removes_it() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)",
+        )
+        .expect("create");
+        run(&storage, "INSERT INTO t VALUES (1, 'a')").expect("insert");
+        run(&storage, "ALTER TABLE t DROP PRIMARY KEY").expect("alter");
+        // No longer enforced: a duplicate `id` now inserts cleanly.
+        run(&storage, "INSERT INTO t VALUES (1, 'b')").expect("insert duplicate, no PK left");
+        let result = run(&storage, "SELECT * FROM t").expect("select");
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn alter_table_drop_primary_key_rejects_when_there_is_none() {
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (a INT)").expect("create");
+        assert!(matches!(
+            run(&storage, "ALTER TABLE t DROP PRIMARY KEY"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_drop_primary_key_clears_auto_increment_too() {
+        let storage = InMemoryStorage::new();
+        run(
+            &storage,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR)",
+        )
+        .expect("create");
+        run(&storage, "INSERT INTO t (name) VALUES ('a')").expect("insert");
+        run(&storage, "ALTER TABLE t DROP PRIMARY KEY").expect("alter");
+        // `id` is still NOT NULL (dropping the key doesn't relax that,
+        // matching real MySQL) but no longer AUTO_INCREMENT, so omitting it
+        // now fails instead of silently auto-assigning a value.
+        assert!(matches!(
+            run(&storage, "INSERT INTO t (name) VALUES ('b')"),
+            Err(Error::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn alter_table_rejects_an_unknown_table() {
+        let storage = InMemoryStorage::new();
+        assert!(matches!(
+            run(&storage, "ALTER TABLE bogus ADD COLUMN a INT"),
             Err(Error::Execution(_))
         ));
     }

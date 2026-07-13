@@ -28,10 +28,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::storage::log::{
-    encode_create_database, encode_create_table, encode_drop_database, encode_insert_row,
-    encode_transaction, Log,
+    encode_alter_table, encode_create_database, encode_create_table, encode_drop_database,
+    encode_insert_row, encode_transaction, Log,
 };
 use crate::storage::value::{ColumnSchema, Value};
+use crate::storage::SchemaChange;
 use crate::{Error, Result};
 
 /// Generous headroom so `submit`'s channel send essentially never actually
@@ -230,6 +231,13 @@ impl LogWriter {
     pub async fn append_drop_database(&self, name: &str) -> Result<()> {
         self.submit(crate::storage::log::frame_record(&encode_drop_database(
             name,
+        )))
+        .await
+    }
+
+    pub async fn append_alter_table(&self, table: &str, change: &SchemaChange) -> Result<()> {
+        self.submit(crate::storage::log::frame_record(&encode_alter_table(
+            table, change,
         )))
         .await
     }

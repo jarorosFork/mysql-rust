@@ -47,6 +47,7 @@ use std::path::Path;
 
 use crate::config::SyncPolicy;
 use crate::storage::value::{ColumnSchema, ColumnType, Value};
+use crate::storage::SchemaChange;
 use crate::{Error, Result};
 
 const TAG_CREATE_TABLE: u8 = 1;
@@ -65,6 +66,16 @@ const TAG_TRANSACTION: u8 = 3;
 /// survive a restart the same way table data always has.
 const TAG_CREATE_DATABASE: u8 = 4;
 const TAG_DROP_DATABASE: u8 = 5;
+/// `ALTER TABLE` (Phase 11) — see [`Entry::AlterTable`]/[`SchemaChange`].
+const TAG_ALTER_TABLE: u8 = 6;
+
+/// Sub-tags distinguishing `SchemaChange`'s variants inside a
+/// `TAG_ALTER_TABLE` record's payload, right after the table name.
+const ALTER_ADD_COLUMN: u8 = 0;
+const ALTER_DROP_COLUMN: u8 = 1;
+const ALTER_MODIFY_COLUMN: u8 = 2;
+const ALTER_ADD_PRIMARY_KEY: u8 = 3;
+const ALTER_DROP_PRIMARY_KEY: u8 = 4;
 
 const VALUE_NULL: u8 = 0;
 const VALUE_INT: u8 = 1;
@@ -106,6 +117,12 @@ pub enum Entry {
     DropDatabase {
         name: String,
     },
+    /// A schema change from `ALTER TABLE` (Phase 11) — see
+    /// [`TAG_ALTER_TABLE`] and [`SchemaChange`].
+    AlterTable {
+        table: String,
+        change: SchemaChange,
+    },
 }
 
 fn write_u32(buf: &mut Vec<u8>, n: u32) {
@@ -140,6 +157,33 @@ fn write_value(buf: &mut Vec<u8>, value: &Value) {
     }
 }
 
+/// Encode one column's name/type/flags — shared by `TAG_CREATE_TABLE` (a
+/// whole column list) and `TAG_ALTER_TABLE`'s `AddColumn`/`ModifyColumn`
+/// payloads (a single column), so the two record types can never drift
+/// apart on the wire format for what's the same underlying `ColumnSchema`.
+fn write_column_schema(buf: &mut Vec<u8>, col: &ColumnSchema) {
+    write_string(buf, &col.name);
+    match col.column_type {
+        ColumnType::Int => buf.push(COLUMN_TYPE_INT),
+        ColumnType::Varchar => buf.push(COLUMN_TYPE_VARCHAR),
+        ColumnType::Date => buf.push(COLUMN_TYPE_DATE),
+        // DECIMAL carries its scale as data, unlike the other types — one
+        // extra byte right after the tag.
+        ColumnType::Decimal(scale) => {
+            buf.push(COLUMN_TYPE_DECIMAL);
+            buf.push(scale);
+        }
+    }
+    let mut flags = 0u8;
+    if col.nullable {
+        flags |= COLUMN_FLAG_NULLABLE;
+    }
+    if col.auto_increment {
+        flags |= COLUMN_FLAG_AUTO_INCREMENT;
+    }
+    buf.push(flags);
+}
+
 pub(super) fn encode_create_table(
     table: &str,
     columns: &[ColumnSchema],
@@ -156,26 +200,40 @@ pub(super) fn encode_create_table(
     }
     write_u32(&mut buf, columns.len() as u32);
     for col in columns {
-        write_string(&mut buf, &col.name);
-        match col.column_type {
-            ColumnType::Int => buf.push(COLUMN_TYPE_INT),
-            ColumnType::Varchar => buf.push(COLUMN_TYPE_VARCHAR),
-            ColumnType::Date => buf.push(COLUMN_TYPE_DATE),
-            // DECIMAL carries its scale as data, unlike the other types —
-            // one extra byte right after the tag.
-            ColumnType::Decimal(scale) => {
-                buf.push(COLUMN_TYPE_DECIMAL);
-                buf.push(scale);
-            }
+        write_column_schema(&mut buf, col);
+    }
+    buf
+}
+
+/// Encode one `ALTER TABLE` schema change — see [`SchemaChange`] and the
+/// `ALTER_*` sub-tag constants.
+pub(super) fn encode_alter_table(table: &str, change: &SchemaChange) -> Vec<u8> {
+    let mut buf = vec![TAG_ALTER_TABLE];
+    write_string(&mut buf, table);
+    match change {
+        SchemaChange::AddColumn {
+            column,
+            is_primary_key,
+        } => {
+            buf.push(ALTER_ADD_COLUMN);
+            write_column_schema(&mut buf, column);
+            buf.push(u8::from(*is_primary_key));
         }
-        let mut flags = 0u8;
-        if col.nullable {
-            flags |= COLUMN_FLAG_NULLABLE;
+        SchemaChange::DropColumn(name) => {
+            buf.push(ALTER_DROP_COLUMN);
+            write_string(&mut buf, name);
         }
-        if col.auto_increment {
-            flags |= COLUMN_FLAG_AUTO_INCREMENT;
+        SchemaChange::ModifyColumn(column) => {
+            buf.push(ALTER_MODIFY_COLUMN);
+            write_column_schema(&mut buf, column);
         }
-        buf.push(flags);
+        SchemaChange::AddPrimaryKey(name) => {
+            buf.push(ALTER_ADD_PRIMARY_KEY);
+            write_string(&mut buf, name);
+        }
+        SchemaChange::DropPrimaryKey => {
+            buf.push(ALTER_DROP_PRIMARY_KEY);
+        }
     }
     buf
 }
@@ -316,6 +374,27 @@ fn read_string(bytes: &[u8], pos: &mut usize) -> Result<String> {
     Ok(s)
 }
 
+/// Decode one column's name/type/flags — the inverse of
+/// [`write_column_schema`], shared the same way between `TAG_CREATE_TABLE`
+/// and `TAG_ALTER_TABLE`.
+fn read_column_schema(bytes: &[u8], pos: &mut usize) -> Result<ColumnSchema> {
+    let name = read_string(bytes, pos)?;
+    let column_type = match read_byte(bytes, pos)? {
+        COLUMN_TYPE_INT => ColumnType::Int,
+        COLUMN_TYPE_VARCHAR => ColumnType::Varchar,
+        COLUMN_TYPE_DATE => ColumnType::Date,
+        COLUMN_TYPE_DECIMAL => ColumnType::Decimal(read_byte(bytes, pos)?),
+        other => return Err(corrupt(&format!("unknown column type tag {other}"))),
+    };
+    let flags = read_byte(bytes, pos)?;
+    Ok(ColumnSchema {
+        name,
+        column_type,
+        nullable: flags & COLUMN_FLAG_NULLABLE != 0,
+        auto_increment: flags & COLUMN_FLAG_AUTO_INCREMENT != 0,
+    })
+}
+
 fn read_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
     match read_byte(bytes, pos)? {
         VALUE_NULL => Ok(Value::Null),
@@ -344,21 +423,7 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
             let column_count = read_u32(bytes, &mut pos)? as usize;
             let mut columns = Vec::with_capacity(column_count);
             for _ in 0..column_count {
-                let name = read_string(bytes, &mut pos)?;
-                let column_type = match read_byte(bytes, &mut pos)? {
-                    COLUMN_TYPE_INT => ColumnType::Int,
-                    COLUMN_TYPE_VARCHAR => ColumnType::Varchar,
-                    COLUMN_TYPE_DATE => ColumnType::Date,
-                    COLUMN_TYPE_DECIMAL => ColumnType::Decimal(read_byte(bytes, &mut pos)?),
-                    other => return Err(corrupt(&format!("unknown column type tag {other}"))),
-                };
-                let flags = read_byte(bytes, &mut pos)?;
-                columns.push(ColumnSchema {
-                    name,
-                    column_type,
-                    nullable: flags & COLUMN_FLAG_NULLABLE != 0,
-                    auto_increment: flags & COLUMN_FLAG_AUTO_INCREMENT != 0,
-                });
+                columns.push(read_column_schema(bytes, &mut pos)?);
             }
             Ok(Entry::CreateTable {
                 table,
@@ -395,6 +460,27 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
         TAG_DROP_DATABASE => Ok(Entry::DropDatabase {
             name: read_string(bytes, &mut pos)?,
         }),
+        TAG_ALTER_TABLE => {
+            let table = read_string(bytes, &mut pos)?;
+            let change = match read_byte(bytes, &mut pos)? {
+                ALTER_ADD_COLUMN => {
+                    let column = read_column_schema(bytes, &mut pos)?;
+                    let is_primary_key = read_byte(bytes, &mut pos)? != 0;
+                    SchemaChange::AddColumn {
+                        column,
+                        is_primary_key,
+                    }
+                }
+                ALTER_DROP_COLUMN => SchemaChange::DropColumn(read_string(bytes, &mut pos)?),
+                ALTER_MODIFY_COLUMN => {
+                    SchemaChange::ModifyColumn(read_column_schema(bytes, &mut pos)?)
+                }
+                ALTER_ADD_PRIMARY_KEY => SchemaChange::AddPrimaryKey(read_string(bytes, &mut pos)?),
+                ALTER_DROP_PRIMARY_KEY => SchemaChange::DropPrimaryKey,
+                other => return Err(corrupt(&format!("unknown alter-table sub-tag {other}"))),
+            };
+            Ok(Entry::AlterTable { table, change })
+        }
         other => Err(corrupt(&format!("unknown entry tag {other}"))),
     }
 }
@@ -671,6 +757,11 @@ impl Log {
     pub fn append_drop_database(&mut self, name: &str) -> Result<()> {
         self.append(&encode_drop_database(name))
     }
+
+    /// Record an `ALTER TABLE` schema change (see [`SchemaChange`]).
+    pub fn append_alter_table(&mut self, table: &str, change: &SchemaChange) -> Result<()> {
+        self.append(&encode_alter_table(table, change))
+    }
 }
 
 /// Write `framed_records` (already-framed `[len][crc][payload]` records,
@@ -865,6 +956,80 @@ mod tests {
         match &replayed[2] {
             Entry::DropDatabase { name } => assert_eq!(name, "shop_alt"),
             _ => panic!("expected DropDatabase"),
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_every_alter_table_schema_change_variant() {
+        let path = temp_path("round-trip-alter-table");
+        let name_col = |n: &str| ColumnSchema {
+            name: n.to_string(),
+            column_type: ColumnType::Varchar,
+            nullable: true,
+            auto_increment: false,
+        };
+        {
+            let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
+            log.append_alter_table(
+                "t",
+                &SchemaChange::AddColumn {
+                    column: name_col("nickname"),
+                    is_primary_key: false,
+                },
+            )
+            .unwrap();
+            log.append_alter_table("t", &SchemaChange::DropColumn("nickname".to_string()))
+                .unwrap();
+            log.append_alter_table("t", &SchemaChange::ModifyColumn(name_col("name")))
+                .unwrap();
+            log.append_alter_table("t", &SchemaChange::AddPrimaryKey("id".to_string()))
+                .unwrap();
+            log.append_alter_table("t", &SchemaChange::DropPrimaryKey)
+                .unwrap();
+        }
+
+        let mut replayed = Vec::new();
+        let _log = Log::open(&path, SyncPolicy::Never, |entry| replayed.push(entry)).unwrap();
+
+        assert_eq!(replayed.len(), 5);
+        match &replayed[0] {
+            Entry::AlterTable { table, change } => {
+                assert_eq!(table, "t");
+                assert_eq!(
+                    *change,
+                    SchemaChange::AddColumn {
+                        column: name_col("nickname"),
+                        is_primary_key: false,
+                    }
+                );
+            }
+            _ => panic!("expected AlterTable"),
+        }
+        match &replayed[1] {
+            Entry::AlterTable { change, .. } => {
+                assert_eq!(*change, SchemaChange::DropColumn("nickname".to_string()));
+            }
+            _ => panic!("expected AlterTable"),
+        }
+        match &replayed[2] {
+            Entry::AlterTable { change, .. } => {
+                assert_eq!(*change, SchemaChange::ModifyColumn(name_col("name")));
+            }
+            _ => panic!("expected AlterTable"),
+        }
+        match &replayed[3] {
+            Entry::AlterTable { change, .. } => {
+                assert_eq!(*change, SchemaChange::AddPrimaryKey("id".to_string()));
+            }
+            _ => panic!("expected AlterTable"),
+        }
+        match &replayed[4] {
+            Entry::AlterTable { change, .. } => {
+                assert_eq!(*change, SchemaChange::DropPrimaryKey);
+            }
+            _ => panic!("expected AlterTable"),
         }
 
         std::fs::remove_file(&path).ok();

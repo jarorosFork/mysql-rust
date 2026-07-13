@@ -12,8 +12,11 @@ use crate::storage::log::{
     write_snapshot_file, Entry, Log,
 };
 use crate::storage::log_writer::LogWriter;
-use crate::storage::value::{ColumnSchema, TableSchema, Value};
-use crate::storage::{BoxFuture, Storage};
+use crate::storage::value::{
+    format_decimal, parse_date_literal, parse_decimal_literal, rescale_decimal, ColumnSchema,
+    ColumnType, TableSchema, Value,
+};
+use crate::storage::{BoxFuture, SchemaChange, Storage};
 use crate::{Error, Result};
 
 /// How long a transaction waits for a table's write lock before giving up
@@ -106,6 +109,245 @@ impl Table {
     }
 }
 
+/// Build the post-`change` version of `current` from scratch: a fresh
+/// schema, and every existing row transformed/extended/shrunk to match it,
+/// re-inserted via `Table::new` + `push_trusted` so the primary-key index
+/// and `AUTO_INCREMENT` counter come out right for free — the same
+/// machinery that already rebuilds a table from a batch of rows on replay
+/// (`apply_entry`'s `Entry::Transaction` arm) and at checkpoint time.
+///
+/// Pure with respect to `current`: callers apply the result by replacing
+/// the old `Table` wholesale (`tables.insert(name, ...)`), never by
+/// mutating it in place — which is also what makes it safe to call twice
+/// (once to validate under a read lock, discarding the result; once for
+/// real under the write lock, matching every other mutating method in this
+/// file) without ever leaving partially-altered state visible to a reader.
+fn compute_altered_table(current: &Table, change: &SchemaChange) -> Result<Table> {
+    match change {
+        SchemaChange::AddColumn {
+            column,
+            is_primary_key,
+        } => {
+            if current.schema.columns.iter().any(|c| c.name == column.name) {
+                return Err(Error::Execution(format!(
+                    "Duplicate column name '{}'",
+                    column.name
+                )));
+            }
+            // No `DEFAULT` support anywhere in this engine (see
+            // `query::parser::Parser::parse_column_def`'s own doc comment —
+            // `DEFAULT <expr>` is parsed and discarded even for `CREATE
+            // TABLE`), so a new `NOT NULL` or `PRIMARY KEY` column has no
+            // way to get a value for rows that already exist.
+            if !current.rows.is_empty() {
+                if !column.nullable {
+                    return Err(Error::Execution(format!(
+                        "ADD COLUMN '{}' NOT NULL is not supported on a table that already has rows (no DEFAULT value support)",
+                        column.name
+                    )));
+                }
+                if *is_primary_key {
+                    return Err(Error::Execution(format!(
+                        "ADD COLUMN '{}' PRIMARY KEY is not supported on a table that already has rows",
+                        column.name
+                    )));
+                }
+            }
+            if *is_primary_key && current.schema.primary_key.is_some() {
+                return Err(Error::Execution(
+                    "table already has a primary key".to_string(),
+                ));
+            }
+            let mut columns = current.schema.columns.clone();
+            columns.push(column.clone());
+            let primary_key = if *is_primary_key {
+                Some(column.name.clone())
+            } else {
+                current.schema.primary_key.clone()
+            };
+            let mut rebuilt = Table::new(columns, primary_key);
+            for row in &current.rows {
+                let mut new_row = row.clone();
+                new_row.push(Value::Null);
+                rebuilt.push_trusted(new_row);
+            }
+            Ok(rebuilt)
+        }
+        SchemaChange::DropColumn(name) => {
+            let idx = current
+                .schema
+                .columns
+                .iter()
+                .position(|c| &c.name == name)
+                .ok_or_else(|| Error::Execution(format!("Unknown column '{name}'")))?;
+            if current.schema.columns.len() == 1 {
+                return Err(Error::Execution(
+                    "cannot drop the only remaining column in a table".to_string(),
+                ));
+            }
+            let mut columns = current.schema.columns.clone();
+            columns.remove(idx);
+            // Dropping the primary-key column drops the primary key itself
+            // (there is nothing left to index by) rather than erroring —
+            // simpler and more permissive than real MySQL's own version-
+            // dependent behavior here, and unambiguous to document.
+            let primary_key = current.schema.primary_key.clone().filter(|pk| pk != name);
+            let mut rebuilt = Table::new(columns, primary_key);
+            for row in &current.rows {
+                let mut new_row = row.clone();
+                new_row.remove(idx);
+                rebuilt.push_trusted(new_row);
+            }
+            Ok(rebuilt)
+        }
+        SchemaChange::ModifyColumn(new_col) => {
+            let idx = current
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == new_col.name)
+                .ok_or_else(|| Error::Execution(format!("Unknown column '{}'", new_col.name)))?;
+            // `AUTO_INCREMENT` requires being the primary key everywhere
+            // else in this engine (`Executor::execute_create_table`); `MODIFY
+            // COLUMN` never changes primary-key status (see
+            // `query::parser::AlterAction::ModifyColumn`), so the only way
+            // this can be valid is if the column already is the PK.
+            if new_col.auto_increment
+                && current.schema.primary_key.as_deref() != Some(new_col.name.as_str())
+            {
+                return Err(Error::Unsupported(
+                    "AUTO_INCREMENT on a column that isn't the PRIMARY KEY",
+                ));
+            }
+            let mut columns = current.schema.columns.clone();
+            columns[idx] = new_col.clone();
+            let mut rebuilt = Table::new(columns, current.schema.primary_key.clone());
+            for row in &current.rows {
+                let mut new_row = row.clone();
+                new_row[idx] = retype_value(&new_row[idx], new_col.column_type, &new_col.name)?;
+                if !new_col.nullable && matches!(new_row[idx], Value::Null) {
+                    return Err(Error::Execution(format!(
+                        "Column '{}' cannot be null",
+                        new_col.name
+                    )));
+                }
+                rebuilt.push_trusted(new_row);
+            }
+            Ok(rebuilt)
+        }
+        SchemaChange::AddPrimaryKey(name) => {
+            if current.schema.primary_key.is_some() {
+                return Err(Error::Execution(
+                    "table already has a primary key".to_string(),
+                ));
+            }
+            let idx = current
+                .schema
+                .columns
+                .iter()
+                .position(|c| &c.name == name)
+                .ok_or_else(|| Error::Execution(format!("Unknown column '{name}'")))?;
+            let mut columns = current.schema.columns.clone();
+            columns[idx].nullable = false; // PRIMARY KEY implies NOT NULL
+            let mut rebuilt = Table::new(columns, Some(name.clone()));
+            let mut seen = HashSet::new();
+            for row in &current.rows {
+                if matches!(row[idx], Value::Null) {
+                    return Err(Error::Execution(format!(
+                        "Column '{name}' contains NULL values; cannot be a primary key"
+                    )));
+                }
+                if !seen.insert(row[idx].clone()) {
+                    return Err(Error::Execution(format!(
+                        "Duplicate entry '{}' for key 'PRIMARY'",
+                        row[idx].to_display_string().unwrap_or_default()
+                    )));
+                }
+                rebuilt.push_trusted(row.clone());
+            }
+            Ok(rebuilt)
+        }
+        SchemaChange::DropPrimaryKey => {
+            if current.schema.primary_key.is_none() {
+                return Err(Error::Execution(
+                    "table has no primary key to drop".to_string(),
+                ));
+            }
+            let mut columns = current.schema.columns.clone();
+            // `AUTO_INCREMENT` must be the primary key everywhere else in
+            // this engine, so dropping the key also has to clear it —
+            // otherwise `Table::new` below would rebuild an orphaned
+            // AUTO_INCREMENT column `create_table`'s own validation would
+            // never have allowed in the first place.
+            for c in &mut columns {
+                if Some(&c.name) == current.schema.primary_key.as_ref() {
+                    c.auto_increment = false;
+                }
+            }
+            let mut rebuilt = Table::new(columns, None);
+            for row in &current.rows {
+                rebuilt.push_trusted(row.clone());
+            }
+            Ok(rebuilt)
+        }
+    }
+}
+
+/// Convert an already-stored `value` to what it would be under `new_type` —
+/// the `ALTER TABLE ... MODIFY COLUMN` counterpart of
+/// `query::executor::coerce` (which converts a freshly parsed literal
+/// instead of an already-stored value), reusing the same rescale/parse
+/// primitives from `storage::value` so the two stay consistent. `NULL`
+/// always stays `NULL` regardless of `new_type` — there's no value to lose.
+fn retype_value(value: &Value, new_type: ColumnType, column_name: &str) -> Result<Value> {
+    match (value, new_type) {
+        (Value::Null, _) => Ok(Value::Null),
+        (Value::Int(n), ColumnType::Int) => Ok(Value::Int(*n)),
+        (Value::Int(n), ColumnType::Varchar) => Ok(Value::Varchar(n.to_string())),
+        (Value::Int(n), ColumnType::Decimal(scale)) => {
+            rescale_decimal(*n, 0, scale, column_name).map(|u| Value::Decimal(u, scale))
+        }
+        (Value::Int(_), ColumnType::Date) => Err(Error::Execution(format!(
+            "Incorrect date value for column '{column_name}': cannot convert an INT to DATE"
+        ))),
+        (Value::Varchar(s), ColumnType::Varchar) => Ok(Value::Varchar(s.clone())),
+        (Value::Varchar(s), ColumnType::Int) => s.parse::<i64>().map(Value::Int).map_err(|_| {
+            Error::Execution(format!(
+                "Incorrect integer value: '{s}' for column '{column_name}'"
+            ))
+        }),
+        (Value::Varchar(s), ColumnType::Decimal(scale)) => {
+            let (unscaled, lit_scale) = parse_decimal_literal(s, column_name)?;
+            rescale_decimal(unscaled, lit_scale, scale, column_name)
+                .map(|u| Value::Decimal(u, scale))
+        }
+        (Value::Varchar(s), ColumnType::Date) => {
+            parse_date_literal(s, column_name).map(Value::Date)
+        }
+        (Value::Decimal(unscaled, scale), ColumnType::Decimal(new_scale)) => {
+            rescale_decimal(*unscaled, *scale, new_scale, column_name)
+                .map(|u| Value::Decimal(u, new_scale))
+        }
+        (Value::Decimal(unscaled, scale), ColumnType::Int) => {
+            rescale_decimal(*unscaled, *scale, 0, column_name).map(Value::Int)
+        }
+        (Value::Decimal(unscaled, scale), ColumnType::Varchar) => {
+            Ok(Value::Varchar(format_decimal(*unscaled, *scale)))
+        }
+        (Value::Decimal(..), ColumnType::Date) => Err(Error::Execution(format!(
+            "Incorrect date value for column '{column_name}': cannot convert a DECIMAL to DATE"
+        ))),
+        (Value::Date(s), ColumnType::Date) => Ok(Value::Date(s.clone())),
+        (Value::Date(s), ColumnType::Varchar) => Ok(Value::Varchar(s.clone())),
+        (Value::Date(_), ColumnType::Int) => Err(Error::Execution(format!(
+            "Incorrect integer value for column '{column_name}': cannot convert a DATE to INT"
+        ))),
+        (Value::Date(_), ColumnType::Decimal(_)) => Err(Error::Execution(format!(
+            "Incorrect decimal value for column '{column_name}': cannot convert a DATE to DECIMAL"
+        ))),
+    }
+}
+
 fn apply_entry(tables: &mut HashMap<String, Table>, databases: &mut HashSet<String>, entry: Entry) {
     match entry {
         Entry::CreateTable {
@@ -140,6 +382,25 @@ fn apply_entry(tables: &mut HashMap<String, Table>, databases: &mut HashSet<Stri
         }
         Entry::DropDatabase { name } => {
             databases.remove(&name);
+        }
+        Entry::AlterTable { table, change } => {
+            if let Some(t) = tables.get_mut(&table) {
+                // Trust, but don't panic if it no longer validates: the
+                // same benign race `create_table`/`create_database` already
+                // document (log-before-memory means a "loser" can get
+                // durably logged even though it never actually won live) can
+                // durably log an `AlterTable` record whose change never
+                // actually applied at the time -- it lost the write-lock
+                // re-check. Replaying it here would then fail the exact
+                // same validation it failed live (e.g. two concurrent `ADD
+                // COLUMN x` on the same table), which is the *correct*
+                // outcome: skip it, exactly reproducing what genuinely
+                // happened, rather than panicking over a record that was
+                // never a real change to begin with.
+                if let Ok(altered) = compute_altered_table(t, &change) {
+                    *t = altered;
+                }
+            }
         }
     }
 }
@@ -435,6 +696,39 @@ impl Storage for InMemoryStorage {
                 return Err(Error::Execution(format!("Table '{name}' already exists")));
             }
             tables.insert(name.to_string(), Table::new(columns, primary_key));
+            Ok(())
+        })
+    }
+
+    fn alter_table<'a>(&'a self, name: &'a str, change: SchemaChange) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // Same log-before-memory, check/release/log/reacquire/re-check
+            // shape as `create_table` above. The same benign race it
+            // accepts applies here too: two concurrent `ALTER TABLE`s on the
+            // same table can both pass the first check and both durably log
+            // a record; the loser's re-validation after reacquiring the
+            // write lock sees the table already in its new state and fails
+            // there instead of silently discarding one of the two changes.
+            {
+                let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
+                let t = tables
+                    .get(name)
+                    .ok_or_else(|| Error::Execution(format!("Table '{name}' doesn't exist")))?;
+                compute_altered_table(t, &change)?;
+            }
+
+            #[cfg(test)]
+            self.check_fault_injection()?;
+            if let Some(writer) = &self.log_writer {
+                writer.append_alter_table(name, &change).await?;
+            }
+
+            let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
+            let t = tables
+                .get(name)
+                .ok_or_else(|| Error::Execution(format!("Table '{name}' doesn't exist")))?;
+            let altered = compute_altered_table(t, &change)?;
+            tables.insert(name.to_string(), altered);
             Ok(())
         })
     }
@@ -1361,6 +1655,66 @@ mod tests {
 
         let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
         assert_eq!(reopened.databases().unwrap(), vec!["shop".to_string()]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn alter_table_changes_survive_reopening() {
+        let path = temp_path("persist-alter-table");
+        std::fs::remove_file(&path).ok();
+
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+            storage
+                .create_table("t", vec![col("a", ColumnType::Int)], None)
+                .await
+                .unwrap();
+            storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
+            storage
+                .alter_table(
+                    "t",
+                    SchemaChange::AddColumn {
+                        column: col("b", ColumnType::Varchar),
+                        is_primary_key: false,
+                    },
+                )
+                .await
+                .unwrap();
+            storage
+                .insert_row("t", vec![Value::Int(2), Value::Varchar("x".to_string())])
+                .await
+                .unwrap();
+            storage
+                .alter_table("t", SchemaChange::AddPrimaryKey("a".to_string()))
+                .await
+                .unwrap();
+        }
+
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+        let schema = reopened.table_schema("t").unwrap();
+        assert_eq!(schema.primary_key.as_deref(), Some("a"));
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            reopened.scan("t").unwrap(),
+            vec![
+                vec![Value::Int(1), Value::Null],
+                vec![Value::Int(2), Value::Varchar("x".to_string())],
+            ]
+        );
+        // The primary key added via ALTER TABLE is still enforced after a
+        // restart, not just live in the session that added it.
+        assert!(reopened
+            .insert_row("t", vec![Value::Int(1), Value::Null])
+            .await
+            .is_err());
 
         std::fs::remove_file(&path).ok();
     }
