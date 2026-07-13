@@ -114,7 +114,7 @@ impl Storage for Transaction {
         self.storage.tables()
     }
 
-    fn table_schema(&self, name: &str) -> Result<TableSchema> {
+    fn table_schema(&self, name: &str) -> Result<Arc<TableSchema>> {
         self.storage.table_schema(name)
     }
 

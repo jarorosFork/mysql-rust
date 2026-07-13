@@ -20,14 +20,18 @@ use crate::{Error, Result};
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Table {
-    columns: Vec<ColumnSchema>,
-    primary_key: Option<String>,
-    /// Position of the primary-key column within `columns`, cached for
-    /// O(1) access on every insert/lookup.
+    /// Shared, not cloned, on every `table_schema()` call
+    /// (PERFORMANCE_DURABILITY_PLAN.md P6) — a statement (and every `JOIN`
+    /// side, twice-plus) reads this at least once, and a deep clone of
+    /// every column's name `String` on each read is a real per-query
+    /// allocation storm on a wide table.
+    schema: Arc<TableSchema>,
+    /// Position of the primary-key column within `schema.columns`, cached
+    /// for O(1) access on every insert/lookup.
     primary_key_index: Option<usize>,
     rows: Vec<Vec<Value>>,
-    /// Primary-key value -> row index. Empty (and unused) if `primary_key`
-    /// is `None`.
+    /// Primary-key value -> row index. Empty (and unused) if
+    /// `schema.primary_key` is `None`.
     index: HashMap<Value, usize>,
     /// `(column index, next value)` for this table's `AUTO_INCREMENT`
     /// column, if it has one. Bumped by every inserted row (live or
@@ -47,8 +51,10 @@ impl Table {
             .position(|c| c.auto_increment)
             .map(|idx| (idx, 1i64));
         Table {
-            columns,
-            primary_key,
+            schema: Arc::new(TableSchema {
+                columns,
+                primary_key,
+            }),
             primary_key_index,
             rows: Vec::new(),
             index: HashMap::new(),
@@ -325,14 +331,11 @@ impl Storage for InMemoryStorage {
         Ok(tables.keys().cloned().collect())
     }
 
-    fn table_schema(&self, name: &str) -> Result<TableSchema> {
+    fn table_schema(&self, name: &str) -> Result<Arc<TableSchema>> {
         let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
         tables
             .get(name)
-            .map(|t| TableSchema {
-                columns: t.columns.clone(),
-                primary_key: t.primary_key.clone(),
-            })
+            .map(|t| Arc::clone(&t.schema))
             .ok_or_else(|| Error::Execution(format!("Table '{name}' doesn't exist")))
     }
 
@@ -355,10 +358,10 @@ impl Storage for InMemoryStorage {
                 let t = tables
                     .get(table)
                     .ok_or_else(|| Error::Execution(format!("Table '{table}' doesn't exist")))?;
-                if row.len() != t.columns.len() {
+                if row.len() != t.schema.columns.len() {
                     return Err(Error::Execution(format!(
                         "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
-                        t.columns.len(),
+                        t.schema.columns.len(),
                         row.len()
                     )));
                 }
@@ -403,10 +406,10 @@ impl Storage for InMemoryStorage {
                     let t = tables.get(table.as_str()).ok_or_else(|| {
                         Error::Execution(format!("Table '{table}' doesn't exist"))
                     })?;
-                    if row.len() != t.columns.len() {
+                    if row.len() != t.schema.columns.len() {
                         return Err(Error::Execution(format!(
                             "Column count doesn't match value count: table '{table}' has {} column(s), got {}",
-                            t.columns.len(),
+                            t.schema.columns.len(),
                             row.len()
                         )));
                     }
@@ -541,6 +544,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage.tables().unwrap(), vec!["t".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn table_schema_hands_out_shared_clones_not_deep_copies() {
+        // PERFORMANCE_DURABILITY_PLAN.md P6: two calls must return the same
+        // underlying allocation (an `Arc` refcount bump), not two
+        // independently-heap-allocated `TableSchema`s -- `Arc::ptr_eq`
+        // proves that directly, rather than just checking the *contents*
+        // match (which a deep clone would also satisfy).
+        let storage = InMemoryStorage::new();
+        storage
+            .create_table("t", vec![col("a", ColumnType::Int)], None)
+            .await
+            .unwrap();
+
+        let first = storage.table_schema("t").unwrap();
+        let second = storage.table_schema("t").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "table_schema() must return clones of the same Arc, not separately \
+             allocated copies"
+        );
+        assert_eq!(
+            Arc::strong_count(&first),
+            3,
+            "storage's own + first + second"
+        );
     }
 
     #[tokio::test]

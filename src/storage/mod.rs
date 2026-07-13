@@ -15,6 +15,7 @@ pub use value::{format_decimal, ColumnSchema, ColumnType, TableSchema, Value};
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::Result;
 
@@ -46,8 +47,13 @@ pub trait Storage: Send + Sync {
     /// Return the names of all tables.
     fn tables(&self) -> Result<Vec<String>>;
 
-    /// Return `name`'s full schema.
-    fn table_schema(&self, name: &str) -> Result<TableSchema>;
+    /// Return `name`'s full schema, shared rather than cloned
+    /// (PERFORMANCE_DURABILITY_PLAN.md P6): called at least once per
+    /// statement and twice-plus per `JOIN`, so a deep clone of every
+    /// column's name `String` on every call is a real per-query allocation
+    /// storm on a wide table. `InMemoryStorage` keeps one `Arc<TableSchema>`
+    /// per table and hands out clones of the `Arc` (a refcount bump).
+    fn table_schema(&self, name: &str) -> Result<Arc<TableSchema>>;
 
     /// Append a row. `row` must have exactly as many values as the table
     /// has columns, in column order, and already be type-checked.
