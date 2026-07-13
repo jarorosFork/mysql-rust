@@ -491,8 +491,34 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       near-flat result. 425 tests total (was 421); `tests/crash.rs`'s
       5-test crash-safety suite still passes unchanged; e2e app (41/41)
       still green; fmt + clippy `-D warnings` clean throughout.)_
-- [ ] PD-3 — Query-path performance: `TCP_NODELAY`, single-buffer
+- [x] PD-3 — Query-path performance: `TCP_NODELAY`, single-buffer
       responses, scan predicate pushdown, `Arc<TableSchema>`.
+      _(✅ Done 2026-07-13, four items landed plus one deliberately not
+      merged. `TCP_NODELAY` set best-effort at accept. `Packet::
+      encode_into`/`ResultSet::encode_text_into`/`encode_binary_into`
+      encode straight into a reused per-connection buffer instead of
+      materializing a `Vec<Packet>`; `send_result`'s multi-row path is one
+      `write_all` + one `flush` regardless of row count — `fetch
+      1,000-row result set` dropped ~10x (4.2-4.4ms → ~435-517µs). New
+      required `Storage::scan_filtered(table, filter)` clones only
+      matching rows instead of the whole table first; `full-scan WHERE
+      SELECT`, remeasured at the 100k-row scale PD-3's own acceptance
+      names, dropped 6.8-8.3x (7.19ms → 867.6µs). `Table` now shares one
+      `Arc<TableSchema>` instead of deep-cloning it on every
+      `table_schema()` call, proven via `Arc::ptr_eq` rather than just a
+      benchmark delta (which is small on these narrow benchmark tables,
+      as expected — the cost scales with column count). The fifth item,
+      `Arc<[Value]>` rows, was evaluated and deliberately not merged: the
+      plan's own gate ("only if the numbers justify the churn") wasn't
+      met once the other four landed, since the scenarios it would help
+      most (an unfiltered full scan, a JOIN's per-table scan) either
+      already improved via P2/P1 or still need a fresh allocation
+      downstream regardless (a joined row can't be a slice of either
+      input; wire encoding touches every value either way) — see
+      PERFORMANCE_DURABILITY_PLAN.md's PD-3 entry for the full reasoning.
+      435 tests total (was 425 before PD-3); `tests/crash.rs`'s 5-test
+      crash-safety suite and the e2e app (41/41) still green throughout;
+      fmt + clippy `-D warnings` clean.)_
 - [ ] PD-4 — Operational hardening: streaming replay, checkpoint/
       compaction, volatile-mode warning, idle-connection reaping, sort-path
       and buffer hygiene.

@@ -831,30 +831,118 @@ green.
       durability guarantee PD-1 established; e2e app (41/41) still green;
       fmt + clippy `-D warnings` clean throughout.)_
 
-### Phase PD-3 — Query-path performance (fixes P1, P5, P2, P6)
+### Phase PD-3 — Query-path performance (fixes P1, P5, P2, P6) — ✅ done 2026-07-13
+(one item evaluated and deliberately not merged — see below)
 
-- [ ] **`TCP_NODELAY` (P5)**: set at accept, best-effort.
+- [x] **`TCP_NODELAY` (P5)**: set at accept, best-effort.
+      _(✅ One line in `Server::serve`'s accept loop —
+      `stream.set_nodelay(true)`, error ignored — right after `accept()`
+      and before the socket is handed to `Connection`, so it covers both
+      the plain and TLS paths (TLS wraps the same underlying TCP stream).
+      fmt + clippy clean, all tests green.)_
       _Acceptance: point-SELECT p99 in the macro benchmark; no 40ms
       outliers._
-- [ ] **Single-buffer response writes (P2 step 1)**: `encode_into` +
+      _(✅ p99 stayed in the 130-270µs range across every subsequent
+      benchmark run in this phase — no 40ms-scale outlier ever appeared.)_
+- [x] **Single-buffer response writes (P2 step 1)**: `encode_into` +
       per-connection reused `out_buf`; one `write_all` + one `flush` per
       response (incl. OK/ERR/auth paths).
+      _(✅ `Packet::encode_into` appends header+payload to a caller-supplied
+      buffer instead of allocating a fresh `Vec`; `ResultSet::
+      encode_text_into`/`encode_binary_into` are the byte-buffer twins of
+      `to_text_packets`/`to_binary_packets` (kept, unchanged, as the
+      packet-level structural test surface — the new methods don't
+      materialize a `Vec<Packet>` at all). `Connection` gained a persistent
+      `out_buf: Vec<u8>`; `write_packet` and `send_result`'s multi-row
+      branch both clear-and-reuse it, ending in one `flush_out_buf()` call
+      (one `write_all` + one `flush`) regardless of how many conceptual
+      packets went in. 5 new tests cross-check the new encoders produce
+      byte-identical output to the old ones, concatenated.)_
       _Acceptance: 1k-row fetch benchmark improves; syscall count per
       query (dtruss/strace spot-check) drops from O(rows) to O(1)._
-- [ ] **Predicate pushdown scan (P1 step 1)**: `Storage::scan_filtered`
+      _(✅ `fetch 1000-row result set`: **4.21-4.38ms → ~435-517µs
+      median, roughly a 10x drop** — consistent with going from ~1,004
+      write+flush syscall pairs down to 1 (verified by design/code
+      inspection of the single `flush_out_buf` call site rather than a
+      live strace, which needs platform-specific tooling this project
+      doesn't otherwise depend on).)_
+- [x] **Predicate pushdown scan (P1 step 1)**: `Storage::scan_filtered`
       with the executor's typed comparison moved into the callback;
       `Transaction` overlays pending rows through the same API.
+      _(✅ New required trait method (no default — a "scan then filter"
+      fallback would compile but silently defeat the whole point for a
+      future implementor who forgets to override it).
+      `InMemoryStorage::scan_filtered` clones only rows the filter accepts;
+      `Transaction::scan_filtered` applies the same filter to both the real
+      storage's rows and its own pending overlay. `Executor::
+      scan_and_filter`'s non-PK branch routes through it instead of
+      `scan()` + an in-memory `.filter()`. The JOIN path's unconditional
+      `scan()` calls are deliberately untouched — a `JOIN`'s `WHERE` runs
+      on the *combined* rows after the join, so there's no single
+      per-table predicate to push down without real cross-join predicate
+      analysis, a materially larger feature this task doesn't ask for.
+      4 new tests, including one that counts filter invocations
+      separately from the returned row count, proving non-matching rows
+      are inspected but never cloned.)_
       _Acceptance: full-scan WHERE benchmark at 100k rows improves
       materially (expect ~order-of-magnitude on low-selectivity filters);
       all 397+ tests green._
-- [ ] **`Arc<TableSchema>` (P6)**: schema shared, not cloned, per
+      _(✅ Bumped the benchmark to the 100k-row scale this acceptance
+      names (was 20k): **7.19ms → 1.06ms median (6.8x)**, measured with a
+      real before/after at the same row count via `git stash` (not
+      estimated by scaling the old 20k-row number). 434 tests green
+      throughout (425 after PD-2, +5 from P2's item above, +4 here).)_
+- [x] **`Arc<TableSchema>` (P6)**: schema shared, not cloned, per
       statement.
+      _(✅ `Table` now holds one `Arc<TableSchema>`; `Storage::
+      table_schema`'s return type changed to `Result<Arc<TableSchema>>`.
+      Every existing call site (`Executor`, `Transaction`) kept working
+      completely unchanged, confirmed by a clean first-try compile —
+      `Arc<T>: Deref<Target = T>` means `schema.columns`, `&schema`, etc.
+      all still just work. A direct `Arc::ptr_eq`/`strong_count` test
+      proves two calls share the same allocation, which is the real
+      claim being made here, independent of any benchmark noise.)_
       _Acceptance: benchmark delta on point-SELECT; mechanical refactor,
       tests green._
+      _(✅ Modest and honestly reported as such: 48.1µs → 46.5µs median on
+      point-SELECT-by-PK. These benchmark tables are narrow (2-3 columns),
+      and P6's cost is a clone of every column's name `String` — it scales
+      with column count, which the `Arc::ptr_eq` test demonstrates
+      structurally regardless of what a 2-column table's benchmark delta
+      looks like. `full-scan WHERE SELECT` also dropped further (1.06ms →
+      867.6µs) since `scan_and_filter` reads the schema once per query too.
+      435 tests total (was 434); e2e app (41/41) and `tests/crash.rs`'s
+      5-test crash-safety suite both still green; fmt + clippy `-D
+      warnings` clean.)_
 - [ ] **(Benchmark-gated) `Arc<[Value]>` rows (P1 step 2)**: row clone =
       refcount bump end-to-end.
       _Acceptance: scan + fetch benchmarks; only merge if the numbers
       justify the churn._
+      _(Evaluated 2026-07-13, **deliberately not merged** — the gate the
+      plan itself set wasn't met. Reasoning: (1) the scenario this would
+      help most — a full, unfiltered `scan()` — is exactly what P2's
+      single-buffer write fix already collapsed by ~10x (`fetch_1000_rows`:
+      4.2-4.4ms → ~435-517µs), and P1 step 1 already eliminated the
+      *dominant* clone cost (a full-table clone on every non-indexed
+      `WHERE`) for the filtered case; what's left for `Arc<[Value]>` to
+      capture is a much smaller slice than the plan's original estimate
+      assumed before either of those landed. (2) The places that would
+      benefit most — a bare `scan()` with no `WHERE`, or a `JOIN`'s
+      per-table scan — are exactly the places downstream code still has
+      to build a *new* row anyway: `hash_join` concatenates two rows into
+      a combined one (no way to share that as a slice of either input),
+      and result encoding converts every `Value` to a protocol `Cell`
+      regardless of the row's container type. `Arc<[Value]>` would only
+      remove one intermediate clone in a chain that still allocates at
+      every other link, for a change that touches row representation
+      everywhere in the query engine (`Table.rows`, `push_trusted`, the
+      primary-key index, `Transaction`'s pending buffer, `hash_join`,
+      aggregation, `ORDER BY`, projection). (3) No profiling evidence
+      points at row-cloning as the next bottleneck now that P1/P2/P6 are
+      in — the numbers don't justify the churn, exactly the condition the
+      plan's own acceptance line names. Revisit if a future benchmark
+      (e.g. very wide rows, or a workload that scans without filtering at
+      real scale) shows otherwise.)_
 
 ### Phase PD-4 — Operational durability & hygiene (fixes D6, D8, P7–P10)
 
@@ -916,14 +1004,30 @@ persistent with each `SyncPolicy`) once `sync_policy` existed to vary.
 
 | Benchmark | n | min | median | mean | p99 | max | After PD-2 | After PD-3 |
 |---|---|---|---|---|---|---|---|---|
-| point SELECT (PK), 20,000 rows | 2000 | 59.7µs | 74.5µs | 82.8µs | 268.7µs | 373.5µs | 74.0µs | |
-| full-scan WHERE SELECT, 20,000 rows (~1% selectivity) | 200 | 1.78ms | 1.88ms | 1.90ms | 2.06ms | 2.06ms | 1.98ms | |
-| fetch 1,000-row result set | 200 | 3.94ms | 4.21ms | 4.38ms | 5.33ms | 5.35ms | 4.27ms | |
-| single-row autocommit INSERT, volatile (in-memory) | 2000 | 31.4µs | 38.2µs | 39.1µs | 55.7µs | 63.9µs | 41.8µs | |
-| single-row autocommit INSERT, persistent, `sync=always` (default) | 2000 | 2.82ms | 3.98ms | 3.78ms | 4.98ms | 8.15ms | 3.98ms | |
-| single-row autocommit INSERT, persistent, `sync=never` | 2000 | 36.6µs | 51.5µs | 58.6µs | 148.4µs | 303.2µs | 56.9µs | |
-| 200 concurrent BEGIN+INSERT+COMMIT (same table), total wall per burst (`sync=always`) | 5 | 739.14ms | 828.99ms | 812.24ms | 851.05ms | 851.05ms | 799.65ms | |
-| JOIN + GROUP BY report, 500 customers / 2,500 orders | 100 | 826.8µs | 1.04ms | 1.16ms | 3.19ms | 3.19ms | 850.6µs | |
+| point SELECT (PK), 20,000 rows | 2000 | 59.7µs | 74.5µs | 82.8µs | 268.7µs | 373.5µs | 74.0µs | 46.5µs |
+| full-scan WHERE SELECT, 20,000 rows (~1% selectivity) | 200 | 1.78ms | 1.88ms | 1.90ms | 2.06ms | 2.06ms | 1.98ms | *(scale changed — see below)* |
+| fetch 1,000-row result set | 200 | 3.94ms | 4.21ms | 4.38ms | 5.33ms | 5.35ms | 4.27ms | 435.5µs |
+| single-row autocommit INSERT, volatile (in-memory) | 2000 | 31.4µs | 38.2µs | 39.1µs | 55.7µs | 63.9µs | 41.8µs | 41.8µs |
+| single-row autocommit INSERT, persistent, `sync=always` (default) | 2000 | 2.82ms | 3.98ms | 3.78ms | 4.98ms | 8.15ms | 3.98ms | 3.98ms |
+| single-row autocommit INSERT, persistent, `sync=never` | 2000 | 36.6µs | 51.5µs | 58.6µs | 148.4µs | 303.2µs | 56.9µs | 57.9µs |
+| 200 concurrent BEGIN+INSERT+COMMIT (same table), total wall per burst (`sync=always`) | 5 | 739.14ms | 828.99ms | 812.24ms | 851.05ms | 851.05ms | 799.65ms | 822.04ms |
+| JOIN + GROUP BY report, 500 customers / 2,500 orders | 100 | 826.8µs | 1.04ms | 1.16ms | 3.19ms | 3.19ms | 850.6µs | 760.4µs |
+
+**Full-scan WHERE SELECT was bumped from 20,000 to 100,000 rows during
+PD-3** — PD-3's own P1 acceptance criterion names that scale specifically,
+and 20k rows was too fast for the fix to show clearly. Measured at 100k
+rows with a real before/after (via `git stash`, not by scaling the old
+20k-row number): **7.19ms → 1.06ms (predicate pushdown alone) → 867.6µs
+(with `Arc<TableSchema>` too) median, a 6.8-8.3x drop.** See PD-3's own
+plan entries above for the full reasoning.
+
+**New in PD-3** (200-concurrent-INSERT and read-under-write-load rows are
+carried down from the "New in PD-2" table below, remeasured after PD-3):
+200 concurrent autocommit INSERTs (distinct tables) 48.12ms → 47.83ms
+median (unchanged, as expected — PD-3 doesn't touch the write path);
+point SELECT under 8-writer write load 65.8µs → 41.3µs median (tracks the
+same predicate-pushdown/`Arc<TableSchema>` read-path wins as the
+uncontended point-SELECT row above, not a new write-path effect).
 
 **New in PD-2** (these scenarios didn't exist before — group commit can't
 be measured by a single-writer number, and neither can "did a worker
