@@ -46,6 +46,15 @@ struct PreparedStatement {
 /// Read chunk size for filling the packet buffer from the socket.
 const READ_CHUNK: usize = 4096;
 
+/// A `read_buf` allocation above this many bytes, once it goes back to
+/// empty, is shrunk back down (PERFORMANCE_DURABILITY_PLAN.md P8) — without
+/// this, one packet anywhere up to `max_allowed_packet` (default 64 MiB)
+/// pins that whole allocation for the rest of the connection's life, even
+/// after the client goes back to small, ordinary queries. 1 MiB is well
+/// above any packet size ordinary traffic (queries, small-to-medium
+/// `INSERT`s) produces, so normal use never pays a shrink-then-regrow cycle.
+const READ_BUF_SHRINK_THRESHOLD: usize = 1024 * 1024;
+
 /// Represents a single connected client for its whole lifetime.
 pub struct Connection {
     stream: ConnStream,
@@ -761,6 +770,7 @@ impl Connection {
 
             if let Some((packet, consumed)) = Packet::parse(&self.read_buf)? {
                 self.read_buf.drain(..consumed);
+                shrink_read_buf_if_idle_and_oversized(&mut self.read_buf);
                 return Ok(packet);
             }
             let n = self.stream.read(&mut chunk).await?;
@@ -771,6 +781,29 @@ impl Connection {
             }
             self.read_buf.extend_from_slice(&chunk[..n]);
         }
+    }
+}
+
+/// Shrinks `buf`'s allocation back down to `READ_CHUNK` once it's both
+/// empty (no pipelined remainder to preserve) and above
+/// `READ_BUF_SHRINK_THRESHOLD` — see that constant's doc comment
+/// (PERFORMANCE_DURABILITY_PLAN.md P8). A free function over a `&mut
+/// Vec<u8>`, not a `Connection` method, so this — the actual policy this
+/// task is about — is unit-testable directly, without a real socket or
+/// `Connection`.
+///
+/// Deliberately *not* pursuing the plan's other suggested P8 change (a read
+/// cursor + periodic compaction instead of per-packet `drain`): `drain`'s
+/// cost is proportional to whatever's left in `buf` *after* the consumed
+/// packet, which is zero in the overwhelmingly common case (one packet per
+/// `read()`, no pipelining) — the finding itself calls this "fine at
+/// current scale," and no benchmark in this suite shows it as a real
+/// bottleneck (unlike P1's full-scan clone cost, which was). Restructuring
+/// the whole read-buffering scheme for an unmeasured cost would be
+/// unexercised complexity for its own sake.
+fn shrink_read_buf_if_idle_and_oversized(buf: &mut Vec<u8>) {
+    if buf.is_empty() && buf.capacity() > READ_BUF_SHRINK_THRESHOLD {
+        buf.shrink_to(READ_CHUNK);
     }
 }
 
@@ -838,4 +871,56 @@ fn eof_packet(sequence_id: u8) -> Packet {
     payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
     payload.extend_from_slice(&0x0002u16.to_le_bytes()); // SERVER_STATUS_AUTOCOMMIT
     Packet::new(sequence_id, payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrinks_an_empty_oversized_buffer_back_down() {
+        let mut buf = Vec::new();
+        buf.reserve_exact(READ_BUF_SHRINK_THRESHOLD + 1);
+        assert!(buf.capacity() > READ_BUF_SHRINK_THRESHOLD);
+
+        shrink_read_buf_if_idle_and_oversized(&mut buf);
+
+        assert!(
+            buf.capacity() <= READ_BUF_SHRINK_THRESHOLD,
+            "an empty, oversized buffer should have been shrunk, capacity is {}",
+            buf.capacity()
+        );
+    }
+
+    #[test]
+    fn leaves_a_non_empty_buffer_alone_even_if_oversized() {
+        // A pipelined remainder must survive -- shrinking is about reclaiming
+        // idle memory, never about discarding buffered bytes.
+        let mut buf = Vec::new();
+        buf.reserve_exact(READ_BUF_SHRINK_THRESHOLD + 1);
+        buf.push(1);
+        let capacity_before = buf.capacity();
+
+        shrink_read_buf_if_idle_and_oversized(&mut buf);
+
+        assert_eq!(buf, vec![1], "buffered bytes must not be discarded");
+        assert_eq!(
+            buf.capacity(),
+            capacity_before,
+            "a non-empty buffer should not be shrunk"
+        );
+    }
+
+    #[test]
+    fn leaves_a_small_empty_buffer_alone() {
+        // Below the threshold: shrinking here would just cause a pointless
+        // shrink-then-immediately-regrow cycle on completely ordinary traffic.
+        let mut buf = Vec::new();
+        buf.reserve_exact(READ_CHUNK);
+        let capacity_before = buf.capacity();
+
+        shrink_read_buf_if_idle_and_oversized(&mut buf);
+
+        assert_eq!(buf.capacity(), capacity_before);
+    }
 }

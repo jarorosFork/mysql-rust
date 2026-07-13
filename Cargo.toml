@@ -53,3 +53,17 @@ path = "e2e/main.rs"
 name = "mysql_bench"
 path = "benches/mysql_bench.rs"
 harness = false
+
+# PERFORMANCE_DURABILITY_PLAN.md P10: the two standard, well-known free wins
+# for a long-running server binary (as opposed to a CLI tool run once and
+# exited, where slower-but-cheaper compilation matters more than runtime
+# speed). `lto = "thin"` optimizes across crate boundaries (this binary's
+# own code against tokio/tokio-rustls) at a fraction of "fat" LTO's build
+# time; `codegen-units = 1` gives the optimizer the whole crate as one unit
+# instead of splitting it for parallel compilation. Both cost extra build
+# time in exchange for runtime speed -- exactly the right trade for a
+# server that's compiled once and then runs for a long time. Before/after
+# numbers recorded in PERFORMANCE_DURABILITY_PLAN.md's benchmark table.
+[profile.release]
+lto = "thin"
+codegen-units = 1

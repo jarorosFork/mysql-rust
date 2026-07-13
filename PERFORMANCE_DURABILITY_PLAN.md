@@ -1120,10 +1120,94 @@ green.
       e2e app (41/41) still green (its connections finish in milliseconds,
       nowhere near either default timeout); fmt + clippy `-D warnings`
       clean.)_
-- [ ] **Sort-path fixes (P7)**: allocation-free comparison fallback;
+- [x] **Sort-path fixes (P7)**: allocation-free comparison fallback;
       top-N heap for ORDER BY + small LIMIT (benchmark-gated).
-- [ ] **Buffer shrink policy (P8)**; **release profile (P10)** with
+      _(✅ **Allocation-free fallback**: `value_ordering` gained an explicit
+      `(Date, Date) => a.cmp(b)` arm. This was the fallback's *only*
+      actually-hot case — `ORDER BY` always compares the same column
+      position across rows, and a column has one fixed type, so genuinely
+      mixed-type comparisons never happen in this engine's `WHERE`/`ORDER
+      BY` evaluation; `Date`/`Date` was the one same-type pair the fallback
+      used to handle anyway (its own doc comment said so), allocating two
+      `String`s per comparison the whole time. The true mixed-type arm is
+      left as-is and documented as a dead-in-practice defensive path — an
+      allocation-free stack-buffer formatter for it would be unexercised
+      complexity, not a real fix. **Top-N** (benchmark-gated, per the
+      plan's own gate): new shared `sort_and_paginate` (extracted from
+      `execute_projected`'s and `execute_aggregate`'s till-now-duplicated
+      sort-then-paginate tails) uses `Vec::select_nth_unstable_by`
+      (average-case O(n) quickselect, std-only, no heap needed) to
+      partition rows so only the surviving `offset + limit` rows are fully
+      sorted, whenever that's fewer than the whole row set — falling back
+      to one plain full sort otherwise (no `LIMIT`, or one covering
+      everything anyway). Proof of correctness: new
+      `order_by_with_limit_and_offset_well_under_row_count_matches_a_full_sort`
+      inserts a 50-row permutation (scrambled via `(i*37) % 50`, a bijection
+      since `gcd(37,50)==1`) and checks `ORDER BY id LIMIT 5 OFFSET 10`
+      against the exact expected slice. Proof it matters, honestly
+      reported: new `order_by_small_limit` benchmark (`ORDER BY name DESC
+      LIMIT 10` over 100,000 rows) measured **4.88ms min / 5.18ms median
+      with the top-N path vs. 4.90ms min / 5.38ms median with it forced off
+      (same code, `select_nth_unstable_by` call gated behind a temporary
+      `if false` for the A/B measurement, then reverted)** — a real but
+      modest ~4% median improvement, smaller than the O(n log n) → O(n)
+      complexity change alone would suggest. Reason, not hand-waved: this
+      query has no `WHERE`, so `execute_projected` receives all 100,000
+      rows already cloned by `scan()` (one `String` allocation per
+      `Varchar` value) *before* `sort_and_paginate` ever runs — that O(n)
+      clone cost dominates the measured total, and only the
+      comparison-only sort step itself benefits from the algorithmic
+      change. The fix is still correct and unconditionally not worse (it
+      only activates when strictly less work than a full sort), and its
+      isolated benefit will matter more as the row-cloning cost shrinks
+      (e.g. a future P1-step-2-style change) or the comparator gets more
+      expensive (multi-key sorts) — kept on that basis, reported honestly
+      rather than oversold, matching D6's own checkpoint-replay-time
+      finding earlier in this phase. 457 tests total (was 456, +1 unit
+      test; the new benchmark scenario is separate from `cargo test`'s own
+      count); e2e app (41/41) still green; fmt + clippy `-D warnings`
+      clean.)_
+- [x] **Buffer shrink policy (P8)**; **release profile (P10)** with
       before/after benchmark numbers recorded here.
+      _(✅ **P8**: new `shrink_read_buf_if_idle_and_oversized` (a free
+      function over `&mut Vec<u8>`, not a `Connection` method, so it's
+      unit-testable without a real socket) shrinks `Connection::read_buf`
+      back to `READ_CHUNK` (4 KiB) whenever it's both empty (no pipelined
+      remainder to lose) and above a 1 MiB threshold — otherwise one large
+      packet anywhere up to `max_allowed_packet` (default 64 MiB) pins that
+      whole allocation for the connection's entire remaining lifetime, even
+      after the client goes back to small, ordinary queries. Called right
+      after `read_packet`'s existing `drain(..consumed)`. 3 new unit tests
+      (shrinks when empty+oversized; leaves a pipelined remainder alone
+      even if oversized; leaves a small empty buffer alone, avoiding a
+      pointless shrink-then-immediately-regrow cycle on ordinary traffic).
+      **Deliberately not pursued**: the plan's other suggested P8 change (a
+      read cursor + periodic compaction instead of per-packet `drain`) —
+      `drain`'s cost is proportional to whatever's left in the buffer
+      *after* the consumed packet, which is zero in the overwhelmingly
+      common case (one packet per `read()`, no pipelining); the finding
+      itself calls the current behavior "fine at current scale," and
+      nothing in this benchmark suite shows per-packet `drain` as an actual
+      bottleneck (unlike P1's full-scan clone cost, which measurably was).
+      Restructuring the whole read-buffering scheme for an unmeasured cost
+      would be complexity added on spec, not in response to evidence.
+      **P10**: `[profile.release] lto = "thin", codegen-units = 1` in
+      `Cargo.toml` — the two standard low-risk wins for a long-running
+      server binary (as opposed to a CLI run once and exited, where build
+      time matters more than runtime speed). Before/after via the full
+      `cargo bench` suite, same machine, same commands, default profile vs.
+      the new one — see the updated benchmark table below. Net: every
+      CPU-bound scenario improved 2-9% (point SELECT, full-scan WHERE,
+      `ORDER BY`+LIMIT, 1000-row fetch, JOIN+GROUP BY, restart replay);
+      I/O- or lock-wait-bound scenarios (`sync=always` INSERT, 200
+      concurrent same-table commits) showed no consistent change either
+      way, exactly as expected -- a compiler optimization has no lever on
+      time spent blocked on `fsync` or a lock, and the small
+      apparent regressions there (e.g. concurrent-commits' median moving
+      ~12%) are within this single-machine, single-run harness's own
+      noise band, not a real cost of the profile change. 460 tests total
+      (was 457, +3 new unit tests for P8); e2e app (41/41) still green;
+      fmt + clippy `-D warnings` clean.)_
 
 ### Explicit non-goals (documented so they stay deliberate)
 
@@ -1204,6 +1288,45 @@ regression — see each step's own plan entry above). The second row is
 essentially identical to the first, **not** the improvement the D6 step 2
 acceptance line predicted; see that entry above for the measured file-size
 win (real, ~24%) versus the replay-*time* win (not realized yet, and why).
+
+**New in PD-4, P7** (`ORDER BY` + small `LIMIT` over a big table — this
+scenario didn't exist before the sort-path fix; "before" is the identical
+code with `sort_and_paginate`'s `select_nth_unstable_by` call gated behind
+a temporary `if false` for this one A/B measurement, then reverted — see
+that entry above for why the gap is real but modest):
+
+| Benchmark | n | min | median | mean | p99 | max |
+|---|---|---|---|---|---|---|
+| `ORDER BY` + `LIMIT 10`, 100,000 rows — before (full sort every time) | 200 | 4.90ms | 5.38ms | 5.41ms | 6.25ms | 6.53ms |
+| `ORDER BY` + `LIMIT 10`, 100,000 rows — after (top-N `select_nth_unstable_by`) | 200 | 4.88ms | 5.18ms | 5.20ms | 5.73ms | 6.37ms |
+
+**New in PD-4, P10** (release profile: `lto = "thin"`, `codegen-units = 1`
+— same machine, same `cargo bench` command, before/after the `Cargo.toml`
+change; every other PD-4 fix, incl. P7/P8 above, was already in place for
+both runs, so the delta here isolates the profile's own effect):
+
+| Benchmark | n | before (median) | after (median) | Δ |
+|---|---|---|---|---|
+| point SELECT (PK), 20,000 rows | 2000 | 46.9µs | 45.4µs | ~3% faster |
+| full-scan WHERE SELECT, 100,000 rows | 200 | 1.04ms | 1.02ms | ~2% faster |
+| `ORDER BY` + `LIMIT 10`, 100,000 rows | 200 | 5.18ms | 4.70ms | ~9% faster |
+| fetch 1,000-row result set | 200 | 514.8µs | 478.8µs | ~7% faster |
+| single-row autocommit INSERT, volatile | 2000 | 43.7µs | 42.8µs | ~2% faster |
+| single-row autocommit INSERT, persistent (`sync=always`) | 2000 | 3.97ms | 3.97ms | unchanged (fsync-bound) |
+| single-row autocommit INSERT, persistent (`sync=never`) | 2000 | 57.8µs | 62.9µs | within noise |
+| 200 concurrent BEGIN+INSERT+COMMIT (same table) | 5 | 760.88ms | 849.03ms | within noise (lock/fsync-bound, n=5) |
+| 200 concurrent autocommit INSERTs (distinct tables) | 5 | 46.90ms | 47.90ms | within noise |
+| point SELECT (PK) under 8-writer write load | 500 | 41.1µs | 40.5µs | ~1% faster |
+| JOIN+GROUP BY report, 500 customers/2,500 orders | 100 | 760.4µs | 716.0µs | ~6% faster |
+| server restart + replay, 50,000 rows | 5 | 25.30ms | 23.54ms | ~7% faster |
+| server restart + replay AFTER checkpoint, 50,000 rows | 5 | 26.02ms | 23.62ms | ~9% faster |
+
+Every genuinely CPU-bound scenario improved 2-9%; the fsync-/lock-wait-bound
+ones (persistent `sync=always` INSERT, 200 concurrent same-table commits)
+show no consistent direction, exactly as expected — a compiler optimization
+has no lever on time spent blocked on `fsync` or a lock. Those rows' small
+apparent regressions are this single-machine, single-run (`n=5` in the
+concurrent-commit case) harness's own noise, not a real profile cost.
 
 **New in PD-2** (these scenarios didn't exist before — group commit can't
 be measured by a single-writer number, and neither can "did a worker

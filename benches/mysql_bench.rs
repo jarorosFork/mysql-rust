@@ -43,6 +43,7 @@ async fn run_all() -> Vec<Stats> {
     vec![
         point_select_by_pk().await,
         full_scan_where_select().await,
+        order_by_small_limit().await,
         fetch_1000_rows().await,
         single_row_insert(InsertMode::Volatile).await,
         single_row_insert(InsertMode::PersistentAlways).await,
@@ -118,6 +119,37 @@ async fn full_scan_where_select() -> Stats {
         samples.push(start.elapsed());
     }
     stats(&format!("full-scan WHERE SELECT, {ROWS} rows"), samples)
+}
+
+async fn order_by_small_limit() -> Stats {
+    // PERFORMANCE_DURABILITY_PLAN.md P7's target scenario: `ORDER BY` over a
+    // big table but only a handful of rows are actually requested -- exactly
+    // where `sort_and_paginate`'s `select_nth_unstable_by` top-N path (O(n)
+    // partition + O(k log k) sort of just the survivors) should beat a plain
+    // full O(n log n) sort.
+    const ROWS: usize = 100_000;
+    const LIMIT: usize = 10;
+    const ITERS: usize = 200;
+
+    let addr = start_server(None, SyncPolicy::Never).await;
+    let mut conn = connect(addr).await;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
+        .await
+        .expect("create table");
+    seed_id_name_rows(&mut conn, ROWS).await;
+
+    let mut samples = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let start = Instant::now();
+        let _: Vec<(i64, String)> = conn
+            .query(format!(
+                "SELECT id, name FROM t ORDER BY name DESC LIMIT {LIMIT}"
+            ))
+            .await
+            .expect("order by limit select");
+        samples.push(start.elapsed());
+    }
+    stats(&format!("ORDER BY + LIMIT {LIMIT}, {ROWS} rows"), samples)
 }
 
 async fn fetch_1000_rows() -> Stats {

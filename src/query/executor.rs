@@ -819,7 +819,7 @@ fn apply_where(
 /// left that differs between them.
 fn execute_projected(
     scope: &Scope,
-    mut rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<Value>>,
     projection: &[SelectItem],
     order_by: &[OrderByItem],
     limit: Option<u64>,
@@ -827,36 +827,15 @@ fn execute_projected(
 ) -> Result<QueryResult> {
     let selected_indices = resolve_projection(scope, projection)?;
 
-    // Sort before projecting: ORDER BY may name a column that isn't in the
-    // SELECT list, so this needs the full (pre-projection) row.
-    if !order_by.is_empty() {
-        let sort_keys = order_by
-            .iter()
-            .map(|item| Ok((scope.resolve(&item.column)?, item.descending)))
-            .collect::<Result<Vec<(usize, bool)>>>()?;
-        rows.sort_by(|a, b| {
-            for &(idx, descending) in &sort_keys {
-                let ordering = value_ordering(&a[idx], &b[idx]);
-                let ordering = if descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                };
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            Ordering::Equal
-        });
-    }
-
-    // OFFSET then LIMIT, applied after ordering/filtering — matching real
-    // MySQL's evaluation order.
-    let paged_rows: Vec<Vec<Value>> = rows
-        .into_iter()
-        .skip(offset.unwrap_or(0) as usize)
-        .take(limit.unwrap_or(u64::MAX) as usize)
-        .collect();
+    // ORDER BY may name a column that isn't in the SELECT list, so sorting
+    // (and OFFSET/LIMIT, applied after — matching real MySQL's evaluation
+    // order) needs the full pre-projection row; shared with
+    // `execute_aggregate`'s identical tail via `sort_and_paginate`.
+    let sort_keys = order_by
+        .iter()
+        .map(|item| Ok((scope.resolve(&item.column)?, item.descending)))
+        .collect::<Result<Vec<(usize, bool)>>>()?;
+    let paged_rows = sort_and_paginate(rows, &sort_keys, limit, offset);
 
     let columns = selected_indices
         .iter()
@@ -1003,40 +982,19 @@ fn execute_aggregate(
     // aggregate's own alias (`ORDER BY total DESC`), which may not even
     // exist as a column anywhere. The output has no qualifiers of its own,
     // so only the bare column name is meaningful here.
-    if !order_by.is_empty() {
-        let sort_keys = order_by
-            .iter()
-            .map(|item| {
-                let idx = output_columns
-                    .iter()
-                    .position(|c| c.name == item.column.column)
-                    .ok_or_else(|| {
-                        Error::Execution(format!("Unknown column '{}'", item.column.column))
-                    })?;
-                Ok((idx, item.descending))
-            })
-            .collect::<Result<Vec<(usize, bool)>>>()?;
-        output_rows.sort_by(|a, b| {
-            sort_keys
+    let sort_keys = order_by
+        .iter()
+        .map(|item| {
+            let idx = output_columns
                 .iter()
-                .map(|&(idx, descending)| {
-                    let ord = value_ordering(&a[idx], &b[idx]);
-                    if descending {
-                        ord.reverse()
-                    } else {
-                        ord
-                    }
-                })
-                .find(|ord| *ord != Ordering::Equal)
-                .unwrap_or(Ordering::Equal)
-        });
-    }
-
-    let paged_rows: Vec<Vec<Value>> = output_rows
-        .into_iter()
-        .skip(offset.unwrap_or(0) as usize)
-        .take(limit.unwrap_or(u64::MAX) as usize)
-        .collect();
+                .position(|c| c.name == item.column.column)
+                .ok_or_else(|| {
+                    Error::Execution(format!("Unknown column '{}'", item.column.column))
+                })?;
+            Ok((idx, item.descending))
+        })
+        .collect::<Result<Vec<(usize, bool)>>>()?;
+    let paged_rows = sort_and_paginate(output_rows, &sort_keys, limit, offset);
 
     Ok(QueryResult {
         columns: output_columns,
@@ -1498,6 +1456,57 @@ fn parse_date_literal(s: &str, column_name: &str) -> Result<String> {
     Ok(s.to_string())
 }
 
+/// Order `rows` by `sort_keys` (column index + descending flag, applied in
+/// order until one comparison differs — empty means no `ORDER BY`), then
+/// apply OFFSET/LIMIT. The tail shared by `execute_projected` and
+/// `execute_aggregate` once each has its own fully-materialized row set.
+///
+/// When `sort_keys` is non-empty and `offset + limit` covers only part of
+/// `rows`, partitions with `select_nth_unstable_by` (average-case O(n)
+/// quickselect) instead of a full O(n log n) sort first
+/// (PERFORMANCE_DURABILITY_PLAN.md P7): that leaves the first `offset +
+/// limit` rows holding exactly the rows the page needs (in arbitrary order
+/// among themselves), discards the rest unsorted, and only *then* sorts the
+/// small survivor set. Falls back to one plain full sort when there's no
+/// `LIMIT` (or one covering the whole row set) — `select_nth` would still
+/// cost a full O(n) pass there for nothing, since every row survives anyway.
+fn sort_and_paginate(
+    mut rows: Vec<Vec<Value>>,
+    sort_keys: &[(usize, bool)],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Vec<Vec<Value>> {
+    if !sort_keys.is_empty() {
+        let compare = |a: &Vec<Value>, b: &Vec<Value>| -> Ordering {
+            for &(idx, descending) in sort_keys {
+                let ordering = value_ordering(&a[idx], &b[idx]);
+                let ordering = if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            Ordering::Equal
+        };
+
+        let keep =
+            (offset.unwrap_or(0) as usize).saturating_add(limit.unwrap_or(u64::MAX) as usize);
+        if keep > 0 && keep < rows.len() {
+            rows.select_nth_unstable_by(keep - 1, compare);
+            rows.truncate(keep);
+        }
+        rows.sort_by(compare);
+    }
+
+    rows.into_iter()
+        .skip(offset.unwrap_or(0) as usize)
+        .take(limit.unwrap_or(u64::MAX) as usize)
+        .collect()
+}
+
 /// Order two values for `ORDER BY` sorting. Unlike `compare_values` (a
 /// WHERE-clause filter), this needs a definite answer even when one side is
 /// `NULL` — MySQL sorts `NULL` first, as the least value, in ascending order.
@@ -1508,13 +1517,22 @@ fn value_ordering(a: &Value, b: &Value) -> Ordering {
         (_, Value::Null) => Ordering::Greater,
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
-        // `Date` stores canonical zero-padded "YYYY-MM-DD" text, which the
-        // fallback's string comparison below already orders chronologically
-        // — no dedicated arm needed there. `Decimal` is the opposite: its
+        // `Date` stores canonical zero-padded "YYYY-MM-DD" text, which
+        // already orders chronologically under plain `&str` comparison — no
+        // numeric date logic needed. A dedicated arm (rather than routing
+        // through the mixed-type fallback below, which used to handle this
+        // too) matters for more than tidiness: `ORDER BY` always compares
+        // the *same* column position across rows, so a `DATE` column's
+        // comparisons are always `Date`/`Date`, never genuinely mixed-type
+        // — this was the fallback's single actually-hot path, and the
+        // fallback allocates two `String`s per comparison
+        // (PERFORMANCE_DURABILITY_PLAN.md P7), an O(n log n) allocation
+        // count in a real sort. `Decimal` is the opposite of `Date`: its
         // *text* form ("10.20" vs "9.50") does NOT sort the way the numbers
         // do, so it needs a real numeric comparison, normalizing to a common
         // scale first (within one column `coerce` already guarantees a
         // shared scale, but this stays correct even if that ever isn't true).
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
         (Value::Decimal(a_unscaled, a_scale), Value::Decimal(b_unscaled, b_scale)) => {
             let (a_cmp, b_cmp) = match a_scale.cmp(b_scale) {
                 Ordering::Equal => (*a_unscaled, *b_unscaled),
@@ -1523,9 +1541,17 @@ fn value_ordering(a: &Value, b: &Value) -> Ordering {
             };
             a_cmp.cmp(&b_cmp)
         }
-        // Mixed types (incl. Date/Varchar, or Decimal against anything else):
-        // compare by display text (best-effort; real MySQL has more nuanced
-        // coercion rules than this subset needs).
+        // Genuinely mixed types (e.g. Int/Varchar, Decimal/Date): compare by
+        // display text (best-effort; real MySQL has more nuanced coercion
+        // rules than this subset needs). Left allocation-heavy on purpose —
+        // `ORDER BY`/comparisons always compare the *same* column position
+        // across rows, and a column has one fixed `ColumnType`, so this arm
+        // only fires for a comparison between values from genuinely
+        // different columns, which nothing in this engine's `WHERE`/`ORDER
+        // BY` evaluation ever does. Building an allocation-free stack-buffer
+        // formatter for a path that's dead in every real query would just be
+        // unexercised complexity (PERFORMANCE_DURABILITY_PLAN.md P7 — the
+        // `Date`/`Date` arm above was the fallback's one actually-hot case).
         (a, b) => a
             .to_display_string()
             .unwrap_or_default()
@@ -2931,6 +2957,37 @@ mod tests {
         seed_order_by_table(&storage);
         let result = run(&storage, "SELECT id FROM t ORDER BY id LIMIT 2").expect("select");
         assert_eq!(result.rows, vec![vec![int(1)], vec![int(2)]]);
+    }
+
+    #[test]
+    fn order_by_with_limit_and_offset_well_under_row_count_matches_a_full_sort() {
+        // PERFORMANCE_DURABILITY_PLAN.md P7: `offset + limit` well under the
+        // row count exercises `sort_and_paginate`'s `select_nth_unstable_by`
+        // top-N path, not just a plain full sort -- this must produce
+        // exactly what sorting everything then paging through it would.
+        let storage = InMemoryStorage::new();
+        run(&storage, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+        // Insert in scrambled (not ascending) order -- `(i * 37) % 50` is a
+        // bijection on 0..50 since gcd(37, 50) == 1, so this is a full
+        // permutation of 0..=49 in a scrambled insertion order, meaning a
+        // correct top-N result genuinely depends on comparing against every
+        // row, not just whatever happened to land near the front.
+        for i in 0..50 {
+            let id = (i * 37) % 50;
+            run(&storage, &format!("INSERT INTO t VALUES ({id})")).expect("insert");
+        }
+        let result =
+            run(&storage, "SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10").expect("select");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![int(10)],
+                vec![int(11)],
+                vec![int(12)],
+                vec![int(13)],
+                vec![int(14)],
+            ]
+        );
     }
 
     #[test]

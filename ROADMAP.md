@@ -519,10 +519,10 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       435 tests total (was 425 before PD-3); `tests/crash.rs`'s 5-test
       crash-safety suite and the e2e app (41/41) still green throughout;
       fmt + clippy `-D warnings` clean.)_
-- [ ] PD-4 — Operational hardening: streaming replay, checkpoint/
+- [x] PD-4 — Operational hardening: streaming replay, checkpoint/
       compaction, volatile-mode warning, idle-connection reaping, sort-path
       and buffer hygiene.
-      _(In progress. **Streaming replay** (D6 step 1) done 2026-07-13:
+      _(**Streaming replay** (D6 step 1) done 2026-07-13:
       `Log::open` streams through the file with a `BufReader` instead of
       `std::fs::read`-ing it whole first, one record at a time into its
       own short-lived allocation — startup memory is O(one record), not
@@ -595,9 +595,43 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       frees up for a waiting second connection; a stalled-handshake client
       is disconnected via `connect_timeout`. All 4 run 5x clean, no
       flakes. 456 tests total (was 446); e2e app (41/41) still green; fmt +
-      clippy `-D warnings` clean. Remaining:
-      sort-path/buffer/release-profile hygiene (P7/P8/P10).)_
-- [ ] **Acceptance:** every checkbox in
+      clippy `-D warnings` clean.
+      **Sort-path fixes (P7)**, **buffer shrink (P8)**, **release profile
+      (P10)** done 2026-07-13 — **completes PD-4**. `value_ordering` gained
+      an explicit `Date`/`Date` arm (the fallback's one actually-hot case —
+      a column has one fixed type, so `ORDER BY` never genuinely compares
+      mixed types — now allocation-free instead of cloning two `String`s
+      per comparison). New shared `sort_and_paginate` (de-duplicating
+      `execute_projected`'s/`execute_aggregate`'s identical sort-then-
+      paginate tails) uses `Vec::select_nth_unstable_by` to partition top-N
+      rows in average-case O(n) instead of a full O(n log n) sort whenever
+      `offset + limit` covers only part of the row set. Benchmark-gated per
+      the plan's own requirement: a new `order_by_small_limit` scenario
+      (`ORDER BY ... LIMIT 10` over 100,000 rows) measured a real but
+      modest ~4% median improvement (5.38ms -> 5.18ms) — smaller than the
+      complexity change alone suggests, because this no-`WHERE` query's
+      cost is dominated by `scan()`'s upfront clone of all 100,000 rows,
+      not the sort itself; kept anyway since it's unconditionally not
+      worse and its isolated benefit will matter more once row-cloning
+      cost drops or comparators get pricier. New `shrink_read_buf_if_idle_
+      and_oversized` shrinks `Connection::read_buf` back to 4 KiB once
+      it's both empty and above 1 MiB, so one huge packet (up to
+      `max_allowed_packet`, 64 MiB default) doesn't pin that allocation
+      for the connection's whole remaining life; the plan's other
+      suggested P8 change (read-cursor + periodic compaction instead of
+      per-packet `drain`) was evaluated and deliberately not pursued —
+      `drain`'s cost is proportional to whatever's left *after* the
+      consumed packet, zero in the common no-pipelining case, and the
+      finding itself calls this "fine at current scale." `[profile.
+      release] lto = "thin", codegen-units = 1` added to `Cargo.toml`;
+      full before/after `cargo bench` run shows every CPU-bound scenario
+      2-9% faster, fsync-/lock-bound ones unchanged (as expected — a
+      compiler can't speed up time spent blocked on `fsync` or a lock).
+      460 tests total (was 456); e2e app (41/41) still green throughout;
+      fmt + clippy `-D warnings` clean. See PERFORMANCE_DURABILITY_PLAN.md's
+      P7/P8/P10 entries and updated benchmark table for the full
+      before/after numbers.)_
+- [x] **Acceptance:** every checkbox in
       [PERFORMANCE_DURABILITY_PLAN.md](PERFORMANCE_DURABILITY_PLAN.md) is
       checked, the crash harness passes un-`#[ignore]`d in CI, and the
       benchmark table there records before/after numbers.
