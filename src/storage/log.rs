@@ -456,9 +456,12 @@ fn read_one_record(
 /// Force `path`'s parent directory entry to durable storage
 /// (PERFORMANCE_DURABILITY_PLAN.md D7) — a no-op with no directory handle
 /// to open on platforms without this concept (Windows doesn't need it: an
-/// `NTFS` directory entry update isn't cached the same way).
+/// `NTFS` directory entry update isn't cached the same way). `pub(super)`:
+/// also used directly by `engine::checkpoint` after the atomic rename that
+/// swaps a compacted snapshot into place (D6 step 2), which needs exactly
+/// the same guarantee D7 established for a freshly-created file.
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(super) fn sync_parent_dir(path: &Path) -> Result<()> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
         return Ok(());
     };
@@ -467,7 +470,7 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> Result<()> {
+pub(super) fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -548,6 +551,29 @@ impl Log {
         })
     }
 
+    /// Open `path` for appending only, without replaying any existing
+    /// content — used after a successful checkpoint rewrite
+    /// (PERFORMANCE_DURABILITY_PLAN.md D6 step 2), where the caller already
+    /// knows exactly what the file contains (it just wrote and renamed it
+    /// into place) and a redundant re-replay would be pure waste.
+    pub(super) fn open_for_append(path: &Path, sync_policy: SyncPolicy) -> Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Log {
+            file,
+            sync_policy,
+            #[cfg(test)]
+            sync_calls: 0,
+        })
+    }
+
+    /// The log file's current size in bytes — what
+    /// `engine::checkpoint_if_worthwhile` compares against
+    /// `Config::checkpoint_threshold_bytes` (PERFORMANCE_DURABILITY_PLAN.md
+    /// D6 step 2).
+    pub(super) fn file_len(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
     /// Test-only: how many times [`Self::append`] has actually called
     /// `sync_data()` so far.
     #[cfg(test)]
@@ -601,6 +627,28 @@ impl Log {
     pub fn append_transaction(&mut self, rows: &[(String, Vec<Value>)]) -> Result<()> {
         self.append(&encode_transaction(rows))
     }
+}
+
+/// Write `framed_records` (already-framed `[len][crc][payload]` records,
+/// concatenated — see [`frame_record`]) to a brand-new file at `path`,
+/// durably, before returning (PERFORMANCE_DURABILITY_PLAN.md D6 step 2:
+/// `engine::checkpoint_if_worthwhile` builds `path` as a temp path like
+/// `data.log.new`, then atomically renames it into place). A full `sync_all`
+/// (not `sync_data`) is used unconditionally here, regardless of the
+/// store's configured `SyncPolicy`: a checkpoint's crash-safety is about to
+/// depend entirely on *this* file's content actually being on disk before
+/// the rename that replaces the durable record of everything before it —
+/// that can't be allowed to follow a `SyncPolicy::Never` store's usual
+/// "don't bother" policy.
+pub(super) fn write_snapshot_file(path: &Path, framed_records: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(framed_records)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]

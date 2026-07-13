@@ -262,6 +262,7 @@ fn reopening_a_file_with_a_torn_trailing_record_recovers_without_panicking() {
     let storage = mysql_rust::storage::InMemoryStorage::open_in_dir(
         &dir,
         mysql_rust::config::SyncPolicy::Never,
+        u64::MAX,
     )
     .expect("a torn trailing record should recover, not error or panic");
     assert!(storage.tables().unwrap().is_empty());
@@ -283,9 +284,12 @@ async fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking()
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("data.log");
 
-    let storage =
-        mysql_rust::storage::InMemoryStorage::open(&path, mysql_rust::config::SyncPolicy::Never)
-            .unwrap();
+    let storage = mysql_rust::storage::InMemoryStorage::open(
+        &path,
+        mysql_rust::config::SyncPolicy::Never,
+        u64::MAX,
+    )
+    .unwrap();
     storage
         .create_table(
             "t",
@@ -314,6 +318,7 @@ async fn reopening_a_file_with_mid_file_corruption_errors_instead_of_panicking()
     let result = mysql_rust::storage::InMemoryStorage::open_in_dir(
         &dir,
         mysql_rust::config::SyncPolicy::Never,
+        u64::MAX,
     );
     assert!(
         result.is_err(),

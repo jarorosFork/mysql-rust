@@ -102,6 +102,13 @@ pub struct Config {
     /// How aggressively the on-disk log is forced to durable storage. Only
     /// meaningful when `data_dir` is set. Defaults to [`SyncPolicy::Always`].
     pub sync_policy: SyncPolicy,
+    /// If the on-disk log is at least this many bytes at startup, it's
+    /// rewritten as a compact snapshot before serving connections
+    /// (PERFORMANCE_DURABILITY_PLAN.md D6 step 2). Only meaningful when
+    /// `data_dir` is set. Defaults to 16 MiB; a low value is mainly useful
+    /// for tests that want to reliably trigger a checkpoint without
+    /// writing a large dataset first.
+    pub checkpoint_threshold_bytes: u64,
     /// Largest client packet payload (in bytes) the server will accept. A
     /// packet declaring more than this is rejected before its payload is
     /// buffered, bounding how much memory one client can force the server to
@@ -131,6 +138,7 @@ impl Default for Config {
             users: Vec::new(),
             data_dir: None,
             sync_policy: SyncPolicy::default(),
+            checkpoint_threshold_bytes: 16 * 1024 * 1024,
             max_allowed_packet: 64 * 1024 * 1024,
             log_level: LogLevel::Info,
             tls: None,
@@ -197,6 +205,9 @@ impl Config {
     /// - `MYSQLRUST_DATA_DIR` — directory for the on-disk log (default: in-memory).
     /// - `MYSQLRUST_SYNC_POLICY` — `always` (default) or `never`; see
     ///   [`SyncPolicy`]. Only meaningful when `MYSQLRUST_DATA_DIR` is set.
+    /// - `MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES` — log size (bytes) that
+    ///   triggers a startup checkpoint (default 16 MiB). Only meaningful
+    ///   when `MYSQLRUST_DATA_DIR` is set.
     /// - `MYSQLRUST_USER` — a single account's username; if set, that account
     ///   is created.
     /// - `MYSQLRUST_PASSWORD` — the account's password (unset or empty means a
@@ -240,6 +251,17 @@ impl Config {
             config.sync_policy = SyncPolicy::from_name(&policy).ok_or_else(|| {
                 Error::Config(format!(
                     "MYSQLRUST_SYNC_POLICY '{policy}' is not recognized; use 'always' or 'never'"
+                ))
+            })?;
+        }
+
+        if let Some(threshold) =
+            get("MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES").filter(|t| !t.is_empty())
+        {
+            config.checkpoint_threshold_bytes = threshold.parse().map_err(|e| {
+                Error::Config(format!(
+                    "MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES '{threshold}' is not a valid \
+                     unsigned integer ({e})"
                 ))
             })?;
         }
@@ -394,6 +416,30 @@ mod tests {
     fn unknown_sync_policy_is_a_config_error() {
         let err = Config::from_env_with(env(&[("MYSQLRUST_SYNC_POLICY", "sometimes")]))
             .expect_err("should reject");
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn checkpoint_threshold_defaults_to_16_mib() {
+        let config = Config::from_env_with(env(&[])).expect("parse");
+        assert_eq!(config.checkpoint_threshold_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn checkpoint_threshold_is_parsed() {
+        let config =
+            Config::from_env_with(env(&[("MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES", "4096")]))
+                .expect("parse");
+        assert_eq!(config.checkpoint_threshold_bytes, 4096);
+    }
+
+    #[test]
+    fn non_numeric_checkpoint_threshold_is_a_config_error() {
+        let err = Config::from_env_with(env(&[(
+            "MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES",
+            "not-a-number",
+        )]))
+        .expect_err("should reject");
         assert!(matches!(err, Error::Config(_)));
     }
 }

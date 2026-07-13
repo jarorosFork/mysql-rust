@@ -52,6 +52,7 @@ async fn run_all() -> Vec<Stats> {
         read_latency_under_write_load().await,
         join_group_by_report().await,
         restart_replay_time().await,
+        restart_replay_time_after_checkpoint().await,
     ]
 }
 
@@ -455,6 +456,62 @@ async fn restart_replay_time() -> Stats {
     )
 }
 
+/// PERFORMANCE_DURABILITY_PLAN.md D6 step 2's acceptance: "replay time on a
+/// churned dataset drops accordingly" once compacted. Same scenario as
+/// [`restart_replay_time`] (50,000 rows built up the identical way), but
+/// with one untimed boot at a near-zero checkpoint threshold in between to
+/// force compaction — a real deployment would do this periodically as
+/// routine maintenance; this isolates *its effect on subsequent replay*
+/// rather than timing the checkpoint operation itself.
+async fn restart_replay_time_after_checkpoint() -> Stats {
+    const ROWS: usize = 50_000;
+    const ITERS: usize = 5;
+
+    let dir = temp_data_dir("restart-replay-checkpointed");
+    {
+        let addr = start_server(Some(dir.path()), SyncPolicy::Never).await;
+        let mut conn = connect(addr).await;
+        conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
+            .await
+            .expect("create table");
+        seed_id_name_rows(&mut conn, ROWS).await;
+    }
+
+    {
+        // threshold=1: guaranteed to checkpoint (the log is certainly at
+        // least 1 byte). Not timed — this is the one-time compaction cost,
+        // not the thing being measured here.
+        let addr =
+            start_server_with_checkpoint_threshold(Some(dir.path()), SyncPolicy::Never, 1).await;
+        let mut conn = connect(addr).await;
+        let rows: Vec<(i64,)> = conn
+            .query("SELECT id FROM t")
+            .await
+            .expect("verify data survived the checkpoint");
+        assert_eq!(rows.len(), ROWS);
+    }
+
+    let mut samples = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let start = Instant::now();
+        // Default threshold (16 MiB): the now-compacted log is tiny, so
+        // this never re-triggers a checkpoint -- purely measures replaying
+        // the *compacted* representation.
+        let addr = start_server(Some(dir.path()), SyncPolicy::Never).await;
+        let mut conn = connect(addr).await;
+        let rows: Vec<(i64,)> = conn
+            .query("SELECT id FROM t")
+            .await
+            .expect("query after restart");
+        assert_eq!(rows.len(), ROWS, "replay must have restored every row");
+        samples.push(start.elapsed());
+    }
+    stats(
+        &format!("server restart + replay AFTER checkpoint, {ROWS} rows (compacted)"),
+        samples,
+    )
+}
+
 // ---------------------------------------------------------------------
 // Harness plumbing
 // ---------------------------------------------------------------------
@@ -504,16 +561,41 @@ fn temp_data_dir(name: &str) -> TempDir {
 /// The caller owns and keeps alive whatever `TempDir` backs `data_dir` (see
 /// [`TempDir::path`]) for as long as the server needs it. `sync_policy` is
 /// irrelevant when `data_dir` is `None` (nothing is ever written to disk).
+/// Uses `Config::default`'s checkpoint threshold (16 MiB) — see
+/// [`start_server_with_checkpoint_threshold`] for scenarios that need to
+/// force or suppress a startup checkpoint (PERFORMANCE_DURABILITY_PLAN.md
+/// D6 step 2).
 async fn start_server(data_dir: Option<&Path>, sync_policy: SyncPolicy) -> std::net::SocketAddr {
-    let config = Config {
-        users: vec![UserCredential::with_caching_sha2_password(
-            USERNAME, PASSWORD,
-        )],
-        log_level: LogLevel::Error,
+    start_server_with_config(Config {
         data_dir: data_dir.map(Path::to_path_buf),
         sync_policy,
         ..Config::default()
-    };
+    })
+    .await
+}
+
+/// Like [`start_server`], but with an explicit checkpoint threshold —
+/// `0` forces a checkpoint on every boot (regardless of how small the log
+/// is), a huge value guarantees one never happens.
+async fn start_server_with_checkpoint_threshold(
+    data_dir: Option<&Path>,
+    sync_policy: SyncPolicy,
+    checkpoint_threshold_bytes: u64,
+) -> std::net::SocketAddr {
+    start_server_with_config(Config {
+        data_dir: data_dir.map(Path::to_path_buf),
+        sync_policy,
+        checkpoint_threshold_bytes,
+        ..Config::default()
+    })
+    .await
+}
+
+async fn start_server_with_config(mut config: Config) -> std::net::SocketAddr {
+    config.users = vec![UserCredential::with_caching_sha2_password(
+        USERNAME, PASSWORD,
+    )];
+    config.log_level = LogLevel::Error;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

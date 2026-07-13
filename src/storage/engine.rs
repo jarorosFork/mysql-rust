@@ -7,7 +7,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::config::SyncPolicy;
-use crate::storage::log::{Entry, Log};
+use crate::storage::log::{
+    encode_create_table, encode_transaction, frame_record, sync_parent_dir, write_snapshot_file,
+    Entry, Log,
+};
 use crate::storage::log_writer::LogWriter;
 use crate::storage::value::{ColumnSchema, TableSchema, Value};
 use crate::storage::{BoxFuture, Storage};
@@ -186,10 +189,19 @@ impl InMemoryStorage {
     /// Open (creating if necessary) a store backed by a log file at `path`.
     /// Any existing data is replayed into memory immediately. `sync_policy`
     /// governs how aggressively subsequent writes are forced durable (see
-    /// `Log::open`, PERFORMANCE_DURABILITY_PLAN.md D1).
-    pub fn open(path: &Path, sync_policy: SyncPolicy) -> Result<Self> {
+    /// `Log::open`, PERFORMANCE_DURABILITY_PLAN.md D1). If the replayed log
+    /// is at least `checkpoint_threshold_bytes`, it's rewritten as a
+    /// compact snapshot before this returns (D6 step 2, see
+    /// `checkpoint_if_worthwhile`).
+    pub fn open(
+        path: &Path,
+        sync_policy: SyncPolicy,
+        checkpoint_threshold_bytes: u64,
+    ) -> Result<Self> {
         let mut tables: HashMap<String, Table> = HashMap::new();
         let log = Log::open(path, sync_policy, |entry| apply_entry(&mut tables, entry))?;
+        let log =
+            checkpoint_if_worthwhile(log, path, sync_policy, checkpoint_threshold_bytes, &tables)?;
         Ok(InMemoryStorage {
             tables: RwLock::new(tables),
             log_writer: Some(LogWriter::spawn(log)),
@@ -255,10 +267,87 @@ impl InMemoryStorage {
 
     /// Open (creating the directory and a fixed-name data file within it if
     /// necessary) a persistent store rooted at `dir`.
-    pub fn open_in_dir(dir: &Path, sync_policy: SyncPolicy) -> Result<Self> {
+    pub fn open_in_dir(
+        dir: &Path,
+        sync_policy: SyncPolicy,
+        checkpoint_threshold_bytes: u64,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        Self::open(&dir.join("data.log"), sync_policy)
+        Self::open(
+            &dir.join("data.log"),
+            sync_policy,
+            checkpoint_threshold_bytes,
+        )
     }
+}
+
+/// PERFORMANCE_DURABILITY_PLAN.md D6 step 2: if the log `open` just
+/// replayed is at least `threshold_bytes`, rewrite it as a compact
+/// snapshot — one `CreateTable` entry, plus (if non-empty) one
+/// `Transaction` entry carrying every current row, per table — and return
+/// a fresh `Log` pointing at the rewritten file. Below the threshold,
+/// `log` is returned unchanged.
+///
+/// Deliberately startup-only: this runs *before* any [`LogWriter`] exists
+/// for `path`, specifically to avoid the much harder problem of
+/// hot-swapping a *running* writer thread's file handle out from under it
+/// mid-flight — there is no live/on-demand compaction path here, only "at
+/// startup, if it's grown large enough since last time." Crash-safe via
+/// write-to-temp -> fsync -> atomic rename -> fsync the directory: if a
+/// crash lands at any point before the rename completes, `path` (the
+/// original log) is untouched, so a subsequent restart just replays it as
+/// if the checkpoint had never started.
+fn checkpoint_if_worthwhile(
+    log: Log,
+    path: &Path,
+    sync_policy: SyncPolicy,
+    threshold_bytes: u64,
+    tables: &HashMap<String, Table>,
+) -> Result<Log> {
+    if log.file_len()? < threshold_bytes {
+        return Ok(log);
+    }
+
+    let tmp_path = snapshot_tmp_path(path);
+    let mut framed = Vec::new();
+    for (name, table) in tables {
+        framed.extend(frame_record(&encode_create_table(
+            name,
+            &table.schema.columns,
+            table.schema.primary_key.as_deref(),
+        )));
+        if !table.rows.is_empty() {
+            let rows: Vec<(String, Vec<Value>)> = table
+                .rows
+                .iter()
+                .map(|row| (name.clone(), row.clone()))
+                .collect();
+            framed.extend(frame_record(&encode_transaction(&rows)));
+        }
+    }
+    write_snapshot_file(&tmp_path, &framed)?;
+
+    // Close the old handle explicitly before renaming over its path: not
+    // required for correctness on Unix (a rename can replace a path that's
+    // still open elsewhere — the old inode just stays alive via that
+    // handle until it's closed), but Windows is stricter about renaming
+    // over an open file, so closing first is what makes this portable
+    // rather than Unix-only.
+    drop(log);
+    std::fs::rename(&tmp_path, path)?;
+    sync_parent_dir(path)?;
+
+    Log::open_for_append(path, sync_policy)
+}
+
+/// The temp path a checkpoint rewrite is staged at before being atomically
+/// renamed over the real log — same directory as `path` (so the rename is
+/// same-filesystem and therefore atomic) with `.new` appended to the file
+/// name.
+fn snapshot_tmp_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    path.with_file_name(name)
 }
 
 impl Storage for InMemoryStorage {
@@ -802,7 +891,7 @@ mod tests {
     async fn failed_log_append_on_insert_leaves_no_trace_in_memory() {
         let path = temp_path("fault-injection-insert");
         std::fs::remove_file(&path).ok();
-        let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+        let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
         storage
             .create_table(
                 "t",
@@ -846,7 +935,7 @@ mod tests {
     async fn failed_log_append_on_create_table_leaves_it_absent() {
         let path = temp_path("fault-injection-create");
         std::fs::remove_file(&path).ok();
-        let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+        let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
 
         storage.fail_next_log_write();
         let result = storage
@@ -935,7 +1024,7 @@ mod tests {
     async fn failed_log_append_on_insert_rows_leaves_no_trace_of_the_whole_batch() {
         let path = temp_path("fault-injection-insert-rows");
         std::fs::remove_file(&path).ok();
-        let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+        let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
         storage
             .create_table(
                 "t",
@@ -981,7 +1070,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
             storage
                 .create_table(
                     "t",
@@ -1003,7 +1092,7 @@ mod tests {
                 .unwrap();
         } // `storage` (and its log file handle) dropped here — simulates a restart.
 
-        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
         assert_eq!(reopened.tables().unwrap(), vec!["t".to_string()]);
         assert_eq!(
             reopened.scan("t").unwrap(),
@@ -1022,12 +1111,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_below_threshold_leaves_the_log_untouched() {
+        let path = temp_path("checkpoint-below-threshold");
+        std::fs::remove_file(&path).ok();
+
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+            storage
+                .create_table(
+                    "t",
+                    vec![col("id", ColumnType::Int)],
+                    Some("id".to_string()),
+                )
+                .await
+                .unwrap();
+            storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
+        }
+        let len_before = std::fs::metadata(&path).unwrap().len();
+
+        // A huge threshold never triggers -- the file must be exactly the
+        // same size it was before this second open (still the original
+        // create+insert history, not rewritten).
+        let _storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_above_threshold_compacts_the_log_and_preserves_every_row() {
+        let path = temp_path("checkpoint-above-threshold");
+        std::fs::remove_file(&path).ok();
+        const ROWS: i64 = 200;
+
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+            storage
+                .create_table(
+                    "t",
+                    vec![col("id", ColumnType::Int), col("name", ColumnType::Varchar)],
+                    Some("id".to_string()),
+                )
+                .await
+                .unwrap();
+            for i in 0..ROWS {
+                storage
+                    .insert_row("t", vec![Value::Int(i), Value::Varchar(format!("row{i}"))])
+                    .await
+                    .unwrap();
+            }
+        }
+        let len_before_checkpoint = std::fs::metadata(&path).unwrap().len();
+
+        // threshold=0 always triggers, regardless of the file's actual size
+        // (a real file's length is never negative, so "at least 0 bytes" is
+        // unconditionally true) -- a deterministic way to force a
+        // checkpoint in a test without needing to actually cross a
+        // realistic production-sized threshold.
+        let storage = InMemoryStorage::open(&path, SyncPolicy::Never, 0).unwrap();
+        let len_after_checkpoint = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(
+            storage.scan("t").unwrap().len(),
+            ROWS as usize,
+            "every row must survive the compaction"
+        );
+        assert!(
+            len_after_checkpoint < len_before_checkpoint,
+            "compacted log ({len_after_checkpoint} bytes) should be smaller than \
+             {ROWS} individual insert records ({len_before_checkpoint} bytes)"
+        );
+
+        // The compacted file left behind must itself still be a valid,
+        // replayable log -- reopening again (with a threshold that won't
+        // re-trigger) must reproduce the exact same data.
+        drop(storage);
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+        assert_eq!(reopened.scan("t").unwrap().len(), ROWS as usize);
+        assert_eq!(
+            reopened
+                .lookup_by_primary_key("t", &Value::Int(42))
+                .unwrap(),
+            Some(vec![Value::Int(42), Value::Varchar("row42".to_string())])
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_preserves_data_across_multiple_tables_and_auto_increment() {
+        let path = temp_path("checkpoint-multi-table");
+        std::fs::remove_file(&path).ok();
+
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+            storage
+                .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
+                .await
+                .unwrap();
+            storage
+                .create_table(
+                    "u",
+                    vec![col("id", ColumnType::Int), col("name", ColumnType::Varchar)],
+                    Some("id".to_string()),
+                )
+                .await
+                .unwrap();
+            for i in 1..=5 {
+                storage.insert_row("t", vec![Value::Int(i)]).await.unwrap();
+            }
+            storage
+                .insert_row(
+                    "u",
+                    vec![Value::Int(100), Value::Varchar("alice".to_string())],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Force a checkpoint, then restart once more on top of it.
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, 0).unwrap();
+            assert_eq!(storage.scan("t").unwrap().len(), 5);
+            assert_eq!(storage.scan("u").unwrap().len(), 1);
+        }
+
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+        assert_eq!(reopened.scan("t").unwrap().len(), 5);
+        assert_eq!(reopened.scan("u").unwrap().len(), 1);
+        // AUTO_INCREMENT must still continue from the largest value actually
+        // present, exactly as if the checkpoint had never happened.
+        assert_eq!(reopened.next_auto_increment("t").unwrap(), 6);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
     async fn decimal_and_date_columns_survive_reopening() {
         let path = temp_path("persist-decimal-date");
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
             storage
                 .create_table(
                     "orders",
@@ -1061,7 +1286,7 @@ mod tests {
                 .unwrap();
         } // dropped here — simulates a restart.
 
-        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
         assert_eq!(
             reopened.scan("orders").unwrap(),
             vec![vec![
@@ -1079,7 +1304,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
             storage
                 .create_table(
                     "t",
@@ -1091,7 +1316,7 @@ mod tests {
             storage.insert_row("t", vec![Value::Int(1)]).await.unwrap();
         }
 
-        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
         assert!(reopened.insert_row("t", vec![Value::Int(1)]).await.is_err());
 
         std::fs::remove_file(&path).ok();
@@ -1152,7 +1377,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         {
-            let storage = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
             storage
                 .create_table("t", vec![auto_increment_col("id")], Some("id".to_string()))
                 .await
@@ -1164,7 +1389,7 @@ mod tests {
         // Reopening must replay the rows and pick the counter up from the
         // largest value actually present, not restart it from 1 — otherwise
         // a fresh auto-assigned insert would collide with an existing row.
-        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap();
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
         assert_eq!(reopened.next_auto_increment("t").unwrap(), 3);
 
         std::fs::remove_file(&path).ok();

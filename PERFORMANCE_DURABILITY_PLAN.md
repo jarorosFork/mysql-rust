@@ -977,11 +977,74 @@ green.
       tests total (was 435); `tests/crash.rs`'s 5-test crash-safety suite
       and the e2e app (41/41) both still green; fmt + clippy `-D warnings`
       clean.)_
-- [ ] **Checkpoint/compaction (D6 step 2)**: snapshot to `data.log.new` →
+- [x] **Checkpoint/compaction (D6 step 2)**: snapshot to `data.log.new` →
       fsync → atomic rename → dir fsync; triggered at startup-complete
       and/or a size threshold; replay prefers the snapshot.
+      _(✅ Done 2026-07-13, with one honest caveat on the acceptance
+      criterion's second half — see below. New `Config::
+      checkpoint_threshold_bytes` (`MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES`,
+      default 16 MiB): if the just-replayed log is at least this many
+      bytes, `InMemoryStorage::open` rewrites it as a compact snapshot —
+      one `CreateTable` entry plus (if non-empty) one `Transaction` entry
+      carrying every current row, per table — before returning. Crash-safe
+      via write-to-`data.log.new` (full `sync_all`, unconditionally,
+      regardless of the store's own `SyncPolicy` — a checkpoint's safety
+      can't depend on a "don't bother syncing" policy) → `std::fs::rename`
+      over `data.log` → `sync_parent_dir` (reusing D7's own primitive).
+      Deliberately **startup-only, no live/on-demand compaction path**: it
+      runs *before* `LogWriter::spawn`, specifically so there is never a
+      *running* writer thread whose file handle would need to be hot-swapped
+      mid-flight — a meaningfully harder problem than "at startup, if it's
+      grown large enough since last time," which is what the plan's own
+      "and/or" wording allows choosing. New `Log::open_for_append` (no
+      replay — the caller already knows the file's exact content, it just
+      wrote it) and `write_snapshot_file` support this without duplicating
+      `Log::open`'s replay/recovery logic.
       _Acceptance: crash harness passes when killed mid-checkpoint (old log
       intact); replay time on a churned dataset drops accordingly._
+      _(✅/⚠️ First half fully met, second half honestly did not measure
+      out as expected. **Crash-safety**: new `tests/crash.rs` test races a
+      `SIGKILL` against process startup itself (checkpointing runs before
+      the accept loop, so — unlike every other crash test in this file —
+      there's no client-observable moment to race against instead) across
+      9 swept delays (0-34ms), against a real 500-row pre-built log with a
+      threshold of 1 (guaranteed to attempt a checkpoint). Every trial
+      restarts to exactly 500 rows, never more, never less, never
+      corrupted — proving the crash lands either before the rename (old
+      log untouched) or after it (new log complete and correct), never in
+      between. Also proven directly at the unit level: `checkpoint_above_
+      threshold_compacts_the_log_and_preserves_every_row` (200 rows, real
+      compaction, ~24% smaller: 7,533 → 5,746 bytes) and `checkpoint_
+      preserves_data_across_multiple_tables_and_auto_increment` (2 tables,
+      `AUTO_INCREMENT` continuity survives the rewrite).
+      **Replay time**: measured with a dedicated new benchmark
+      (`restart_replay_time_after_checkpoint`) against the existing
+      50,000-row `restart_replay_time` baseline — **23.05-24.77ms before
+      vs. 23.39-25.05ms after, i.e. no measurable improvement, and if
+      anything slightly slower within noise.** This is a genuine, reported-
+      as-is result, not the "drops accordingly" the acceptance line
+      predicted — and there's a real reason for it, not a bug: this
+      codebase has no `UPDATE`/`DELETE` yet (confirmed by grep — Phase 11
+      hasn't reached them), so "compaction" here cannot shrink the *live
+      row count* the way it would once those exist; it only merges many
+      small `InsertRow` records into fewer, larger `Transaction` records,
+      eliminating one 8-byte record header per row (exactly the ~24%
+      file-size win measured above). But replay's actual cost is dominated
+      by *per-value and per-row* allocation (`decode_entry`'s `TAG_
+      TRANSACTION` branch still allocates one `Vec<Value>` per row and one
+      `String` per `Varchar` field, one row at a time, whether that row
+      arrived inside a big batched record or its own small one) — record-
+      *framing* overhead (the 8-byte header this compaction removes) is a
+      small fraction of that. Net: checkpointing is real, correct, and
+      already worth having for its actual proven benefits — smaller
+      on-disk files, and the infrastructure `UPDATE`/`DELETE` will need to
+      get real replay-time wins from compaction later — but the plan's
+      replay-time prediction specifically doesn't hold *yet*, and closing
+      that gap is a `Value`-representation change (P1 step 2 / P7
+      territory, already evaluated and deliberately deferred in PD-3), not
+      something this task should reach into. 443 tests total (was 436);
+      e2e app (41/41) and `tests/crash.rs`'s now-6-test crash-safety suite
+      both green; fmt + clippy `-D warnings` clean.)_
 - [ ] **Volatile-mode startup warning + persisted DB namespace (D8)**.
 - [ ] **Idle-connection reaping (P9)**: enforce `wait_timeout` on
       command-loop reads and a short handshake timeout.
@@ -1057,6 +1120,20 @@ median (unchanged, as expected — PD-3 doesn't touch the write path);
 point SELECT under 8-writer write load 65.8µs → 41.3µs median (tracks the
 same predicate-pushdown/`Arc<TableSchema>` read-path wins as the
 uncontended point-SELECT row above, not a new write-path effect).
+
+**New in PD-4** (D6 streaming replay + checkpoint/compaction):
+
+| Benchmark | n | min | median | mean | p99 | max |
+|---|---|---|---|---|---|---|
+| server restart + replay, 50,000 persisted rows | 5 | 22.47-23.05ms | 23.46-24.77ms | 24.56-26.09ms | 26.63-33.29ms | 26.63-33.29ms |
+| server restart + replay AFTER checkpoint, 50,000 rows (compacted) | 5 | 23.39ms | 25.05ms | 25.08ms | 26.63ms | 26.63ms |
+
+Ranges on the first row are across the two separate runs recorded for D6
+step 1 and step 2 respectively (normal run-to-run variance, not a
+regression — see each step's own plan entry above). The second row is
+essentially identical to the first, **not** the improvement the D6 step 2
+acceptance line predicted; see that entry above for the measured file-size
+win (real, ~24%) versus the replay-*time* win (not realized yet, and why).
 
 **New in PD-2** (these scenarios didn't exist before — group commit can't
 be measured by a single-writer number, and neither can "did a worker

@@ -45,20 +45,48 @@ impl ServerProcess {
     /// `data_dir`, on a free loopback port, and block until it's actually
     /// accepting connections.
     fn spawn(data_dir: &Path) -> Self {
+        let (addr, child) = Self::spawn_child(data_dir, None);
+        wait_until_listening(addr);
+        ServerProcess { child, addr }
+    }
+
+    /// Like [`Self::spawn`], but sets `MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES`
+    /// and does **not** wait for the server to start accepting connections.
+    /// Checkpointing (PERFORMANCE_DURABILITY_PLAN.md D6 step 2) runs during
+    /// startup, strictly before the accept loop — so unlike every other
+    /// crash test in this file, there is no client-observable moment to
+    /// race a kill against; the caller races a kill against process
+    /// startup itself, at a delay it controls directly (see
+    /// `crash_mid_checkpoint_never_loses_or_corrupts_data`).
+    fn spawn_with_checkpoint_threshold(data_dir: &Path, threshold_bytes: u64) -> Self {
+        let (addr, child) = Self::spawn_child(data_dir, Some(threshold_bytes));
+        ServerProcess { child, addr }
+    }
+
+    fn spawn_child(
+        data_dir: &Path,
+        checkpoint_threshold_bytes: Option<u64>,
+    ) -> (SocketAddr, Child) {
         let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
-        let child = Command::new(env!("CARGO_BIN_EXE_mysql-rust"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mysql-rust"));
+        command
             .env("MYSQLRUST_LISTEN_ADDR", addr.to_string())
             .env("MYSQLRUST_DATA_DIR", data_dir)
             .env("MYSQLRUST_USER", USERNAME)
             .env("MYSQLRUST_PASSWORD", PASSWORD)
             .env("MYSQLRUST_LOG_LEVEL", "error")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(threshold) = checkpoint_threshold_bytes {
+            command.env(
+                "MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES",
+                threshold.to_string(),
+            );
+        }
+        let child = command
             .spawn()
             .expect("spawn the mysql-rust binary (did `cargo build` run first?)");
-
-        wait_until_listening(addr);
-        ServerProcess { child, addr }
+        (addr, child)
     }
 
     /// `SIGKILL` on Unix (`TerminateProcess` elsewhere via `Child::kill`) —
@@ -254,6 +282,78 @@ async fn crash_mid_transaction_commit_never_leaves_a_partial_transaction() {
     }
 }
 
+/// PERFORMANCE_DURABILITY_PLAN.md D6 step 2's acceptance: a crash mid-
+/// checkpoint must leave the data fully intact — either the *original* log
+/// (the atomic rename never got a chance to run) or the *new* compacted
+/// one (it did), never anything in between. Unlike every other test in
+/// this file, checkpointing runs during startup, strictly before the
+/// accept loop, so there's no client-observable moment (a query, a
+/// connection) to race a kill against — this races the kill against the
+/// **process startup itself**, sweeping delays the same way the other
+/// tests sweep delays against a client operation. The assertion is
+/// deliberately strict (`== ROWS`, not "0 or ROWS"): every row here was
+/// already durably committed by an ordinary `INSERT` (under the default
+/// `sync=always`) *before* the checkpoint-triggering boot ever started, so
+/// a checkpoint crash must never lose, duplicate, or corrupt any of it —
+/// there is no valid partial outcome the way there is for a crash mid-way
+/// through a brand-new write.
+#[tokio::test]
+async fn crash_mid_checkpoint_never_loses_or_corrupts_data() {
+    const ROWS: i64 = 500;
+
+    // Build up a real log with a normal boot (the default checkpoint
+    // threshold, 16 MiB, is nowhere near crossed by this, so this boot
+    // itself never checkpoints) — this is the "before" state every trial
+    // starts from.
+    let source_dir = temp_data_dir("crash-mid-checkpoint-source");
+    {
+        let server = ServerProcess::spawn(&source_dir);
+        let mut conn = connect(server.addr).await;
+        conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)")
+            .await
+            .expect("create table");
+        for i in 0..ROWS {
+            conn.query_drop(format!("INSERT INTO t VALUES ({i}, 'row{i}')"))
+                .await
+                .expect("insert");
+        }
+        // Every insert already got an OK (sync=always fsyncs before
+        // acking), so this data is durable regardless of how `server`
+        // itself eventually stops — no explicit `.crash()` needed here.
+    }
+    let source_log = source_dir.join("data.log");
+
+    for (trial, delay_ms) in [0u64, 1, 2, 3, 5, 8, 13, 21, 34].into_iter().enumerate() {
+        let trial_dir = temp_data_dir(&format!("crash-mid-checkpoint-trial-{trial}"));
+        std::fs::copy(&source_log, trial_dir.join("data.log"))
+            .expect("seed the trial dir with the pre-built log");
+
+        // threshold=1 guarantees this boot attempts a checkpoint (the log
+        // is certainly at least 1 byte); kill it after a short delay from
+        // process start, landing at different points in the write-
+        // snapshot/rename/fsync sequence across trials.
+        let server = ServerProcess::spawn_with_checkpoint_threshold(&trial_dir, 1);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        server.crash();
+
+        // Restart normally (the default threshold won't re-trigger a
+        // checkpoint on a freshly-compacted, still-small log) and verify
+        // every row survived, exactly once.
+        let restarted = ServerProcess::spawn(&trial_dir);
+        let mut conn = connect(restarted.addr).await;
+        let count: Option<i64> = conn
+            .query_first("SELECT COUNT(*) FROM t")
+            .await
+            .expect("count after restart");
+        assert_eq!(
+            count,
+            Some(ROWS),
+            "trial {trial} (delay {delay_ms}ms): expected exactly {ROWS} rows after a crash \
+             mid-checkpoint, got {count:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // Torn/corrupt log recovery: direct storage-engine tests. No subprocess
 // needed here — byte-exact control over the on-disk file is the point,
@@ -290,7 +390,7 @@ fn varchar_col(name: &str) -> ColumnSchema {
 #[tokio::test]
 async fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
     let path = temp_data_dir("torn-tail").join("data.log");
-    let storage = InMemoryStorage::open(&path, SyncPolicy::Never).expect("open");
+    let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).expect("open");
     storage
         .create_table(
             "t",
@@ -316,12 +416,13 @@ async fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
 
     for truncate_at in before_last_record..after_last_record {
         std::fs::write(&path, &full_bytes[..truncate_at as usize]).expect("write truncated log");
-        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never).unwrap_or_else(|e| {
-            panic!(
-                "truncating the final record at byte {truncate_at} of {after_last_record} \
+        let reopened =
+            InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap_or_else(|e| {
+                panic!(
+                    "truncating the final record at byte {truncate_at} of {after_last_record} \
                  should recover (discarding just that record), not error: {e}"
-            )
-        });
+                )
+            });
         assert_eq!(
             reopened.scan("t").expect("scan"),
             vec![vec![Value::Int(1), Value::Varchar("ada".to_string())]],
@@ -341,7 +442,7 @@ async fn torn_log_tail_recovers_by_discarding_the_incomplete_final_record() {
 #[tokio::test]
 async fn mid_file_corruption_with_valid_data_after_it_is_still_refused() {
     let path = temp_data_dir("mid-file-corrupt").join("data.log");
-    let storage = InMemoryStorage::open(&path, SyncPolicy::Never).expect("open");
+    let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).expect("open");
     storage
         .create_table("t", vec![int_pk_col("id")], Some("id".to_string()))
         .await
@@ -369,7 +470,7 @@ async fn mid_file_corruption_with_valid_data_after_it_is_still_refused() {
     std::fs::write(&path, &bytes).expect("write corrupted log");
 
     assert!(
-        InMemoryStorage::open(&path, SyncPolicy::Never).is_err(),
+        InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).is_err(),
         "mid-file corruption with valid data still following it must never be silently accepted"
     );
 }

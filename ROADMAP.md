@@ -522,6 +522,39 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
 - [ ] PD-4 — Operational hardening: streaming replay, checkpoint/
       compaction, volatile-mode warning, idle-connection reaping, sort-path
       and buffer hygiene.
+      _(In progress. **Streaming replay** (D6 step 1) done 2026-07-13:
+      `Log::open` streams through the file with a `BufReader` instead of
+      `std::fs::read`-ing it whole first, one record at a time into its
+      own short-lived allocation — startup memory is O(one record), not
+      O(the whole file twice over) — with the torn-tail/corruption
+      classification preserved exactly (every existing byte-exact test
+      passes unchanged) and a new 5,000-record test proving the streaming
+      loop itself is correct at a scale the old handful-of-records tests
+      wouldn't catch an off-by-one at.
+      **Checkpoint/compaction** (D6 step 2) done 2026-07-13: if the
+      just-replayed log is at least `Config::checkpoint_threshold_bytes`
+      (16 MiB default), `InMemoryStorage::open` rewrites it as a compact
+      snapshot (one `CreateTable` + one batched `Transaction` of every
+      current row, per table) via write-temp → fsync → atomic rename →
+      fsync-the-directory, entirely at startup and before any live
+      `LogWriter` exists (deliberately no on-demand/background compaction
+      path — hot-swapping a *running* writer thread's file handle
+      mid-flight is a harder problem the plan's "and/or" wording doesn't
+      require solving here). A new crash test races a `SIGKILL` against
+      process startup itself across 9 swept delays (checkpointing runs
+      before the accept loop, so there's no client-observable moment to
+      race against instead) and always recovers to exactly the right row
+      count. Honestly reported: this measurably shrinks the on-disk log
+      (~24% smaller in the test case) but does **not** measurably speed up
+      replay in this codebase today, because there's no `UPDATE`/`DELETE`
+      yet — compaction can't reduce live row count, only record-framing
+      overhead, and replay's real cost is dominated by per-value/per-row
+      allocation, not framing. See PERFORMANCE_DURABILITY_PLAN.md's D6
+      entries for the full reasoning. 443 tests total (was 436); e2e app
+      (41/41) and `tests/crash.rs`'s crash-safety suite (now 6 tests)
+      still green throughout; fmt + clippy `-D warnings` clean. Remaining:
+      volatile-mode warning + persisted DB namespace (D8), idle-connection
+      reaping (P9), sort-path/buffer/release-profile hygiene (P7/P8/P10).)_
 - [ ] **Acceptance:** every checkbox in
       [PERFORMANCE_DURABILITY_PLAN.md](PERFORMANCE_DURABILITY_PLAN.md) is
       checked, the crash harness passes un-`#[ignore]`d in CI, and the
