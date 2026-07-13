@@ -27,7 +27,10 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::storage::log::{encode_create_table, encode_insert_row, encode_transaction, Log};
+use crate::storage::log::{
+    encode_create_database, encode_create_table, encode_drop_database, encode_insert_row,
+    encode_transaction, Log,
+};
 use crate::storage::value::{ColumnSchema, Value};
 use crate::{Error, Result};
 
@@ -215,6 +218,20 @@ impl LogWriter {
     pub async fn append_transaction(&self, rows: &[(String, Vec<Value>)]) -> Result<()> {
         self.submit(crate::storage::log::frame_record(&encode_transaction(rows)))
             .await
+    }
+
+    pub async fn append_create_database(&self, name: &str) -> Result<()> {
+        self.submit(crate::storage::log::frame_record(&encode_create_database(
+            name,
+        )))
+        .await
+    }
+
+    pub async fn append_drop_database(&self, name: &str) -> Result<()> {
+        self.submit(crate::storage::log::frame_record(&encode_drop_database(
+            name,
+        )))
+        .await
     }
 
     /// Test-only: how many physical batched writes the thread has made so

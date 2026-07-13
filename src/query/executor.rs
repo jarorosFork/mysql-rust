@@ -112,11 +112,11 @@ impl<'a> Executor<'a> {
                 name,
                 if_not_exists,
             } => {
-                self.storage.create_database(&name, if_not_exists)?;
+                self.storage.create_database(&name, if_not_exists).await?;
                 Ok(QueryResult::default())
             }
             Statement::DropDatabase { name, if_exists } => {
-                self.storage.drop_database(&name, if_exists)?;
+                self.storage.drop_database(&name, if_exists).await?;
                 Ok(QueryResult::default())
             }
         }

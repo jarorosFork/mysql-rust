@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::config::SyncPolicy;
 use crate::storage::log::{
-    encode_create_table, encode_transaction, frame_record, sync_parent_dir, write_snapshot_file,
-    Entry, Log,
+    encode_create_database, encode_create_table, encode_transaction, frame_record, sync_parent_dir,
+    write_snapshot_file, Entry, Log,
 };
 use crate::storage::log_writer::LogWriter;
 use crate::storage::value::{ColumnSchema, TableSchema, Value};
@@ -106,7 +106,7 @@ impl Table {
     }
 }
 
-fn apply_entry(tables: &mut HashMap<String, Table>, entry: Entry) {
+fn apply_entry(tables: &mut HashMap<String, Table>, databases: &mut HashSet<String>, entry: Entry) {
     match entry {
         Entry::CreateTable {
             table,
@@ -132,6 +132,14 @@ fn apply_entry(tables: &mut HashMap<String, Table>, entry: Entry) {
                     t.push_trusted(row);
                 }
             }
+        }
+        // PERFORMANCE_DURABILITY_PLAN.md D8: replaying these keeps
+        // `SHOW DATABASES` honest across a restart.
+        Entry::CreateDatabase { name } => {
+            databases.insert(name);
+        }
+        Entry::DropDatabase { name } => {
+            databases.remove(&name);
         }
     }
 }
@@ -162,12 +170,13 @@ pub struct InMemoryStorage {
     /// itself is only ever held for the instant it takes to look up or
     /// insert an `Arc`, never across an `.await`.
     table_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Registered database names (see `Storage::create_database`). Unlike
-    /// tables, this is **not** persisted to the log or across a restart: it's
-    /// a lightweight compatibility namespace, not a real schema-separation
-    /// feature, and table data was never partitioned by database to begin
-    /// with (so nothing about table data is affected by this being in-memory
-    /// only).
+    /// Registered database names (see `Storage::create_database`).
+    /// Persisted across a restart via the same log/checkpoint machinery as
+    /// tables (PERFORMANCE_DURABILITY_PLAN.md D8) — `CreateDatabase`/
+    /// `DropDatabase` log records, replayed in `open`. Still just a
+    /// lightweight compatibility namespace, not a real schema-separation
+    /// feature: table data was never partitioned by database to begin with,
+    /// so nothing about table storage itself is affected by this.
     databases: RwLock<HashSet<String>>,
     /// Test-only fault injection: when set, the next [`Self::append_log`]
     /// call fails without touching the real log, so tests can verify the
@@ -199,14 +208,23 @@ impl InMemoryStorage {
         checkpoint_threshold_bytes: u64,
     ) -> Result<Self> {
         let mut tables: HashMap<String, Table> = HashMap::new();
-        let log = Log::open(path, sync_policy, |entry| apply_entry(&mut tables, entry))?;
-        let log =
-            checkpoint_if_worthwhile(log, path, sync_policy, checkpoint_threshold_bytes, &tables)?;
+        let mut databases: HashSet<String> = HashSet::new();
+        let log = Log::open(path, sync_policy, |entry| {
+            apply_entry(&mut tables, &mut databases, entry)
+        })?;
+        let log = checkpoint_if_worthwhile(
+            log,
+            path,
+            sync_policy,
+            checkpoint_threshold_bytes,
+            &tables,
+            &databases,
+        )?;
         Ok(InMemoryStorage {
             tables: RwLock::new(tables),
             log_writer: Some(LogWriter::spawn(log)),
             table_locks: tokio::sync::Mutex::new(HashMap::new()),
-            databases: RwLock::new(HashSet::new()),
+            databases: RwLock::new(databases),
             #[cfg(test)]
             fail_next_log_write: std::sync::atomic::AtomicBool::new(false),
         })
@@ -303,6 +321,7 @@ fn checkpoint_if_worthwhile(
     sync_policy: SyncPolicy,
     threshold_bytes: u64,
     tables: &HashMap<String, Table>,
+    databases: &HashSet<String>,
 ) -> Result<Log> {
     if log.file_len()? < threshold_bytes {
         return Ok(log);
@@ -324,6 +343,11 @@ fn checkpoint_if_worthwhile(
                 .collect();
             framed.extend(frame_record(&encode_transaction(&rows)));
         }
+    }
+    // PERFORMANCE_DURABILITY_PLAN.md D8: the database namespace is part of
+    // the state a checkpoint has to preserve too, not just table data.
+    for name in databases {
+        framed.extend(frame_record(&encode_create_database(name)));
     }
     write_snapshot_file(&tmp_path, &framed)?;
 
@@ -578,30 +602,81 @@ impl Storage for InMemoryStorage {
         Ok(value)
     }
 
-    fn create_database(&self, name: &str, if_not_exists: bool) -> Result<()> {
-        let mut databases = self.databases.write().unwrap_or_else(|e| e.into_inner());
-        if databases.contains(name) {
-            return if if_not_exists {
+    fn create_database<'a>(
+        &'a self,
+        name: &'a str,
+        if_not_exists: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // Same check-release-log-reacquire shape as `create_table` above
+            // (PERFORMANCE_DURABILITY_PLAN.md D8): never hold the lock across
+            // the `.await`. The same benign race applies — two concurrent
+            // `CREATE DATABASE d` calls can both pass the first check and
+            // both durably log a `CreateDatabase` record for the same name;
+            // the loser's re-check below sees it already registered and
+            // returns "database exists" instead of silently double-adding.
+            // Harmless on replay (a repeated `CreateDatabase` for an
+            // already-registered name is a no-op `insert`).
+            {
+                let databases = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                if databases.contains(name) {
+                    return if if_not_exists {
+                        Ok(())
+                    } else {
+                        Err(Error::Execution(format!(
+                            "Can't create database '{name}'; database exists"
+                        )))
+                    };
+                }
+            }
+
+            #[cfg(test)]
+            self.check_fault_injection()?;
+            if let Some(writer) = &self.log_writer {
+                writer.append_create_database(name).await?;
+            }
+
+            let mut databases = self.databases.write().unwrap_or_else(|e| e.into_inner());
+            if databases.contains(name) {
+                return if if_not_exists {
+                    Ok(())
+                } else {
+                    Err(Error::Execution(format!(
+                        "Can't create database '{name}'; database exists"
+                    )))
+                };
+            }
+            databases.insert(name.to_string());
+            Ok(())
+        })
+    }
+
+    fn drop_database<'a>(&'a self, name: &'a str, if_exists: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            {
+                let databases = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                if !databases.contains(name) && !if_exists {
+                    return Err(Error::Execution(format!(
+                        "Can't drop database '{name}'; database doesn't exist"
+                    )));
+                }
+            }
+
+            #[cfg(test)]
+            self.check_fault_injection()?;
+            if let Some(writer) = &self.log_writer {
+                writer.append_drop_database(name).await?;
+            }
+
+            let mut databases = self.databases.write().unwrap_or_else(|e| e.into_inner());
+            if databases.remove(name) || if_exists {
                 Ok(())
             } else {
                 Err(Error::Execution(format!(
-                    "Can't create database '{name}'; database exists"
+                    "Can't drop database '{name}'; database doesn't exist"
                 )))
-            };
-        }
-        databases.insert(name.to_string());
-        Ok(())
-    }
-
-    fn drop_database(&self, name: &str, if_exists: bool) -> Result<()> {
-        let mut databases = self.databases.write().unwrap_or_else(|e| e.into_inner());
-        if databases.remove(name) || if_exists {
-            Ok(())
-        } else {
-            Err(Error::Execution(format!(
-                "Can't drop database '{name}'; database doesn't exist"
-            )))
-        }
+            }
+        })
     }
 
     fn databases(&self) -> Result<Vec<String>> {
@@ -805,30 +880,30 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn create_database_then_list_it() {
+    #[tokio::test]
+    async fn create_database_then_list_it() {
         let storage = InMemoryStorage::new();
-        storage.create_database("mydb", false).unwrap();
+        storage.create_database("mydb", false).await.unwrap();
         assert_eq!(storage.databases().unwrap(), vec!["mydb".to_string()]);
     }
 
-    #[test]
-    fn create_database_rejects_duplicate_unless_if_not_exists() {
+    #[tokio::test]
+    async fn create_database_rejects_duplicate_unless_if_not_exists() {
         let storage = InMemoryStorage::new();
-        storage.create_database("mydb", false).unwrap();
-        assert!(storage.create_database("mydb", false).is_err());
-        storage.create_database("mydb", true).unwrap(); // no-op, not an error
+        storage.create_database("mydb", false).await.unwrap();
+        assert!(storage.create_database("mydb", false).await.is_err());
+        storage.create_database("mydb", true).await.unwrap(); // no-op, not an error
     }
 
-    #[test]
-    fn drop_database_removes_it_and_rejects_missing_unless_if_exists() {
+    #[tokio::test]
+    async fn drop_database_removes_it_and_rejects_missing_unless_if_exists() {
         let storage = InMemoryStorage::new();
-        storage.create_database("mydb", false).unwrap();
-        storage.drop_database("mydb", false).unwrap();
+        storage.create_database("mydb", false).await.unwrap();
+        storage.drop_database("mydb", false).await.unwrap();
         assert!(storage.databases().unwrap().is_empty());
 
-        assert!(storage.drop_database("mydb", false).is_err());
-        storage.drop_database("mydb", true).unwrap(); // no-op, not an error
+        assert!(storage.drop_database("mydb", false).await.is_err());
+        storage.drop_database("mydb", true).await.unwrap(); // no-op, not an error
     }
 
     #[tokio::test]
@@ -1242,6 +1317,50 @@ mod tests {
         // AUTO_INCREMENT must still continue from the largest value actually
         // present, exactly as if the checkpoint had never happened.
         assert_eq!(reopened.next_auto_increment("t").unwrap(), 6);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn database_names_survive_reopening() {
+        let path = temp_path("persist-database-names");
+        std::fs::remove_file(&path).ok();
+
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+            storage.create_database("shop", false).await.unwrap();
+            storage.create_database("shop_alt", false).await.unwrap();
+            storage.drop_database("shop_alt", false).await.unwrap();
+        }
+
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+        assert_eq!(reopened.databases().unwrap(), vec!["shop".to_string()]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn database_names_survive_checkpoint_compaction() {
+        let path = temp_path("checkpoint-database-names");
+        std::fs::remove_file(&path).ok();
+
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+            storage.create_database("shop", false).await.unwrap();
+            storage.create_database("shop_alt", false).await.unwrap();
+            storage.drop_database("shop_alt", false).await.unwrap();
+        }
+
+        // threshold=0 always triggers -- forces the snapshot-and-compact path
+        // (`checkpoint_if_worthwhile`) to run, which must re-emit a
+        // `CreateDatabase` record for every name still registered.
+        {
+            let storage = InMemoryStorage::open(&path, SyncPolicy::Never, 0).unwrap();
+            assert_eq!(storage.databases().unwrap(), vec!["shop".to_string()]);
+        }
+
+        let reopened = InMemoryStorage::open(&path, SyncPolicy::Never, u64::MAX).unwrap();
+        assert_eq!(reopened.databases().unwrap(), vec!["shop".to_string()]);
 
         std::fs::remove_file(&path).ok();
     }

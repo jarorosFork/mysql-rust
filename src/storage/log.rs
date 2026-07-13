@@ -59,6 +59,12 @@ const TAG_INSERT_ROW: u8 = 2;
 /// only ever applies a record whose checksum verified intact, so there's no
 /// separate "partial batch" state to handle here.
 const TAG_TRANSACTION: u8 = 3;
+/// PERFORMANCE_DURABILITY_PLAN.md D8: database-name registration used to
+/// live only in an in-memory `HashSet`, so `SHOW DATABASES` lied after a
+/// restart. `CreateDatabase`/`DropDatabase` records make the namespace
+/// survive a restart the same way table data always has.
+const TAG_CREATE_DATABASE: u8 = 4;
+const TAG_DROP_DATABASE: u8 = 5;
 
 const VALUE_NULL: u8 = 0;
 const VALUE_INT: u8 = 1;
@@ -89,6 +95,16 @@ pub enum Entry {
     /// [`TAG_TRANSACTION`].
     Transaction {
         rows: Vec<(String, Vec<Value>)>,
+    },
+    /// A database name registered via `CREATE DATABASE` (PERFORMANCE_
+    /// DURABILITY_PLAN.md D8) — see [`TAG_CREATE_DATABASE`].
+    CreateDatabase {
+        name: String,
+    },
+    /// A database name unregistered via `DROP DATABASE` — see
+    /// [`TAG_DROP_DATABASE`].
+    DropDatabase {
+        name: String,
     },
 }
 
@@ -184,6 +200,18 @@ pub(super) fn encode_transaction(rows: &[(String, Vec<Value>)]) -> Vec<u8> {
             write_value(&mut buf, value);
         }
     }
+    buf
+}
+
+pub(super) fn encode_create_database(name: &str) -> Vec<u8> {
+    let mut buf = vec![TAG_CREATE_DATABASE];
+    write_string(&mut buf, name);
+    buf
+}
+
+pub(super) fn encode_drop_database(name: &str) -> Vec<u8> {
+    let mut buf = vec![TAG_DROP_DATABASE];
+    write_string(&mut buf, name);
     buf
 }
 
@@ -361,6 +389,12 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry> {
             }
             Ok(Entry::Transaction { rows })
         }
+        TAG_CREATE_DATABASE => Ok(Entry::CreateDatabase {
+            name: read_string(bytes, &mut pos)?,
+        }),
+        TAG_DROP_DATABASE => Ok(Entry::DropDatabase {
+            name: read_string(bytes, &mut pos)?,
+        }),
         other => Err(corrupt(&format!("unknown entry tag {other}"))),
     }
 }
@@ -627,6 +661,16 @@ impl Log {
     pub fn append_transaction(&mut self, rows: &[(String, Vec<Value>)]) -> Result<()> {
         self.append(&encode_transaction(rows))
     }
+
+    /// Record a database name registration (PERFORMANCE_DURABILITY_PLAN.md D8).
+    pub fn append_create_database(&mut self, name: &str) -> Result<()> {
+        self.append(&encode_create_database(name))
+    }
+
+    /// Record a database name being unregistered.
+    pub fn append_drop_database(&mut self, name: &str) -> Result<()> {
+        self.append(&encode_drop_database(name))
+    }
 }
 
 /// Write `framed_records` (already-framed `[len][crc][payload]` records,
@@ -791,6 +835,36 @@ mod tests {
                 assert_eq!(row, &vec![Value::Decimal(-500, 2), Value::Null]);
             }
             _ => panic!("expected InsertRow"),
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_create_database_and_drop_database_entries() {
+        let path = temp_path("round-trip-database");
+        {
+            let mut log = Log::open(&path, SyncPolicy::Never, |_| {}).unwrap();
+            log.append_create_database("shop").unwrap();
+            log.append_create_database("shop_alt").unwrap();
+            log.append_drop_database("shop_alt").unwrap();
+        }
+
+        let mut replayed = Vec::new();
+        let _log = Log::open(&path, SyncPolicy::Never, |entry| replayed.push(entry)).unwrap();
+
+        assert_eq!(replayed.len(), 3);
+        match &replayed[0] {
+            Entry::CreateDatabase { name } => assert_eq!(name, "shop"),
+            _ => panic!("expected CreateDatabase"),
+        }
+        match &replayed[1] {
+            Entry::CreateDatabase { name } => assert_eq!(name, "shop_alt"),
+            _ => panic!("expected CreateDatabase"),
+        }
+        match &replayed[2] {
+            Entry::DropDatabase { name } => assert_eq!(name, "shop_alt"),
+            _ => panic!("expected DropDatabase"),
         }
 
         std::fs::remove_file(&path).ok();

@@ -552,9 +552,26 @@ file; its durability items also sharpen PRODUCTION_READINESS.md §4 from
       allocation, not framing. See PERFORMANCE_DURABILITY_PLAN.md's D6
       entries for the full reasoning. 443 tests total (was 436); e2e app
       (41/41) and `tests/crash.rs`'s crash-safety suite (now 6 tests)
-      still green throughout; fmt + clippy `-D warnings` clean. Remaining:
-      volatile-mode warning + persisted DB namespace (D8), idle-connection
-      reaping (P9), sort-path/buffer/release-profile hygiene (P7/P8/P10).)_
+      still green throughout; fmt + clippy `-D warnings` clean.
+      **Volatile-mode warning + persisted DB namespace** (D8) done
+      2026-07-13: `Server::serve` logs a `Warn`-level `volatile_mode` event
+      (with a hint pointing at `MYSQLRUST_DATA_DIR`) whenever `data_dir` is
+      `None`, verified by manual smoke run; `None` stays the default.
+      `CREATE DATABASE`/`DROP DATABASE` names now go through the same
+      log/`LogWriter`/checkpoint machinery as tables — two new record types
+      (tags 4/5), `Storage::create_database`/`drop_database` became
+      `BoxFuture`-returning following `create_table`'s exact check-release-
+      log-reacquire pattern, and `checkpoint_if_worthwhile`'s snapshot now
+      re-emits every still-registered name. Two new tests prove a name
+      survives both a plain restart and a forced (threshold-0) checkpoint.
+      README's env-var/`Config`-field tables now document
+      `MYSQLRUST_DATA_DIR`'s full volatile-mode consequence,
+      `MYSQLRUST_SYNC_POLICY`, and `MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES`
+      (previously undocumented). 446 tests total (was 443); e2e app (41/41,
+      exercising `CREATE`/`DROP DATABASE` + `SHOW DATABASES`) and
+      `tests/crash.rs`'s 6-test suite still green; fmt + clippy
+      `-D warnings` clean. Remaining: idle-connection reaping (P9),
+      sort-path/buffer/release-profile hygiene (P7/P8/P10).)_
 - [ ] **Acceptance:** every checkbox in
       [PERFORMANCE_DURABILITY_PLAN.md](PERFORMANCE_DURABILITY_PLAN.md) is
       checked, the crash harness passes un-`#[ignore]`d in CI, and the

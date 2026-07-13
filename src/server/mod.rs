@@ -100,7 +100,26 @@ impl Server {
                 self.config.sync_policy,
                 self.config.checkpoint_threshold_bytes,
             )?,
-            None => InMemoryStorage::new(),
+            None => {
+                // PERFORMANCE_DURABILITY_PLAN.md D8: a *database server*
+                // whose default configuration silently keeps everything in
+                // RAM surprises operators in the worst possible way — this
+                // project hit exactly that in practice (PROGRESS.md,
+                // 2026-07-12: a dev session ran entirely in-memory before
+                // anyone noticed). `None` stays the default (tests depend
+                // on it; embedded/ephemeral use is legitimate), but it's
+                // never silent again.
+                self.observability.logger.log(
+                    LogLevel::Warn,
+                    "volatile_mode",
+                    &[(
+                        "hint",
+                        "running without persistence -- data will not survive a restart; \
+                         set MYSQLRUST_DATA_DIR to persist it",
+                    )],
+                );
+                InMemoryStorage::new()
+            }
         });
         let connection_limit = (self.config.max_connections > 0)
             .then(|| Arc::new(Semaphore::new(self.config.max_connections)));

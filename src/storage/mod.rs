@@ -117,11 +117,19 @@ pub trait Storage: Send + Sync {
     /// which database name is "current" (this server has no `USE`-scoped
     /// table separation); it exists so `CREATE`/`DROP`/`SHOW DATABASES`, which
     /// standard clients and GUI tools issue, work rather than error.
-    fn create_database(&self, name: &str, if_not_exists: bool) -> Result<()>;
+    ///
+    /// Durable (PERFORMANCE_DURABILITY_PLAN.md D8) — like `create_table`,
+    /// this has to reach the log, hence `BoxFuture` rather than a plain
+    /// `Result`.
+    fn create_database<'a>(
+        &'a self,
+        name: &'a str,
+        if_not_exists: bool,
+    ) -> BoxFuture<'a, Result<()>>;
 
     /// Unregister a database name. Errors if it doesn't exist, unless
     /// `if_exists` is set.
-    fn drop_database(&self, name: &str, if_exists: bool) -> Result<()>;
+    fn drop_database<'a>(&'a self, name: &'a str, if_exists: bool) -> BoxFuture<'a, Result<()>>;
 
     /// Return the names of all registered databases.
     fn databases(&self) -> Result<Vec<String>>;

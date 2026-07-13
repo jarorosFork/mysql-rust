@@ -49,7 +49,10 @@ against the server in `tests/conformance.rs`.
 | `MYSQLRUST_PASSWORD` | *(unset)* | That account's password. Unset or empty ⇒ passwordless account. |
 | `MYSQLRUST_AUTH_PLUGIN` | `caching_sha2_password` | `caching_sha2_password` or `mysql_native_password` (case-insensitive). |
 | `MYSQLRUST_LISTEN_ADDR` | `127.0.0.1:3306` | `host:port` to bind. |
-| `MYSQLRUST_DATA_DIR` | *(unset)* | Directory for the on-disk log (persistence). Unset ⇒ in-memory only. |
+| `MYSQLRUST_DATA_DIR` | *(unset)* | Directory for the on-disk log (persistence). **Unset ⇒ in-memory only: all tables, rows, and database names vanish on restart, and the server logs a `volatile_mode` warning at startup to say so.** |
+| `MYSQLRUST_SYNC_POLICY` | `always` | `always` (`fdatasync` every log append) or `never` (rely on the OS page cache). Only meaningful when `MYSQLRUST_DATA_DIR` is set. |
+| `MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES` | `16777216` (16 MiB) | Log size at which startup rewrites it as a compact snapshot instead of replaying it as-is. Only meaningful when `MYSQLRUST_DATA_DIR` is set. |
+| `MYSQLRUST_LOG_LEVEL` | `info` | Minimum severity for structured stderr logs (`debug`/`info`/`warn`/`error`). |
 
 `Config::from_env()` builds this configuration (the injectable
 `Config::from_env_with` makes it unit-testable); the `Config` struct below is
@@ -66,7 +69,9 @@ fields as needed.
 | `listen_addr` | `127.0.0.1:3306` | TCP address/port to bind. |
 | `server_version` | `8.0.0-mysql-rust-<crate version>` | Version string reported in the handshake. |
 | `users` | *(empty)* | Accounts to authenticate (`UserCredential::with_password`); no default/hardcoded credentials are shipped. |
-| `data_dir` | `None` | Directory for the on-disk append-only log. `None` = in-memory only (nothing survives restart). |
+| `data_dir` | `None` | Directory for the on-disk append-only log. `None` = in-memory only (nothing survives restart — table data *and* `CREATE DATABASE` names alike — and startup logs a `volatile_mode` warning). |
+| `sync_policy` | `SyncPolicy::Always` | `Always` (`fdatasync` every log append) or `Never` (rely on the OS page cache). Only meaningful when `data_dir` is set. |
+| `checkpoint_threshold_bytes` | 16 MiB | Log size at which startup rewrites it as a compact snapshot instead of replaying it as-is. Only meaningful when `data_dir` is set. |
 | `max_connections` | `0` (unlimited) | Cap on concurrent clients; extras get `ER_CON_COUNT_ERROR`. |
 | `max_allowed_packet` | 64 MiB | Largest accepted packet payload; larger is rejected on the header before buffering. |
 | `log_level` | `Info` | Minimum severity for structured stderr logs (`Debug`/`Info`/`Warn`/`Error`). |

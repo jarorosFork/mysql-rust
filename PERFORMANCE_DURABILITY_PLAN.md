@@ -1045,7 +1045,37 @@ green.
       something this task should reach into. 443 tests total (was 436);
       e2e app (41/41) and `tests/crash.rs`'s now-6-test crash-safety suite
       both green; fmt + clippy `-D warnings` clean.)_
-- [ ] **Volatile-mode startup warning + persisted DB namespace (D8)**.
+- [x] **Volatile-mode startup warning + persisted DB namespace (D8)**.
+      _Acceptance: starting without `data_dir` logs a visible warning;
+      `CREATE DATABASE` name survives a restart._
+      _(✅ Both halves done. **Startup warning**: `Server::serve` now logs a
+      `Warn`-level `volatile_mode` event with a `hint` pointing at
+      `MYSQLRUST_DATA_DIR` whenever `config.data_dir` is `None` — verified
+      with a manual smoke run (`WARN volatile_mode hint=running without
+      persistence -- data will not survive a restart; set
+      MYSQLRUST_DATA_DIR to persist it`); `None` stays the default (tests
+      and embedded/ephemeral use both depend on it), it's just never silent
+      again. **Persisted DB namespace**: two new log-record types
+      (`CreateDatabase`/`DropDatabase`, tags 4/5) round-trip through
+      `storage::log` exactly like the existing three; `Storage::
+      create_database`/`drop_database` became `BoxFuture`-returning (same
+      check-under-read-lock → release → log-append-and-`.await` →
+      reacquire-write-lock → re-check shape as `create_table`, including the
+      same benign harmless-on-replay race) and go through the same
+      `LogWriter` group-commit path via two new `append_create_database`/
+      `append_drop_database` methods; `checkpoint_if_worthwhile`'s snapshot
+      now also re-emits a `CreateDatabase` record for every still-registered
+      name, so compaction doesn't drop them. Proven by two new tests:
+      `database_names_survive_reopening` (create two, drop one, reopen,
+      confirm only the surviving name comes back) and `database_names_
+      survive_checkpoint_compaction` (same, but forced through a threshold-0
+      checkpoint in between). README's env-var and `Config`-field tables
+      now document `MYSQLRUST_DATA_DIR`'s full volatile-mode consequence,
+      `MYSQLRUST_SYNC_POLICY`, and `MYSQLRUST_CHECKPOINT_THRESHOLD_BYTES`
+      (previously undocumented entirely). 446 tests total (was 443); e2e
+      app (41/41, including its own `CREATE`/`DROP DATABASE` + `SHOW
+      DATABASES` entries) and `tests/crash.rs`'s 6-test suite both green;
+      fmt + clippy `-D warnings` clean.)_
 - [ ] **Idle-connection reaping (P9)**: enforce `wait_timeout` on
       command-loop reads and a short handshake timeout.
       _Acceptance: integration test — idle client is disconnected after

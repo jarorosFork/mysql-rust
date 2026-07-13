@@ -218,12 +218,16 @@ impl Storage for Transaction {
     // Database-name registration isn't part of the buffered-write model at
     // all (unlike table rows) — same as `create_table`, it goes straight to
     // the real storage, "auto-committing" immediately.
-    fn create_database(&self, name: &str, if_not_exists: bool) -> Result<()> {
-        self.storage.create_database(name, if_not_exists)
+    fn create_database<'a>(
+        &'a self,
+        name: &'a str,
+        if_not_exists: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.storage.create_database(name, if_not_exists).await })
     }
 
-    fn drop_database(&self, name: &str, if_exists: bool) -> Result<()> {
-        self.storage.drop_database(name, if_exists)
+    fn drop_database<'a>(&'a self, name: &'a str, if_exists: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.storage.drop_database(name, if_exists).await })
     }
 
     fn databases(&self) -> Result<Vec<String>> {
